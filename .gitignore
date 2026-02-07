@@ -1,0 +1,21 @@
+# Local build outputs
+/cssh-mcp
+/csshctl
+/bin/
+
+# Go test/build artifacts
+*.test
+coverage.out
+*.coverprofile
+
+# Local tool/runtime state
+.cache/
+.csbridge/config.toml
+.csbridge/profiles.json
+.csbridge/runtime/
+.csbridge/logs/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,175 @@
+package app
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"cssh/internal/model"
+)
+
+type testSecretStore struct {
+	values map[string]string
+}
+
+func newTestSecretStore() *testSecretStore {
+	return &testSecretStore{values: map[string]string{}}
+}
+
+func (s *testSecretStore) key(profileID, kind string) string {
+	return profileID + ":" + kind
+}
+
+func (s *testSecretStore) Set(profileID, kind, value string) error {
+	s.values[s.key(profileID, kind)] = value
+	return nil
+}
+
+func (s *testSecretStore) Get(profileID, kind string) (string, error) {
+	v, ok := s.values[s.key(profileID, kind)]
+	if !ok {
+		return "", fmt.Errorf("secret not found")
+	}
+	return v, nil
+}
+
+func (s *testSecretStore) Delete(profileID, kind string) error {
+	delete(s.values, s.key(profileID, kind))
+	return nil
+}
+
+func newTestService(t *testing.T) *Service {
+	t.Helper()
+	tmp := t.TempDir()
+	cfg := model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	}
+	svc := NewService(cfg)
+	svc.secrets = newTestSecretStore()
+	return svc
+}
+
+func TestQuickSetupTemplateDefaults(t *testing.T) {
+	svc := newTestService(t)
+	res, err := svc.QuickSetupTemplate("debug jsonl", "", "devuser")
+	if err != nil {
+		t.Fatalf("template err: %v", err)
+	}
+	defaults, ok := res["defaults"].(map[string]any)
+	if !ok {
+		t.Fatalf("defaults missing")
+	}
+	if defaults["auth_mode"] != "hybrid" {
+		t.Fatalf("auth_mode default mismatch: %#v", defaults["auth_mode"])
+	}
+	fields, ok := res["fields"].([]map[string]any)
+	if !ok {
+		t.Fatalf("fields missing")
+	}
+	for _, field := range fields {
+		name, _ := field["name"].(string)
+		if name == "password" || name == "key_passphrase" {
+			t.Fatalf("template should not include credential field %q", name)
+		}
+	}
+}
+
+func TestQuickSetupSavePersistsProfile(t *testing.T) {
+	svc := newTestService(t)
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:     "debug worker",
+		ProfileName: "rayna-dev",
+		Host:        "100.100.1.9",
+		Username:    "ubuntu",
+		AuthMode:    "password",
+	})
+	if err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+	profileID, _ := out["profile_id"].(string)
+	if profileID == "" {
+		t.Fatalf("profile_id missing")
+	}
+	p, err := svc.ProfileStore().Get(profileID)
+	if err != nil {
+		t.Fatalf("profile get err: %v", err)
+	}
+	if p == nil {
+		t.Fatalf("profile not saved")
+	}
+	if p.Name != "rayna-dev" {
+		t.Fatalf("unexpected profile name: %s", p.Name)
+	}
+	if len(p.AuthPriority) != 1 || p.AuthPriority[0] != "password" {
+		t.Fatalf("unexpected auth priority: %#v", p.AuthPriority)
+	}
+	hint, ok := out["credentials_hint"].(map[string]any)
+	if !ok {
+		t.Fatalf("credentials_hint should exist when password is missing")
+	}
+	args, ok := hint["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("credentials_hint arguments missing")
+	}
+	fields, ok := args["fields"].([]string)
+	if !ok || len(fields) != 1 || fields[0] != "password" {
+		t.Fatalf("unexpected credentials_hint fields: %#v", args["fields"])
+	}
+}
+
+func TestQuickSetupSaveNoHintWhenSecretsExist(t *testing.T) {
+	svc := newTestService(t)
+	sec := svc.secrets.(*testSecretStore)
+	_ = sec.Set("existing-id", "password", "x")
+	_ = sec.Set("existing-id", "key_passphrase", "y")
+
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:   "debug worker",
+		ProfileID: "existing-id",
+		Host:      "100.100.1.9",
+		Username:  "ubuntu",
+		AuthMode:  "hybrid",
+	})
+	if err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+	if _, ok := out["credentials_hint"]; ok {
+		t.Fatalf("credentials_hint should be omitted when required secrets already exist")
+	}
+}
+
+func TestResolveConnectionByProfileName(t *testing.T) {
+	svc := newTestService(t)
+	if err := svc.ProfileStore().Upsert(model.Profile{
+		ID:             "rayna-dev-1",
+		Name:           "rayna-dev",
+		Host:           "100.100.2.1",
+		Port:           22,
+		Username:       "ubuntu",
+		AuthPriority:   []string{"key"},
+		WorkspaceRoots: []string{"/home/ubuntu/project"},
+	}); err != nil {
+		t.Fatalf("upsert profile: %v", err)
+	}
+	conn, err := svc.resolveConnectionInput(model.ConnectionInput{ProfileName: "rayna-dev"})
+	if err != nil {
+		t.Fatalf("resolve by name: %v", err)
+	}
+	if conn.Host != "100.100.2.1" {
+		t.Fatalf("unexpected host: %s", conn.Host)
+	}
+}
+
+func TestBuildProfileID(t *testing.T) {
+	got := buildProfileID("Debug JSONL", "devbox.ts.net")
+	if got == "" {
+		t.Fatalf("empty profile id")
+	}
+	if got != "debug-jsonl-devbox-ts-net" {
+		t.Fatalf("unexpected id: %s", got)
+	}
+}
