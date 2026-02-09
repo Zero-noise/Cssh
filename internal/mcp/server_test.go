@@ -146,7 +146,7 @@ func TestSSHUploadFileSchema(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	for _, k := range []string{"mode", "create_parents", "verify_checksum", "allow_local_anywhere", "timeout_sec"} {
+	for _, k := range []string{"mode", "create_parents", "verify_checksum", "allow_local_anywhere", "timeout_sec", "approval_token"} {
 		if _, exists := props[k]; !exists {
 			t.Fatalf("properties should include %s", k)
 		}
@@ -161,6 +161,72 @@ func TestSSHUploadFileSchema(t *testing.T) {
 	}
 	if !containsString(enumAny, "create") || !containsString(enumAny, "overwrite") || containsString(enumAny, "append") {
 		t.Fatalf("unexpected mode enum: %#v", enumAny)
+	}
+}
+
+func TestPrivilegeToolsSchema(t *testing.T) {
+	statusTool := findToolDef(t, "ssh_privilege_status")
+	statusSchema, ok := statusTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	statusProps, ok := statusSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	for _, k := range []string{"connection_id", "active_only"} {
+		if _, exists := statusProps[k]; !exists {
+			t.Fatalf("ssh_privilege_status missing %s", k)
+		}
+	}
+
+	revokeTool := findToolDef(t, "ssh_privilege_revoke")
+	revokeSchema, ok := revokeTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	req := requiredAsAny(t, revokeSchema)
+	if !containsString(req, "grant_id") {
+		t.Fatalf("ssh_privilege_revoke should require grant_id")
+	}
+}
+
+func TestProfileDeleteAndSudoPromptToolsSchema(t *testing.T) {
+	delTool := findToolDef(t, "ssh_profile_delete")
+	delSchema, ok := delTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	req := requiredAsAny(t, delSchema)
+	if !containsString(req, "profile_id") {
+		t.Fatalf("ssh_profile_delete should require profile_id")
+	}
+	delProps, ok := delSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	if _, exists := delProps["delete_secrets"]; !exists {
+		t.Fatalf("ssh_profile_delete should include delete_secrets")
+	}
+	if _, exists := delProps["confirm_token"]; !exists {
+		t.Fatalf("ssh_profile_delete should include confirm_token")
+	}
+
+	sudoTool := findToolDef(t, "ssh_sudo_password_prompt")
+	sudoSchema, ok := sudoTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	sudoReq := requiredAsAny(t, sudoSchema)
+	if !containsString(sudoReq, "profile_id") {
+		t.Fatalf("ssh_sudo_password_prompt should require profile_id")
+	}
+	sudoProps, ok := sudoSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	if _, exists := sudoProps["prompt_mode"]; !exists {
+		t.Fatalf("ssh_sudo_password_prompt should support prompt_mode")
 	}
 }
 
@@ -260,6 +326,42 @@ func TestToolsCallNoStructuredContent(t *testing.T) {
 	}
 	if _, ok := rm["isError"].(bool); !ok {
 		t.Fatalf("isError bool should exist")
+	}
+}
+
+func TestCredentialPromptSchemaSupportsSudoPassword(t *testing.T) {
+	tool := findToolDef(t, "ssh_credentials_prompt")
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	fieldsProp, ok := props["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields property missing")
+	}
+	items, ok := fieldsProp["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields items missing")
+	}
+	enumAny := toAnySlice(items["enum"])
+	if enumAny == nil {
+		t.Fatalf("fields enum missing")
+	}
+	if !containsString(enumAny, "sudo_password") {
+		t.Fatalf("fields enum should include sudo_password: %#v", enumAny)
+	}
+	if !containsString(enumAny, "password") {
+		t.Fatalf("fields enum should include password: %#v", enumAny)
+	}
+	if !containsString(enumAny, "key_passphrase") {
+		t.Fatalf("fields enum should include key_passphrase: %#v", enumAny)
+	}
+	if _, ok := props["prompt_mode"]; !ok {
+		t.Fatalf("credential prompt schema should include prompt_mode")
 	}
 }
 

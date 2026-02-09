@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cssh/internal/approvals"
@@ -31,18 +33,29 @@ type Service struct {
 	profiles  *store.ProfileStore
 	secrets   store.SecretStore
 	approvals *approvals.Store
+	grants    *approvals.GrantStore
 	audit     *audit.Logger
 	ssh       *sshbridge.Manager
+
+	deleteMu     sync.Mutex
+	deleteTokens map[string]profileDeleteConfirm
+}
+
+type profileDeleteConfirm struct {
+	ProfileID string
+	ExpiresAt time.Time
 }
 
 func NewService(cfg model.Config) *Service {
 	return &Service{
-		cfg:       cfg,
-		profiles:  store.NewProfileStore(cfg.ProfilesFile),
-		secrets:   store.NewSecretStore(),
-		approvals: approvals.NewStore(pathJoin(cfg.RuntimeDir, "approvals.jsonl")),
-		audit:     audit.NewLogger(cfg.LogsDir),
-		ssh:       sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
+		cfg:          cfg,
+		profiles:     store.NewProfileStore(cfg.ProfilesFile),
+		secrets:      store.NewSecretStore(),
+		approvals:    approvals.NewStore(pathJoin(cfg.RuntimeDir, "approvals.jsonl")),
+		grants:       approvals.NewGrantStore(pathJoin(cfg.RuntimeDir, "grants.json")),
+		audit:        audit.NewLogger(cfg.LogsDir),
+		ssh:          sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
+		deleteTokens: map[string]profileDeleteConfirm{},
 	}
 }
 
@@ -56,6 +69,7 @@ func pathJoin(a, b string) string {
 func (s *Service) ProfileStore() *store.ProfileStore { return s.profiles }
 func (s *Service) SecretStore() store.SecretStore    { return s.secrets }
 func (s *Service) Approvals() *approvals.Store       { return s.approvals }
+func (s *Service) Grants() *approvals.GrantStore     { return s.grants }
 
 func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 	traceID := util.NewID("trace")
@@ -72,17 +86,19 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		return nil, err
 	}
 	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_connect",
-		ConnectionID: conn.ID,
-		Host:         conn.Host,
-		Status:       "ok",
+		Timestamp:       time.Now().UTC(),
+		TraceID:         traceID,
+		Type:            "ssh_connect",
+		ConnectionID:    conn.ID,
+		Host:            conn.Host,
+		Status:          "ok",
+		SecurityProfile: conn.SecurityProfile,
 	})
 	return map[string]any{
-		"connection_id":   conn.ID,
-		"capabilities":    []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
-		"workspace_roots": conn.WorkspaceRoots,
+		"connection_id":    conn.ID,
+		"capabilities":     []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
+		"workspace_roots":  conn.WorkspaceRoots,
+		"security_profile": conn.SecurityProfile,
 	}, nil
 }
 
@@ -109,28 +125,46 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 	if err != nil {
 		return nil, err
 	}
-	risk, reason := security.ClassifyCommandRisk(command)
-	if risk == model.RiskL2 {
-		ok, statusResp, err := s.checkApproval(connectionID, sessionID, command, reason, approvalToken)
+	policy := security.EvaluateExecPolicy(command, s.cfg.SudoRequireApproval)
+	authz := privilegeAuthz{}
+	if policy.NeedsApprove {
+		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
+		if !authz.Allowed {
 			_ = s.audit.Write(model.AuditEvent{
-				Timestamp:    time.Now().UTC(),
-				TraceID:      traceID,
-				Type:         "ssh_exec",
-				ConnectionID: connectionID,
-				SessionID:    sessionID,
-				Command:      command,
-				RiskLevel:    string(risk),
-				Status:       "approval_required",
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_exec",
+				ConnectionID:    connectionID,
+				SessionID:       sessionID,
+				Command:         command,
+				RiskLevel:       string(policy.RiskLevel),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      policy.Capability,
+				CommandHash:     policy.TemplateHash,
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
 			})
+			return authz.StatusResp, nil
+		}
+	}
+
+	runCommand := command
+	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled {
+		var statusResp map[string]any
+		runCommand, statusResp, err = s.prepareSudoCommand(*conn, command)
+		if err != nil {
+			return nil, err
+		}
+		if statusResp != nil {
 			return statusResp, nil
 		}
 	}
 
-	res, err := s.ssh.Exec(connectionID, sessionID, command, cwd, timeoutSec)
+	res, err := s.ssh.Exec(connectionID, sessionID, runCommand, cwd, timeoutSec)
 	if err != nil {
 		return nil, err
 	}
@@ -139,23 +173,30 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		status = "nonzero_exit"
 	}
 	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_exec",
-		ConnectionID: connectionID,
-		SessionID:    sessionID,
-		Host:         conn.Host,
-		Command:      command,
-		RiskLevel:    string(risk),
-		Status:       status,
-		ExitCode:     res.ExitCode,
-		DurationMS:   res.DurationMS,
+		Timestamp:       time.Now().UTC(),
+		TraceID:         traceID,
+		Type:            "ssh_exec",
+		ConnectionID:    connectionID,
+		SessionID:       sessionID,
+		Host:            conn.Host,
+		Command:         command,
+		RiskLevel:       string(policy.RiskLevel),
+		Status:          status,
+		ExitCode:        res.ExitCode,
+		DurationMS:      res.DurationMS,
+		SecurityProfile: conn.SecurityProfile,
+		Capability:      policy.Capability,
+		CommandHash:     policy.TemplateHash,
+		GrantID:         authz.GrantID,
+		GrantTTLsec:     authz.GrantTTLsec,
+		ConfirmMode:     authz.ConfirmMode,
 	})
 	return map[string]any{
 		"exit_code":   res.ExitCode,
 		"stdout":      res.Stdout,
 		"stderr":      res.Stderr,
 		"duration_ms": res.DurationMS,
+		"grant_id":    authz.GrantID,
 	}, nil
 }
 
@@ -184,6 +225,7 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 			"port":                  conn.Port,
 			"username":              conn.Username,
 			"workspace_roots":       conn.WorkspaceRoots,
+			"security_profile":      conn.SecurityProfile,
 			"created_at":            conn.CreatedAt.Format(time.RFC3339),
 			"connected":             alive,
 			"control_socket_exists": socketExists,
@@ -224,7 +266,48 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 	return map[string]any{"connections": items}, nil
 }
 
-func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool) (map[string]any, error) {
+func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[string]any, error) {
+	items, err := s.grants.List(connectionID, activeOnly)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, g := range items {
+		out = append(out, map[string]any{
+			"grant_id":              g.ID,
+			"connection_id":         g.ConnectionID,
+			"capability":            g.Capability,
+			"command_template_hash": g.CommandHash,
+			"risk_level":            g.RiskLevel,
+			"status":                g.Status,
+			"created_at":            g.CreatedAt.Format(time.RFC3339),
+			"expires_at":            g.ExpiresAt.Format(time.RFC3339),
+			"approved_by":           g.ApprovedBy,
+			"source":                g.Source,
+		})
+	}
+	return map[string]any{"grants": out}, nil
+}
+
+func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
+	g, err := s.grants.Revoke(grantID)
+	if err != nil {
+		return nil, err
+	}
+	if g == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "grant_id not found")
+	}
+	return map[string]any{
+		"revoked":               true,
+		"grant_id":              g.ID,
+		"connection_id":         g.ConnectionID,
+		"capability":            g.Capability,
+		"command_template_hash": g.CommandHash,
+		"status":                g.Status,
+	}, nil
+}
+
+func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -238,6 +321,41 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	}
 	if err := s.ensureConnectionAlive(connectionID); err != nil {
 		return nil, err
+	}
+	authz := privilegeAuthz{}
+	if allowLocalAnywhere {
+		template := "ssh_upload_file allow_local_anywhere"
+		authz, err = s.authorizePrivilege(
+			connectionID,
+			"",
+			"local_anywhere_transfer",
+			template,
+			template,
+			security.HashCommandTemplate(template),
+			model.RiskL2,
+			"allow_local_anywhere requires explicit approval",
+			approvalToken,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !authz.Allowed {
+			_ = s.audit.Write(model.AuditEvent{
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_upload_file",
+				ConnectionID:    connectionID,
+				Host:            conn.Host,
+				RiskLevel:       string(model.RiskL2),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      "local_anywhere_transfer",
+				CommandHash:     security.HashCommandTemplate(template),
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
+			})
+			return authz.StatusResp, nil
+		}
 	}
 
 	localAbs, err := security.ResolveLocalPath(localPath)
@@ -311,10 +429,11 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		"local_path":    localAbs,
 		"remote_path":   remoteResolved,
 		"duration_ms":   durationMS,
+		"grant_id":      authz.GrantID,
 	}, nil
 }
 
-func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool) (map[string]any, error) {
+func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -328,6 +447,41 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	}
 	if err := s.ensureConnectionAlive(connectionID); err != nil {
 		return nil, err
+	}
+	authz := privilegeAuthz{}
+	if allowLocalAnywhere {
+		template := "ssh_download_file allow_local_anywhere"
+		authz, err = s.authorizePrivilege(
+			connectionID,
+			"",
+			"local_anywhere_transfer",
+			template,
+			template,
+			security.HashCommandTemplate(template),
+			model.RiskL2,
+			"allow_local_anywhere requires explicit approval",
+			approvalToken,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !authz.Allowed {
+			_ = s.audit.Write(model.AuditEvent{
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_download_file",
+				ConnectionID:    connectionID,
+				Host:            conn.Host,
+				RiskLevel:       string(model.RiskL2),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      "local_anywhere_transfer",
+				CommandHash:     security.HashCommandTemplate(template),
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
+			})
+			return authz.StatusResp, nil
+		}
 	}
 
 	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
@@ -415,6 +569,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		"local_path":    localAbs,
 		"remote_path":   remoteResolved,
 		"duration_ms":   durationMS,
+		"grant_id":      authz.GrantID,
 	}, nil
 }
 
@@ -643,6 +798,7 @@ func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) 
 }
 
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
+	_ = s.grants.RevokeByConnection(connectionID)
 	if err := s.ssh.Disconnect(connectionID); err != nil {
 		return nil, err
 	}
@@ -922,52 +1078,325 @@ func splitNonEmpty(s string) []string {
 	return out
 }
 
-func (s *Service) checkApproval(connectionID, sessionID, command, reason, token string) (bool, map[string]any, error) {
+type privilegeAuthz struct {
+	Allowed      bool
+	StatusResp   map[string]any
+	GrantID      string
+	GrantTTLsec  int
+	ConfirmMode  string
+	Reusable     bool
+	ApprovedBy   string
+	TemplateHash string
+}
+
+func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token string) (privilegeAuthz, error) {
+	conn, err := s.ssh.GetConnection(connectionID)
+	if err != nil {
+		return privilegeAuthz{}, err
+	}
+	now := time.Now().UTC()
+	ttlSec := s.approvalTTL(conn)
+	reusable := ttlSec > 0
+	statusResp := func(approvalID string, reqReason string) map[string]any {
+		return map[string]any{
+			"status":                          "approval_required",
+			"approval_id":                     approvalID,
+			"reason":                          reqReason,
+			"risk_level":                      risk,
+			"capability":                      capability,
+			"command_template_hash":           commandHash,
+			"grant_ttl_sec":                   ttlSec,
+			"grant_reusable":                  reusable,
+			"confirmation_required_each_time": !reusable,
+		}
+	}
+
+	if reusable {
+		existing, err := s.grants.FindActive(connectionID, capability, commandHash, now)
+		if err != nil {
+			return privilegeAuthz{}, err
+		}
+		if existing != nil {
+			return privilegeAuthz{
+				Allowed:      true,
+				GrantID:      existing.ID,
+				GrantTTLsec:  ttlSec,
+				ConfirmMode:  "cached_grant",
+				Reusable:     true,
+				ApprovedBy:   existing.ApprovedBy,
+				TemplateHash: commandHash,
+			}, nil
+		}
+	}
+
 	if token != "" {
 		req, err := s.approvals.Get(token)
 		if err != nil {
-			return false, nil, err
+			return privilegeAuthz{}, err
 		}
 		if req == nil {
-			return false, nil, errorsx.New(errorsx.CodeApprovalRequired, "approval token not found")
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRequired, "approval token not found")
 		}
 		if req.Status == model.ApprovalRejected {
-			return false, nil, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected")
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected")
 		}
-		if req.Status == model.ApprovalApproved {
-			if req.Command != command || req.ConnectionID != connectionID {
-				return false, nil, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current command")
+		if req.Status == model.ApprovalPending && isEasySafeProfile(conn.SecurityProfile) {
+			resolved, err := s.approvals.Resolve(req.ID, model.ApprovalApproved, "mcp_token_resubmit", "auto-approved via easy_safe token resubmit")
+			if err != nil {
+				return privilegeAuthz{}, err
 			}
-			return true, nil, nil
+			if resolved != nil {
+				req = resolved
+			}
 		}
-		return false, map[string]any{
-			"status":      "approval_required",
-			"approval_id": req.ID,
-			"reason":      req.Reason,
-			"risk_level":  req.RiskLevel,
-		}, nil
+		if req.Status != model.ApprovalApproved {
+			return privilegeAuthz{Allowed: false, StatusResp: statusResp(req.ID, req.Reason), GrantTTLsec: ttlSec, Reusable: reusable, ConfirmMode: "approval_queue"}, nil
+		}
+		if req.ConnectionID != connectionID {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
+		}
+		if strings.TrimSpace(req.CommandHash) != "" {
+			if req.CommandHash != commandHash {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
+			}
+		} else if strings.TrimSpace(req.Command) != strings.TrimSpace(command) {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current command")
+		}
+		if strings.TrimSpace(req.Capability) != "" && req.Capability != capability {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current capability")
+		}
+		if !reusable {
+			if req.UsedAt != nil {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token already consumed")
+			}
+			updated, err := s.approvals.MarkUsed(req.ID)
+			if err != nil {
+				return privilegeAuthz{}, err
+			}
+			if updated == nil {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token not found")
+			}
+			req = updated
+		}
+		authz := privilegeAuthz{
+			Allowed:      true,
+			GrantTTLsec:  ttlSec,
+			ConfirmMode:  "approval_token",
+			Reusable:     reusable,
+			ApprovedBy:   req.ApprovedBy,
+			TemplateHash: commandHash,
+		}
+		if reusable {
+			grantID, err := s.createPrivilegeGrant(connectionID, capability, commandHash, risk, req.ApprovedBy, "approval_token", ttlSec, now)
+			if err != nil {
+				return privilegeAuthz{}, err
+			}
+			authz.GrantID = grantID
+		}
+		return authz, nil
+	}
+
+	if strings.EqualFold(strings.TrimSpace(s.cfg.ApprovalMode), "terminal") {
+		ok, actor, err := s.promptTerminalApproval(connectionID, capability, risk, reason, command, commandTpl, ttlSec)
+		if err == nil {
+			if ok {
+				authz := privilegeAuthz{
+					Allowed:      true,
+					GrantTTLsec:  ttlSec,
+					ConfirmMode:  "terminal_prompt",
+					Reusable:     reusable,
+					ApprovedBy:   actor,
+					TemplateHash: commandHash,
+				}
+				if reusable {
+					grantID, err := s.createPrivilegeGrant(connectionID, capability, commandHash, risk, actor, "terminal_prompt", ttlSec, now)
+					if err != nil {
+						return privilegeAuthz{}, err
+					}
+					authz.GrantID = grantID
+				}
+				return authz, nil
+			}
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected in terminal prompt")
+		}
 	}
 
 	req := model.ApprovalRequest{
 		ID:           util.NewID("apr"),
-		CreatedAt:    time.Now().UTC(),
+		CreatedAt:    now,
 		Status:       model.ApprovalPending,
 		Command:      command,
 		ConnectionID: connectionID,
 		SessionID:    sessionID,
-		RiskLevel:    model.RiskL2,
+		RiskLevel:    risk,
+		Capability:   capability,
+		CommandTpl:   commandTpl,
+		CommandHash:  commandHash,
+		GrantTTLsec:  ttlSec,
 		Reason:       reason,
 		RequestedBy:  "mcp",
 	}
 	if err := s.approvals.Create(req); err != nil {
-		return false, nil, err
+		return privilegeAuthz{}, err
 	}
-	return false, map[string]any{
-		"status":      "approval_required",
-		"approval_id": req.ID,
-		"reason":      req.Reason,
-		"risk_level":  req.RiskLevel,
+	return privilegeAuthz{
+		Allowed:     false,
+		StatusResp:  statusResp(req.ID, req.Reason),
+		GrantTTLsec: ttlSec,
+		ConfirmMode: "approval_queue",
+		Reusable:    reusable,
 	}, nil
+}
+
+func (s *Service) approvalTTL(conn *model.Connection) int {
+	if isEasySafeProfile(conn.SecurityProfile) {
+		if s.cfg.EasySafeApprovalTTLsec < 0 {
+			return 0
+		}
+		return s.cfg.EasySafeApprovalTTLsec
+	}
+	if s.cfg.NonEasyApprovalTTLsec < 0 {
+		return 0
+	}
+	return s.cfg.NonEasyApprovalTTLsec
+}
+
+func (s *Service) createPrivilegeGrant(connectionID, capability, commandHash string, risk model.RiskLevel, approvedBy, source string, ttlSec int, now time.Time) (string, error) {
+	if ttlSec <= 0 {
+		return "", nil
+	}
+	g := model.PrivilegeGrant{
+		ID:           util.NewID("grt"),
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(time.Duration(ttlSec) * time.Second),
+		Status:       model.PrivilegeGrantActive,
+		ConnectionID: connectionID,
+		Capability:   capability,
+		CommandHash:  commandHash,
+		RiskLevel:    risk,
+		ApprovedBy:   approvedBy,
+		Source:       source,
+	}
+	if err := s.grants.Create(g); err != nil {
+		return "", err
+	}
+	return g.ID, nil
+}
+
+func isEasySafeProfile(profile string) bool {
+	return strings.EqualFold(strings.TrimSpace(profile), "easy_safe")
+}
+
+func (s *Service) promptTerminalApproval(connectionID, capability string, risk model.RiskLevel, reason, command, template string, ttlSec int) (bool, string, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false, "", err
+	}
+	defer tty.Close()
+
+	_, _ = fmt.Fprintf(tty, "\n[cssh] privilege approval required\n")
+	_, _ = fmt.Fprintf(tty, "connection_id: %s\n", connectionID)
+	_, _ = fmt.Fprintf(tty, "capability: %s\n", capability)
+	_, _ = fmt.Fprintf(tty, "risk_level: %s\n", risk)
+	_, _ = fmt.Fprintf(tty, "reason: %s\n", reason)
+	_, _ = fmt.Fprintf(tty, "command: %s\n", strings.TrimSpace(command))
+	_, _ = fmt.Fprintf(tty, "template: %s\n", strings.TrimSpace(template))
+	if ttlSec > 0 {
+		_, _ = fmt.Fprintf(tty, "grant_ttl_sec: %d\n", ttlSec)
+	} else {
+		_, _ = fmt.Fprintf(tty, "grant_ttl_sec: 0 (confirm each time)\n")
+	}
+	_, _ = fmt.Fprintf(tty, "approve now? [y/N]: ")
+
+	reader := bufio.NewReader(tty)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return false, "", err
+	}
+	line = strings.TrimSpace(strings.ToLower(line))
+	if line == "y" || line == "yes" {
+		return true, os.Getenv("USER"), nil
+	}
+	return false, "", nil
+}
+
+func (s *Service) issueProfileDeleteToken(profileID string) string {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	now := time.Now().UTC()
+	for k, v := range s.deleteTokens {
+		if now.After(v.ExpiresAt) {
+			delete(s.deleteTokens, k)
+		}
+	}
+	token := util.NewID("del")
+	s.deleteTokens[token] = profileDeleteConfirm{
+		ProfileID: profileID,
+		ExpiresAt: now.Add(5 * time.Minute),
+	}
+	return token
+}
+
+func (s *Service) validateAndConsumeProfileDeleteToken(profileID, token string) error {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	rec, ok := s.deleteTokens[token]
+	if !ok {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token is invalid or expired")
+	}
+	delete(s.deleteTokens, token)
+	if rec.ProfileID != profileID {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token does not match profile_id")
+	}
+	if time.Now().UTC().After(rec.ExpiresAt) {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token is expired")
+	}
+	return nil
+}
+
+func (s *Service) prepareSudoCommand(conn model.Connection, command string) (string, map[string]any, error) {
+	if !security.LooksLikeSudo(command) {
+		return command, nil, nil
+	}
+	if !s.cfg.SudoEnabled {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo execution is disabled by policy")
+	}
+	profileID := strings.TrimSpace(conn.ProfileID)
+	if profileID == "" {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo requires profile-based connection")
+	}
+	secret, err := s.secrets.Get(profileID, "sudo_password")
+	if err != nil || strings.TrimSpace(secret) == "" {
+		return "", map[string]any{
+			"status":          "credential_required",
+			"credential_kind": "sudo_password",
+			"profile_id":      profileID,
+			"message":         "sudo_password is missing; prompt user to enter it securely",
+			"next_action": map[string]any{
+				"tool":      "ssh_sudo_password_prompt",
+				"arguments": map[string]any{"profile_id": profileID, "prompt_mode": "web"},
+			},
+		}, nil
+	}
+
+	cmd := strings.TrimSpace(command)
+	if cmd == "sudo" {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo command is incomplete")
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "sudo"))
+	if !strings.HasPrefix(rest, "-A ") && rest != "-A" {
+		rest = "-A " + rest
+	}
+	wrapped := strings.Join([]string{
+		"ask=$(mktemp)",
+		"printf '%s\\n' '#!/bin/sh' " + util.ShellQuote("printf '%s\\n' "+util.ShellQuote(secret)) + " > \"$ask\"",
+		"chmod 700 \"$ask\"",
+		"SUDO_ASKPASS=\"$ask\" sudo " + rest,
+		"rc=$?",
+		"rm -f \"$ask\"",
+		"exit $rc",
+	}, "; ")
+	return wrapped, nil, nil
 }
 
 func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Connection, error) {
@@ -976,13 +1405,25 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		if err != nil {
 			return model.Connection{}, err
 		}
+		if strings.EqualFold(strings.TrimSpace(p.Username), "root") && !p.AllowRootUser && !s.cfg.AllowRootLogin {
+			return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy; enable allow_root_user in profile to override")
+		}
 		allowPublic := p.AllowPublicHost || s.cfg.AllowPublicHost
 		if input.AllowPublicHost != nil {
 			allowPublic = *input.AllowPublicHost
 		}
 		password, _ := s.secrets.Get(p.ID, "password")
 		keyPassphrase, _ := s.secrets.Get(p.ID, "key_passphrase")
+		sudoPassword, _ := s.secrets.Get(p.ID, "sudo_password")
+		securityProfile := strings.TrimSpace(p.SecurityProfile)
+		if securityProfile == "" {
+			securityProfile = s.cfg.SecurityProfileDefault
+		}
+		if securityProfile == "" {
+			securityProfile = "easy_safe"
+		}
 		return model.Connection{
+			ProfileID:       p.ID,
 			Host:            p.Host,
 			Port:            p.Port,
 			Username:        p.Username,
@@ -990,13 +1431,22 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 			KeyPath:         p.KeyPath,
 			KeyPassphrase:   keyPassphrase,
 			Password:        password,
+			SudoPassword:    sudoPassword,
 			WorkspaceRoots:  append([]string{}, p.WorkspaceRoots...),
 			AllowPublicHost: allowPublic,
+			SecurityProfile: securityProfile,
+			AllowRootUser:   p.AllowRootUser,
 		}, nil
 	}
 
+	if s.cfg.ConnectRequireProfile {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "direct host connection denied by policy; use profile_id/profile_name")
+	}
 	if input.Host == "" || input.Username == "" {
 		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "provide profile_id/profile_name or host/username")
+	}
+	if strings.EqualFold(strings.TrimSpace(input.Username), "root") && !s.cfg.AllowRootLogin {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy")
 	}
 	allowPublic := s.cfg.AllowPublicHost
 	if input.AllowPublicHost != nil {
@@ -1031,6 +1481,10 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 	for i := range roots {
 		roots[i] = path.Clean(roots[i])
 	}
+	securityProfile := strings.TrimSpace(s.cfg.SecurityProfileDefault)
+	if securityProfile == "" {
+		securityProfile = "easy_safe"
+	}
 	return model.Connection{
 		Host:            input.Host,
 		Port:            input.Port,
@@ -1040,6 +1494,8 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		Password:        password,
 		WorkspaceRoots:  roots,
 		AllowPublicHost: allowPublic,
+		SecurityProfile: securityProfile,
+		AllowRootUser:   s.cfg.AllowRootLogin,
 	}, nil
 }
 

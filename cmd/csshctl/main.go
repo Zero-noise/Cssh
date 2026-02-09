@@ -32,7 +32,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "profile":
-		handleProfile(svc, os.Args[2:])
+		handleProfile(svc, cfg, os.Args[2:])
 	case "secret":
 		handleSecret(svc, os.Args[2:])
 	case "approvals":
@@ -41,6 +41,8 @@ func main() {
 		handleApproveReject(svc, true, os.Args[2:])
 	case "reject":
 		handleApproveReject(svc, false, os.Args[2:])
+	case "migrate":
+		handleMigrate(svc, cfg, os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -49,7 +51,7 @@ func main() {
 
 func usage() {
 	fmt.Print(`csshctl commands:
-  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false]
+  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false]
   profile list
   profile show --id ID
   profile remove --id ID
@@ -58,14 +60,18 @@ func usage() {
   secret delete-password --profile ID
   secret set-key-passphrase --profile ID [--value VALUE]
   secret delete-key-passphrase --profile ID
+  secret set-sudo-password --profile ID [--value VALUE]
+  secret delete-sudo-password --profile ID
 
   approvals list [--status pending|approved|rejected]
   approve APPROVAL_ID [--by NAME]
   reject APPROVAL_ID [--by NAME] [--reason TEXT]
+
+  migrate security
 `)
 }
 
-func handleProfile(svc *app.Service, args []string) {
+func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 	if len(args) == 0 {
 		usage()
 		os.Exit(1)
@@ -83,6 +89,8 @@ func handleProfile(svc *app.Service, args []string) {
 		authPriority := fs.String("auth-priority", "key,password", "auth priority")
 		keyPath := fs.String("key-path", "~/.ssh/id_rsa", "ssh private key path")
 		allowPublic := fs.Bool("allow-public", false, "allow public host")
+		securityProfile := fs.String("security-profile", cfg.SecurityProfileDefault, "security profile (easy_safe|ops_strict)")
+		allowRootUser := fs.Bool("allow-root-user", false, "allow root username in this profile")
 		_ = fs.Parse(args[1:])
 		if *id == "" || *host == "" || *user == "" {
 			fatal(fmt.Errorf("id, host, user are required"))
@@ -92,15 +100,18 @@ func handleProfile(svc *app.Service, args []string) {
 			roots = []string{"/"}
 		}
 		p := model.Profile{
-			ID:              *id,
-			Name:            strings.TrimSpace(*name),
-			Host:            *host,
-			Port:            *port,
-			Username:        *user,
-			AuthPriority:    splitCSV(*authPriority),
-			KeyPath:         config.ExpandHome(*keyPath),
-			WorkspaceRoots:  roots,
-			AllowPublicHost: *allowPublic,
+			ID:                *id,
+			Name:              strings.TrimSpace(*name),
+			Host:              *host,
+			Port:              *port,
+			Username:          *user,
+			AuthPriority:      splitCSV(*authPriority),
+			KeyPath:           config.ExpandHome(*keyPath),
+			WorkspaceRoots:    roots,
+			AllowPublicHost:   *allowPublic,
+			SecurityProfile:   normalizeSecurityProfile(*securityProfile, cfg.SecurityProfileDefault),
+			AllowRootUser:     *allowRootUser,
+			ToolPolicyVersion: 2,
 		}
 		if len(p.AuthPriority) == 0 {
 			p.AuthPriority = []string{"key", "password"}
@@ -208,6 +219,33 @@ func handleSecret(svc *app.Service, args []string) {
 			fatal(err)
 		}
 		printJSON(map[string]any{"ok": true})
+	case "set-sudo-password":
+		fs := flag.NewFlagSet("secret set-sudo-password", flag.ExitOnError)
+		profileID := fs.String("profile", "", "profile id")
+		value := fs.String("value", "", "sudo password value")
+		_ = fs.Parse(args[1:])
+		if *profileID == "" {
+			fatal(fmt.Errorf("--profile is required"))
+		}
+		pwd := *value
+		if pwd == "" {
+			pwd = readLine("Sudo password: ")
+		}
+		if err := sec.Set(*profileID, "sudo_password", pwd); err != nil {
+			fatal(err)
+		}
+		printJSON(map[string]any{"ok": true})
+	case "delete-sudo-password":
+		fs := flag.NewFlagSet("secret delete-sudo-password", flag.ExitOnError)
+		profileID := fs.String("profile", "", "profile id")
+		_ = fs.Parse(args[1:])
+		if *profileID == "" {
+			fatal(fmt.Errorf("--profile is required"))
+		}
+		if err := sec.Delete(*profileID, "sudo_password"); err != nil {
+			fatal(err)
+		}
+		printJSON(map[string]any{"ok": true})
 	default:
 		usage()
 		os.Exit(1)
@@ -251,6 +289,75 @@ func handleApproveReject(svc *app.Service, approve bool, args []string) {
 		fatal(fmt.Errorf("approval id not found"))
 	}
 	printJSON(updated)
+}
+
+func handleMigrate(svc *app.Service, cfg model.Config, args []string) {
+	if len(args) == 0 || args[0] != "security" {
+		usage()
+		os.Exit(1)
+	}
+	items, err := svc.ProfileStore().List()
+	if err != nil {
+		fatal(err)
+	}
+	updated := 0
+	warnings := make([]map[string]any, 0)
+	for _, p := range items {
+		changed := false
+		if strings.TrimSpace(p.SecurityProfile) == "" {
+			p.SecurityProfile = normalizeSecurityProfile("", cfg.SecurityProfileDefault)
+			changed = true
+		}
+		if p.ToolPolicyVersion == 0 {
+			p.ToolPolicyVersion = 2
+			changed = true
+		}
+		if changed {
+			if err := svc.ProfileStore().Upsert(p); err != nil {
+				fatal(err)
+			}
+			updated++
+		}
+		if hasRootPath(p.WorkspaceRoots) {
+			warnings = append(warnings, map[string]any{"profile_id": p.ID, "warning": "workspace_roots contains '/'"})
+		}
+		if p.AllowRootUser {
+			warnings = append(warnings, map[string]any{"profile_id": p.ID, "warning": "allow_root_user=true"})
+		}
+		if p.AllowPublicHost {
+			warnings = append(warnings, map[string]any{"profile_id": p.ID, "warning": "allow_public_host=true"})
+		}
+	}
+	printJSON(map[string]any{
+		"ok":               true,
+		"profiles_total":   len(items),
+		"profiles_updated": updated,
+		"warnings":         warnings,
+	})
+}
+
+func normalizeSecurityProfile(v, fallback string) string {
+	mode := strings.ToLower(strings.TrimSpace(v))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(fallback))
+	}
+	switch mode {
+	case "", "easy_safe":
+		return "easy_safe"
+	case "ops_strict":
+		return "ops_strict"
+	default:
+		return mode
+	}
+}
+
+func hasRootPath(roots []string) bool {
+	for _, r := range roots {
+		if strings.TrimSpace(r) == "/" {
+			return true
+		}
+	}
+	return false
 }
 
 func splitCSV(s string) []string {

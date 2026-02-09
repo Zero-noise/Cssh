@@ -42,11 +42,17 @@ func newTestService(t *testing.T) *Service {
 	t.Helper()
 	tmp := t.TempDir()
 	cfg := model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		RuntimeDir:        filepath.Join(tmp, "runtime"),
-		LogsDir:           filepath.Join(tmp, "logs"),
-		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+		DefaultShell:           "bash -lc",
+		DefaultTimeoutSec:      120,
+		RuntimeDir:             filepath.Join(tmp, "runtime"),
+		LogsDir:                filepath.Join(tmp, "logs"),
+		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
+		SecurityProfileDefault: "easy_safe",
+		ConnectRequireProfile:  true,
+		EasySafeApprovalTTLsec: 900,
+		ApprovalMode:           "terminal",
+		SudoEnabled:            true,
+		SudoRequireApproval:    true,
 	}
 	svc := NewService(cfg)
 	svc.secrets = newTestSecretStore()
@@ -65,6 +71,9 @@ func TestQuickSetupTemplateDefaults(t *testing.T) {
 	}
 	if defaults["auth_mode"] != "hybrid" {
 		t.Fatalf("auth_mode default mismatch: %#v", defaults["auth_mode"])
+	}
+	if defaults["security_profile"] != "easy_safe" {
+		t.Fatalf("security_profile default mismatch: %#v", defaults["security_profile"])
 	}
 	fields, ok := res["fields"].([]map[string]any)
 	if !ok {
@@ -103,6 +112,9 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	}
 	if p.Name != "rayna-dev" {
 		t.Fatalf("unexpected profile name: %s", p.Name)
+	}
+	if p.SecurityProfile != "easy_safe" {
+		t.Fatalf("unexpected security_profile: %s", p.SecurityProfile)
 	}
 	if len(p.AuthPriority) != 1 || p.AuthPriority[0] != "password" {
 		t.Fatalf("unexpected auth priority: %#v", p.AuthPriority)
@@ -171,5 +183,67 @@ func TestBuildProfileID(t *testing.T) {
 	}
 	if got != "debug-jsonl-devbox-ts-net" {
 		t.Fatalf("unexpected id: %s", got)
+	}
+}
+
+func TestResolveConnectionInputDirectDeniedByPolicy(t *testing.T) {
+	svc := newTestService(t)
+	_, err := svc.resolveConnectionInput(model.ConnectionInput{
+		Host:     "100.100.1.9",
+		Username: "ubuntu",
+	})
+	if err == nil {
+		t.Fatalf("expected direct connection to be denied")
+	}
+}
+
+func TestProfileDeleteRemovesProfileAndSecrets(t *testing.T) {
+	svc := newTestService(t)
+	sec := svc.secrets.(*testSecretStore)
+	if err := svc.ProfileStore().Upsert(model.Profile{
+		ID:             "to-del",
+		Name:           "to-del",
+		Host:           "100.100.2.8",
+		Port:           22,
+		Username:       "ubuntu",
+		AuthPriority:   []string{"password"},
+		WorkspaceRoots: []string{"/home/ubuntu/project"},
+	}); err != nil {
+		t.Fatalf("upsert profile: %v", err)
+	}
+	_ = sec.Set("to-del", "password", "x")
+	_ = sec.Set("to-del", "key_passphrase", "y")
+	_ = sec.Set("to-del", "sudo_password", "z")
+
+	first, err := svc.ProfileDelete("to-del", true, "")
+	if err != nil {
+		t.Fatalf("profile delete: %v", err)
+	}
+	token, _ := first["confirm_token"].(string)
+	if token == "" {
+		t.Fatalf("confirm_token should be returned")
+	}
+	out, err := svc.ProfileDelete("to-del", true, token)
+	if err != nil {
+		t.Fatalf("profile delete confirm: %v", err)
+	}
+	if deleted, _ := out["deleted"].(bool); !deleted {
+		t.Fatalf("deleted should be true")
+	}
+	p, err := svc.ProfileStore().Get("to-del")
+	if err != nil {
+		t.Fatalf("profile get: %v", err)
+	}
+	if p != nil {
+		t.Fatalf("profile should be deleted")
+	}
+	if _, ok := sec.values["to-del:password"]; ok {
+		t.Fatalf("password secret should be deleted")
+	}
+	if _, ok := sec.values["to-del:key_passphrase"]; ok {
+		t.Fatalf("key_passphrase secret should be deleted")
+	}
+	if _, ok := sec.values["to-del:sudo_password"]; ok {
+		t.Fatalf("sudo_password secret should be deleted")
 	}
 }

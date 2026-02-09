@@ -22,6 +22,8 @@ type QuickSetupInput struct {
 	WorkspaceRoots  []string
 	KeyPath         string
 	AllowPublicHost bool
+	SecurityProfile string
+	AllowRootUser   bool
 }
 
 func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[string]any, error) {
@@ -37,6 +39,8 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		"workspace_roots":   []string{defaultRoot},
 		"allow_public_host": false,
 		"key_path":          "~/.ssh/id_ed25519",
+		"security_profile":  normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault),
+		"allow_root_user":   false,
 	}
 
 	fields := []map[string]any{
@@ -50,6 +54,8 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "workspace_roots", "label": "Workspace Roots", "type": "array", "required": false, "default": []string{defaultRoot}},
 		{"name": "key_path", "label": "Private Key Path", "type": "string", "required": false, "default": "~/.ssh/id_ed25519"},
 		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": false},
+		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)},
+		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 	}
 
 	return map[string]any{
@@ -106,15 +112,24 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	}
 
 	profile := model.Profile{
-		ID:              profileID,
-		Name:            profileName,
-		Host:            strings.TrimSpace(in.Host),
-		Port:            in.Port,
-		Username:        strings.TrimSpace(in.Username),
-		AuthPriority:    authPriority,
-		KeyPath:         config.ExpandHome(strings.TrimSpace(in.KeyPath)),
-		WorkspaceRoots:  in.WorkspaceRoots,
-		AllowPublicHost: in.AllowPublicHost,
+		ID:                profileID,
+		Name:              profileName,
+		Host:              strings.TrimSpace(in.Host),
+		Port:              in.Port,
+		Username:          strings.TrimSpace(in.Username),
+		AuthPriority:      authPriority,
+		KeyPath:           config.ExpandHome(strings.TrimSpace(in.KeyPath)),
+		WorkspaceRoots:    in.WorkspaceRoots,
+		AllowPublicHost:   in.AllowPublicHost,
+		SecurityProfile:   normalizeSecurityProfileDefault(in.SecurityProfile),
+		AllowRootUser:     in.AllowRootUser,
+		ToolPolicyVersion: 2,
+	}
+	if profile.SecurityProfile == "" {
+		profile.SecurityProfile = normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
+	}
+	if profile.SecurityProfile == "" {
+		profile.SecurityProfile = "easy_safe"
 	}
 	if err := s.profiles.Upsert(profile); err != nil {
 		return nil, err
@@ -131,13 +146,14 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	}
 
 	result := map[string]any{
-		"saved":           true,
-		"profile_id":      profileID,
-		"profile_name":    profileName,
-		"auth_priority":   authPriority,
-		"workspace_roots": profile.WorkspaceRoots,
-		"secret_saved":    secretSaved,
-		"warnings":        warnings,
+		"saved":            true,
+		"profile_id":       profileID,
+		"profile_name":     profileName,
+		"auth_priority":    authPriority,
+		"workspace_roots":  profile.WorkspaceRoots,
+		"security_profile": profile.SecurityProfile,
+		"secret_saved":     secretSaved,
+		"warnings":         warnings,
 		"connect_hint": map[string]any{
 			"tool":      "ssh_connect",
 			"arguments": map[string]any{"profile_id": profileID},
@@ -189,9 +205,68 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			"auth_priority":     p.AuthPriority,
 			"workspace_roots":   p.WorkspaceRoots,
 			"allow_public_host": p.AllowPublicHost,
+			"security_profile":  p.SecurityProfile,
+			"allow_root_user":   p.AllowRootUser,
 		})
 	}
 	return map[string]any{"profiles": out}, nil
+}
+
+func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmToken string) (map[string]any, error) {
+	id := strings.TrimSpace(profileID)
+	if id == "" {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
+	}
+	p, err := s.profiles.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id not found")
+	}
+	if strings.TrimSpace(confirmToken) == "" {
+		token := s.issueProfileDeleteToken(id)
+		return map[string]any{
+			"status":          "confirm_required",
+			"profile_id":      id,
+			"profile_name":    p.Name,
+			"confirm_token":   token,
+			"confirm_ttl_sec": 300,
+			"message":         "Deletion requires confirmation token. Retry with confirm_token to proceed.",
+		}, nil
+	}
+	if err := s.validateAndConsumeProfileDeleteToken(id, confirmToken); err != nil {
+		return nil, err
+	}
+	if err := s.profiles.Delete(id); err != nil {
+		return nil, err
+	}
+	secretsDeleted := []string{}
+	if deleteSecrets {
+		for _, kind := range []string{"password", "key_passphrase", "sudo_password"} {
+			if err := s.secrets.Delete(id, kind); err == nil {
+				secretsDeleted = append(secretsDeleted, kind)
+			}
+		}
+	}
+	return map[string]any{
+		"deleted":         true,
+		"profile_id":      id,
+		"profile_name":    p.Name,
+		"secrets_deleted": secretsDeleted,
+	}, nil
+}
+
+func normalizeSecurityProfileDefault(v string) string {
+	mode := strings.ToLower(strings.TrimSpace(v))
+	switch mode {
+	case "", "easy_safe":
+		return "easy_safe"
+	case "ops_strict":
+		return "ops_strict"
+	default:
+		return mode
+	}
 }
 
 func normalizeAuthMode(v string) string {

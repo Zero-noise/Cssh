@@ -21,6 +21,16 @@ func TestNormalizeCredentialFields(t *testing.T) {
 	}
 }
 
+func TestNormalizeCredentialFieldsSudoPassword(t *testing.T) {
+	fields, invalid := normalizeCredentialFields([]string{"sudo_password"})
+	if len(invalid) != 0 {
+		t.Fatalf("sudo_password should be valid, got invalid: %#v", invalid)
+	}
+	if len(fields) != 1 || fields[0] != "sudo_password" {
+		t.Fatalf("unexpected normalized fields: %#v", fields)
+	}
+}
+
 func TestManualCredentialInstructions(t *testing.T) {
 	msg := manualCredentialInstructions("dev-1", []string{"password", "key_passphrase"})
 	if !strings.Contains(msg, "csshctl secret set-password --profile dev-1") {
@@ -29,4 +39,27 @@ func TestManualCredentialInstructions(t *testing.T) {
 	if !strings.Contains(msg, "csshctl secret set-key-passphrase --profile dev-1") {
 		t.Fatalf("missing set-key-passphrase command: %s", msg)
 	}
+}
+
+func TestManualCredentialInstructionsSudoPassword(t *testing.T) {
+	msg := manualCredentialInstructions("dev-1", []string{"sudo_password"})
+	if !strings.Contains(msg, "csshctl secret set-sudo-password --profile dev-1") {
+		t.Fatalf("missing set-sudo-password command: %s", msg)
+	}
+}
+
+func TestNormalizePromptMode(t *testing.T) {
+	if normalizePromptMode("terminal") != "terminal" {
+		t.Fatalf("terminal mode mismatch")
+	}
+	if normalizePromptMode("web") != "web" {
+		t.Fatalf("web mode mismatch")
+	}
+	if normalizePromptMode("") != "auto" {
+		t.Fatalf("empty mode should default to auto")
+	}
+}
+
+func TestCanUseTerminalPromptNoPanic(t *testing.T) {
+	_ = canUseTerminalPrompt()
 }

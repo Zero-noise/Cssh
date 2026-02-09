@@ -38,15 +38,19 @@ claude mcp remove cssh
 - `cmd/cssh-mcp`: MCP server over stdio (NDJSON framing, protocol version `2025-11-25`).
 - `cmd/csshctl`: CLI for profile/secrets/approval management.
 
-## Security Model (MVP)
+## Security Model (v2)
 
-- Default policy: restricted + escalation.
+- Default mode: `easy_safe`.
+- `easy_safe`: high-risk approvals create reusable grants for 15 minutes (by command template).
+- Non-`easy_safe`: high-risk operations require manual confirmation every time (no reusable grant).
+- Default `approval_mode` is `queue` to avoid terminal UI conflicts with MCP client confirmations.
+- Remote connect defaults to profile-only (whitelisted profiles).
 - Write scope: only inside `workspace_roots`.
-- High-risk (`L2`) commands require explicit approval via `csshctl approve <approval_id>`.
 - Credentials are stored in OS key store:
   - macOS: Keychain (`security` command)
   - Linux: Secret Service (`secret-tool`)
-- Public host is denied by default unless `allow_public_host=true`.
+- `sudo` password is stored as `sudo_password` secret in keychain/secret-service.
+- Public host is denied by default unless profile/config explicitly enables it.
 
 ## Runtime Files
 
@@ -56,6 +60,7 @@ Runtime artifacts (all auto-created, no manual setup needed):
 - config: `~/.csbridge/config.toml`
 - profiles store: `~/.csbridge/profiles.json`
 - approvals queue: `~/.csbridge/runtime/approvals.jsonl`
+- privilege grants: `~/.csbridge/runtime/grants.json`
 - audit logs: `~/.csbridge/logs/audit-YYYYMMDD.jsonl`
 
 ## Build
@@ -79,7 +84,8 @@ csshctl profile add \
   --user ubuntu \
   --workspace-roots /home/ubuntu/project \
   --auth-priority key,password \
-  --key-path ~/.ssh/id_ed25519
+  --key-path ~/.ssh/id_ed25519 \
+  --security-profile easy_safe
 
 # Store password for fallback auth
 csshctl secret set-password --profile devbox
@@ -87,11 +93,17 @@ csshctl secret set-password --profile devbox
 # Store private key passphrase (optional)
 csshctl secret set-key-passphrase --profile devbox
 
+# Store sudo password (optional, for sudo command execution)
+csshctl secret set-sudo-password --profile devbox
+
 # List pending approvals
 csshctl approvals list --status pending
 
 # Approve a high-risk command
 csshctl approve apr_xxx --by yourname
+
+# Migrate old profiles to v2 security fields
+csshctl migrate security
 ```
 
 ## Tool List
@@ -102,6 +114,8 @@ csshctl approve apr_xxx --by yourname
 | `ssh_open_session` | Create a reusable shell session |
 | `ssh_exec` | Run a command on remote host |
 | `ssh_connection_status` | Check one/all active SSH connection health and session summary |
+| `ssh_privilege_status` | List privilege grants (active/all) |
+| `ssh_privilege_revoke` | Revoke one privilege grant immediately |
 | `ssh_upload_file` | Upload one local file to remote host via scp (with optional SHA-256 verify) |
 | `ssh_download_file` | Download one remote file to local machine via scp (with optional SHA-256 verify) |
 | `ssh_read_file` | Read remote file (workspace_roots guarded) |
@@ -112,8 +126,11 @@ csshctl approve apr_xxx --by yourname
 | `ssh_tail_log` | Tail remote log file |
 | `ssh_disconnect` | Close an SSH connection |
 | `ssh_profiles_list` | List saved SSH profiles |
+| `ssh_profile_delete` | Delete one saved SSH profile (two-step confirm token flow, optional secret cleanup) |
 | `ssh_quick_setup_template` | Get a setup form template for AI-guided onboarding |
 | `ssh_quick_setup_save` | Save profile + secrets from the setup form |
+| `ssh_credentials_prompt` | Open secure local credential entry form (password/key passphrase/sudo password) |
+| `ssh_sudo_password_prompt` | Open secure local form specifically for sudo password |
 
 ## Fast Setup Flow (AI-Guided)
 
@@ -169,6 +186,7 @@ Example upload:
   "create_parents": true,
   "verify_checksum": true,
   "allow_local_anywhere": true,
+  "approval_token": "",
   "timeout_sec": 300
 }
 ```
@@ -183,6 +201,7 @@ Example download:
   "mode": "create",
   "create_parents": true,
   "verify_checksum": true,
+  "approval_token": "",
   "timeout_sec": 300
 }
 ```

@@ -159,6 +159,14 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.svc.Exec(connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"))
 	case "ssh_connection_status":
 		return s.svc.ConnectionStatus(stringArg(args, "connection_id"), app.ParseIntAny(args["timeout_sec"], 5))
+	case "ssh_privilege_status":
+		return s.svc.PrivilegeStatus(stringArg(args, "connection_id"), app.ParseBoolAny(args["active_only"], true))
+	case "ssh_privilege_revoke":
+		grantID, err := app.RequireString(args, "grant_id")
+		if err != nil {
+			return nil, err
+		}
+		return s.svc.RevokePrivilege(grantID)
 	case "ssh_upload_file":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -182,6 +190,7 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			app.ParseBoolAny(args["create_parents"], true),
 			app.ParseBoolAny(args["verify_checksum"], true),
 			app.ParseBoolAny(args["allow_local_anywhere"], false),
+			stringArg(args, "approval_token"),
 		)
 	case "ssh_download_file":
 		connID, err := app.RequireString(args, "connection_id")
@@ -206,6 +215,7 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			app.ParseBoolAny(args["create_parents"], true),
 			app.ParseBoolAny(args["verify_checksum"], true),
 			app.ParseBoolAny(args["allow_local_anywhere"], false),
+			stringArg(args, "approval_token"),
 		)
 	case "ssh_read_file":
 		connID, err := app.RequireString(args, "connection_id")
@@ -287,6 +297,12 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		return s.svc.Disconnect(connID)
 	case "ssh_profiles_list":
 		return s.svc.ProfilesList()
+	case "ssh_profile_delete":
+		profileID, err := app.RequireString(args, "profile_id")
+		if err != nil {
+			return nil, err
+		}
+		return s.svc.ProfileDelete(profileID, app.ParseBoolAny(args["delete_secrets"], true), stringArg(args, "confirm_token"))
 	case "ssh_quick_setup_template":
 		return s.svc.QuickSetupTemplate(stringArg(args, "purpose"), stringArg(args, "auth_mode"), stringArg(args, "username"))
 	case "ssh_quick_setup_save":
@@ -320,6 +336,8 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			WorkspaceRoots:  roots,
 			KeyPath:         stringArg(args, "key_path"),
 			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], false),
+			SecurityProfile: stringArg(args, "security_profile"),
+			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
 		}
 		return s.svc.QuickSetupSave(in)
 	case "ssh_credentials_prompt":
@@ -330,8 +348,23 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		in := app.CredentialPromptInput{
 			ProfileID: profileID,
 			Fields:    app.ParseStringSliceAny(args["fields"]),
+			Mode:      stringArg(args, "prompt_mode"),
 		}
 		return s.svc.CredentialPrompt(in)
+	case "ssh_sudo_password_prompt":
+		profileID, err := app.RequireString(args, "profile_id")
+		if err != nil {
+			return nil, err
+		}
+		mode := stringArg(args, "prompt_mode")
+		if mode == "" {
+			mode = "web"
+		}
+		return s.svc.CredentialPrompt(app.CredentialPromptInput{
+			ProfileID: profileID,
+			Fields:    []string{"sudo_password"},
+			Mode:      mode,
+		})
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
@@ -415,7 +448,7 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		tool(
 			"ssh_connect",
-			"Create an SSH connection and return connection_id. Workflow: quick_setup/profile -> ssh_connect -> optional ssh_open_session -> ssh_exec. Prefer profile_id for exact targeting, or profile_name for readable targeting.",
+			"Create an SSH connection and return connection_id. Workflow: quick_setup/profile -> ssh_connect -> optional ssh_open_session -> ssh_exec. Profile-based connect is the default policy.",
 			connectSchema(),
 		),
 		tool(
@@ -434,13 +467,23 @@ func toolDefs() []map[string]any {
 			reqSchema(nil, "connection_id", "timeout_sec"),
 		),
 		tool(
+			"ssh_privilege_status",
+			"Inspect privilege grants. Optional connection_id narrows to one connection. active_only defaults true.",
+			reqSchema(nil, "connection_id", "active_only"),
+		),
+		tool(
+			"ssh_privilege_revoke",
+			"Revoke an active privilege grant immediately. Requires grant_id.",
+			reqSchema([]string{"grant_id"}, "grant_id"),
+		),
+		tool(
 			"ssh_upload_file",
-			"Upload a local file to remote host via scp using existing connection_id control socket. Requires connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere.",
+			"Upload a local file to remote host via scp using existing connection_id control socket. Requires connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
 			uploadFileSchema(),
 		),
 		tool(
 			"ssh_download_file",
-			"Download a remote file to local machine via scp using existing connection_id control socket. Requires connection_id/remote_path/local_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere.",
+			"Download a remote file to local machine via scp using existing connection_id control socket. Requires connection_id/remote_path/local_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
 			downloadFileSchema(),
 		),
 		tool(
@@ -484,6 +527,11 @@ func toolDefs() []map[string]any {
 			map[string]any{"type": "object", "properties": map[string]any{}},
 		),
 		tool(
+			"ssh_profile_delete",
+			"Delete one saved SSH profile by profile_id using a confirmation token flow. First call returns confirm_required + confirm_token; second call must include confirm_token. Optional delete_secrets (default true) also removes password/key_passphrase/sudo_password from system keychain.",
+			reqSchema([]string{"profile_id"}, "profile_id", "delete_secrets", "confirm_token"),
+		),
+		tool(
 			"ssh_quick_setup_template",
 			"Return a compact user-facing form template for SSH onboarding. AI should present this form, collect answers, then call ssh_quick_setup_save.",
 			reqSchema(nil, "purpose", "auth_mode", "username"),
@@ -491,12 +539,17 @@ func toolDefs() []map[string]any {
 		tool(
 			"ssh_quick_setup_save",
 			"Persist SSH profile into MCP storage. This tool only stores profile metadata. After saving, use ssh_credentials_prompt to let the user securely enter credentials via local form.",
-			reqSchema([]string{"purpose", "host", "username"}, "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "workspace_roots", "workspace_root", "key_path", "allow_public_host"),
+			reqSchema([]string{"purpose", "host", "username"}, "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user"),
 		),
 		tool(
 			"ssh_credentials_prompt",
-			"Open a secure local form (browser or editor) for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Call this AFTER ssh_quick_setup_save when auth requires password or key passphrase. NEVER ask users for passwords in conversation — always use this tool.",
+			"Open a secure local form (browser or editor) for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Call this AFTER ssh_quick_setup_save when auth requires password or key passphrase. Also use this when sudo commands fail due to missing sudo_password — prompt with fields=[\"sudo_password\"]. NEVER ask users for passwords in conversation — always use this tool.",
 			credentialPromptSchema(),
+		),
+		tool(
+			"ssh_sudo_password_prompt",
+			"Open secure local form specifically for sudo password entry. Requires profile_id. Use this when sudo execution requires sudo_password.",
+			reqSchema([]string{"profile_id"}, "profile_id", "prompt_mode"),
 		),
 	}
 }
@@ -508,9 +561,10 @@ func credentialPromptSchema() map[string]any {
 			"profile_id": paramSchema("profile_id"),
 			"fields": map[string]any{
 				"type":        "array",
-				"items":       map[string]any{"type": "string", "enum": []string{"password", "key_passphrase"}},
-				"description": "Credential fields to prompt. Defaults to auto-detect from profile auth_priority.",
+				"items":       map[string]any{"type": "string", "enum": []string{"password", "key_passphrase", "sudo_password"}},
+				"description": "Credential fields to prompt. Defaults to auto-detect from profile auth_priority. Use sudo_password when the user needs to run sudo commands on the remote host.",
 			},
+			"prompt_mode": paramSchema("prompt_mode"),
 		},
 		"required": []string{"profile_id"},
 	}
@@ -553,7 +607,7 @@ func downloadFileSchema() map[string]any {
 
 func transferFileSchema(required []string) map[string]any {
 	props := map[string]any{}
-	for _, k := range []string{"connection_id", "local_path", "remote_path", "cwd", "timeout_sec", "create_parents", "verify_checksum", "allow_local_anywhere"} {
+	for _, k := range []string{"connection_id", "local_path", "remote_path", "cwd", "timeout_sec", "create_parents", "verify_checksum", "allow_local_anywhere", "approval_token"} {
 		props[k] = paramSchema(k)
 	}
 	props["mode"] = map[string]any{
@@ -592,8 +646,20 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "description": "Single workspace root (shortcut if not using workspace_roots array)."}
 	case "allow_public_host":
 		return map[string]any{"type": "boolean", "description": "Allow public internet host. Default false for safety."}
+	case "security_profile":
+		return map[string]any{"type": "string", "enum": []string{"easy_safe", "ops_strict"}, "description": "Security profile for privilege approval behavior."}
+	case "allow_root_user":
+		return map[string]any{"type": "boolean", "description": "Allow root SSH user for this profile."}
+	case "delete_secrets":
+		return map[string]any{"type": "boolean", "description": "When deleting profile, also delete password/key passphrase/sudo password from keychain. Default true."}
+	case "confirm_token":
+		return map[string]any{"type": "string", "description": "Confirmation token returned by ssh_profile_delete first call."}
+	case "prompt_mode":
+		return map[string]any{"type": "string", "enum": []string{"auto", "terminal", "web"}, "description": "Prompt mode for credential entry."}
 	case "connection_id":
 		return map[string]any{"type": "string", "description": "Connection ID returned by ssh_connect."}
+	case "grant_id":
+		return map[string]any{"type": "string", "description": "Privilege grant ID returned by previous approval flow."}
 	case "session_id":
 		return map[string]any{"type": "string", "description": "Session ID returned by ssh_open_session for context reuse."}
 	case "command":
@@ -638,6 +704,8 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "integer", "description": "Maximum number of matches to return."}
 	case "lines":
 		return map[string]any{"type": "integer", "description": "Number of lines for tail output."}
+	case "active_only":
+		return map[string]any{"type": "boolean", "description": "When true, return only active non-expired grants."}
 	case "purpose":
 		return map[string]any{"type": "string", "description": "Human-readable purpose, used to generate a profile and defaults."}
 	case "key_path":
