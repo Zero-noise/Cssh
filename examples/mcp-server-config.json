@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "cssh": {
-      "command": "/path/to/cssh/cssh-mcp",
+      "command": "/absolute/path/to/cssh-mcp",
       "env": {
-        "CSSH_CONFIG": "/path/to/cssh/.csbridge/config.toml"
+        "CSSH_CONFIG": "~/.csbridge/config.toml"
       }
     }
   }
