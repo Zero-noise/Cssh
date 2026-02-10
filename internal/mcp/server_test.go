@@ -131,14 +131,14 @@ func TestSSHConnectionStatusSchema(t *testing.T) {
 	}
 }
 
-func TestSSHUploadFileSchema(t *testing.T) {
-	tool := findToolDef(t, "ssh_upload_file")
+func TestSSHTransferSchema(t *testing.T) {
+	tool := findToolDef(t, "ssh_transfer")
 	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
 	}
 	requiredAny := requiredAsAny(t, schema)
-	for _, k := range []string{"connection_id", "local_path", "remote_path"} {
+	for _, k := range []string{"direction", "connection_id", "local_path", "remote_path"} {
 		if !containsString(requiredAny, k) {
 			t.Fatalf("required should contain %s: %#v", k, requiredAny)
 		}
@@ -162,6 +162,14 @@ func TestSSHUploadFileSchema(t *testing.T) {
 	}
 	if !containsString(enumAny, "create") || !containsString(enumAny, "overwrite") || containsString(enumAny, "append") {
 		t.Fatalf("unexpected mode enum: %#v", enumAny)
+	}
+	directionProp, ok := props["direction"].(map[string]any)
+	if !ok {
+		t.Fatalf("direction property missing")
+	}
+	directionEnum := toAnySlice(directionProp["enum"])
+	if !containsString(directionEnum, "upload") || !containsString(directionEnum, "download") {
+		t.Fatalf("direction enum should include upload/download: %#v", directionEnum)
 	}
 }
 
@@ -192,42 +200,28 @@ func TestPrivilegeToolsSchema(t *testing.T) {
 	}
 }
 
-func TestProfileDeleteAndSudoPromptToolsSchema(t *testing.T) {
-	delTool := findToolDef(t, "ssh_profile_delete")
-	delSchema, ok := delTool["inputSchema"].(map[string]any)
+func TestProfileAndApprovalToolsSchema(t *testing.T) {
+	profileTool := findToolDef(t, "ssh_profile")
+	profileSchema, ok := profileTool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
 	}
-	req := requiredAsAny(t, delSchema)
-	if !containsString(req, "profile_id") {
-		t.Fatalf("ssh_profile_delete should require profile_id")
-	}
-	delProps, ok := delSchema["properties"].(map[string]any)
+	profileProps, ok := profileSchema["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	if _, exists := delProps["delete_secrets"]; !exists {
-		t.Fatalf("ssh_profile_delete should include delete_secrets")
-	}
-	if _, exists := delProps["confirm_token"]; !exists {
-		t.Fatalf("ssh_profile_delete should include confirm_token")
-	}
-
-	sudoTool := findToolDef(t, "ssh_sudo_password_prompt")
-	sudoSchema, ok := sudoTool["inputSchema"].(map[string]any)
+	actionProp, ok := profileProps["action"].(map[string]any)
 	if !ok {
-		t.Fatalf("inputSchema missing")
+		t.Fatalf("ssh_profile should include action")
 	}
-	sudoReq := requiredAsAny(t, sudoSchema)
-	if !containsString(sudoReq, "profile_id") {
-		t.Fatalf("ssh_sudo_password_prompt should require profile_id")
+	actionEnum := toAnySlice(actionProp["enum"])
+	if !containsString(actionEnum, "list") || !containsString(actionEnum, "delete") {
+		t.Fatalf("ssh_profile action enum should include list/delete: %#v", actionEnum)
 	}
-	sudoProps, ok := sudoSchema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties missing")
-	}
-	if _, exists := sudoProps["prompt_mode"]; !exists {
-		t.Fatalf("ssh_sudo_password_prompt should support prompt_mode")
+	for _, k := range []string{"profile_id", "delete_secrets", "confirm_token"} {
+		if _, exists := profileProps[k]; !exists {
+			t.Fatalf("ssh_profile should include %s", k)
+		}
 	}
 
 	approveTool := findToolDef(t, "ssh_approve_request")
@@ -248,20 +242,6 @@ func TestProfileDeleteAndSudoPromptToolsSchema(t *testing.T) {
 	}
 	if _, exists := approveProps["approved_by"]; !exists {
 		t.Fatalf("ssh_approve_request should include approved_by")
-	}
-}
-
-func TestSSHDownloadFileSchema(t *testing.T) {
-	tool := findToolDef(t, "ssh_download_file")
-	schema, ok := tool["inputSchema"].(map[string]any)
-	if !ok {
-		t.Fatalf("inputSchema missing")
-	}
-	requiredAny := requiredAsAny(t, schema)
-	for _, k := range []string{"connection_id", "remote_path", "local_path"} {
-		if !containsString(requiredAny, k) {
-			t.Fatalf("required should contain %s: %#v", k, requiredAny)
-		}
 	}
 }
 
@@ -309,7 +289,7 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 func TestInitializedNotificationGate(t *testing.T) {
 	s := NewServer(nil)
 
-	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profiles_list","arguments":{}}`)}, 1)
+	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`)}, 1)
 	if res.Error == nil || res.Error.Code != -32002 {
 		t.Fatalf("expected not-initialized error, got: %#v", res)
 	}
@@ -357,8 +337,8 @@ func TestCredentialPromptSchemaSupportsSudoPassword(t *testing.T) {
 	}
 }
 
-func TestQuickSetupSaveSchemaDoesNotAcceptCredentialValues(t *testing.T) {
-	tool := findToolDef(t, "ssh_quick_setup_save")
+func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
+	tool := findToolDef(t, "ssh_profile_setup")
 	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
@@ -371,10 +351,18 @@ func TestQuickSetupSaveSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 		t.Fatalf("password should not be exposed in quick setup schema")
 	}
 	if _, ok := props["key_passphrase"]; ok {
-		t.Fatalf("key_passphrase should not be exposed in quick setup schema")
+		t.Fatalf("key_passphrase should not be exposed in profile setup schema")
 	}
 	if _, ok := props["allow_public_host"]; !ok {
-		t.Fatalf("allow_public_host should stay available in quick setup schema")
+		t.Fatalf("allow_public_host should stay available in profile setup schema")
+	}
+	stepProp, ok := props["step"].(map[string]any)
+	if !ok {
+		t.Fatalf("step should be exposed in profile setup schema")
+	}
+	stepEnum := toAnySlice(stepProp["enum"])
+	if !containsString(stepEnum, "template") || !containsString(stepEnum, "save") {
+		t.Fatalf("step enum should include template/save: %#v", stepEnum)
 	}
 }
 

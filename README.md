@@ -66,6 +66,10 @@ Runtime artifacts (all auto-created, no manual setup needed):
 ## Build
 
 ```bash
+# One-command build (both binaries)
+go build -o cssh-mcp ./cmd/cssh-mcp && go build -o csshctl ./cmd/csshctl
+
+# Or build separately
 go build -o cssh-mcp ./cmd/cssh-mcp
 go build -o csshctl ./cmd/csshctl
 ```
@@ -116,8 +120,7 @@ csshctl migrate security
 | `ssh_connection_status` | Check one/all active SSH connection health and session summary |
 | `ssh_privilege_status` | List privilege grants (active/all) |
 | `ssh_privilege_revoke` | Revoke one privilege grant immediately |
-| `ssh_upload_file` | Upload one local file to remote host via scp (with optional SHA-256 verify) |
-| `ssh_download_file` | Download one remote file to local machine via scp (with optional SHA-256 verify) |
+| `ssh_transfer` | Unified file transfer via scp. `direction=upload` (local->remote) or `direction=download` (remote->local), with optional SHA-256 verify |
 | `ssh_read_file` | Read remote file (workspace_roots guarded) |
 | `ssh_write_file` | Write remote file (workspace_roots guarded) |
 | `ssh_apply_patch` | Apply unified diff patch on remote host |
@@ -125,12 +128,9 @@ csshctl migrate security
 | `ssh_search_text` | Search text in remote files |
 | `ssh_tail_log` | Tail remote log file |
 | `ssh_disconnect` | Close an SSH connection |
-| `ssh_profiles_list` | List saved SSH profiles |
-| `ssh_profile_delete` | Delete one saved SSH profile (two-step confirm token flow, optional secret cleanup) |
-| `ssh_quick_setup_template` | Get a setup form template for AI-guided onboarding |
-| `ssh_quick_setup_save` | Save profile metadata only (host/user/path/policy). Credentials are entered later via credential prompt |
+| `ssh_profile` | Unified profile operations. `action=list` lists profiles; `action=delete` deletes one profile via two-step confirm token flow |
+| `ssh_profile_setup` | Unified setup flow. `step=template` returns onboarding form; `step=save` stores profile metadata |
 | `ssh_credentials_prompt` | Default secure web credential prompt; if web unavailable returns manual `./csshctl secret set-* --profile <id>` commands |
-| `ssh_sudo_password_prompt` | Same flow as above but scoped to `sudo_password` |
 | `ssh_approve_request` | Approve/reject one pending `ssh_exec` approval request |
 
 ## Credential Fallback (No Web)
@@ -157,16 +157,17 @@ Common commands:
 
 When a user says "I want to connect to this SSH host to do X", AI can run:
 
-1. `ssh_quick_setup_template` to get a compact fill-in form.
+1. `ssh_profile_setup` with `step=template` to get a compact fill-in form.
 2. Ask the user to provide the form values.
-3. `ssh_quick_setup_save` to persist profile metadata (credentials are not stored here).
+3. `ssh_profile_setup` with `step=save` to persist profile metadata (credentials are not stored here).
 4. Call `ssh_credentials_prompt` (web by default). If web fails, run returned `manual_commands`.
 5. Call `ssh_connect` with returned `profile_id`.
 
-Example `ssh_quick_setup_save` arguments:
+Example `ssh_profile_setup` save arguments:
 
 ```json
 {
+  "step": "save",
   "purpose": "debug jsonl worker",
   "profile_name": "rayna-dev",
   "host": "100.88.0.10",
@@ -188,7 +189,7 @@ For multiple servers, keep unique names (for AI readability) and unique profile 
 
 ## File Transfer (SCP)
 
-`ssh_upload_file` and `ssh_download_file` reuse the active SSH control socket from `connection_id`.
+`ssh_transfer` reuses the active SSH control socket from `connection_id`.
 This usually avoids re-entering password after `ssh_connect`.
 
 - Default `mode` is `create` (fails if target exists).
@@ -201,6 +202,7 @@ Example upload:
 
 ```json
 {
+  "direction": "upload",
   "connection_id": "conn_xxx",
   "local_path": "/Users/me/workspace/model.bin",
   "remote_path": "/home/ubuntu/project/model.bin",
@@ -217,6 +219,7 @@ Example download:
 
 ```json
 {
+  "direction": "download",
   "connection_id": "conn_xxx",
   "remote_path": "/home/ubuntu/project/logs/latest.log",
   "local_path": "/Users/me/workspace/latest.log",

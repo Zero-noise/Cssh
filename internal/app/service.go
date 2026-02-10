@@ -327,7 +327,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	}
 	authz := privilegeAuthz{}
 	if allowLocalAnywhere {
-		template := "ssh_upload_file allow_local_anywhere"
+		template := "ssh_transfer direction=upload allow_local_anywhere"
 		authz, err = s.authorizePrivilege(
 			connectionID,
 			"",
@@ -346,7 +346,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			_ = s.audit.Write(model.AuditEvent{
 				Timestamp:       time.Now().UTC(),
 				TraceID:         traceID,
-				Type:            "ssh_upload_file",
+				Type:            "ssh_transfer",
 				ConnectionID:    connectionID,
 				Host:            conn.Host,
 				RiskLevel:       string(model.RiskL2),
@@ -397,12 +397,12 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		if remoteTemp != "" {
 			s.remoteRemoveFile(connectionID, remoteTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := s.remoteInstallCreateOnly(connectionID, remoteTemp, remoteResolved); err != nil {
-			s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
 			return nil, err
 		}
 	}
@@ -419,12 +419,12 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			return nil, err
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "checksum_mismatch", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", localAbs+" -> "+remoteResolved, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "ok", localAbs+" -> "+remoteResolved, durationMS)
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", localAbs+" -> "+remoteResolved, durationMS)
 	return map[string]any{
 		"bytes":         info.Size(),
 		"local_sha256":  localSHA,
@@ -453,7 +453,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	}
 	authz := privilegeAuthz{}
 	if allowLocalAnywhere {
-		template := "ssh_download_file allow_local_anywhere"
+		template := "ssh_transfer direction=download allow_local_anywhere"
 		authz, err = s.authorizePrivilege(
 			connectionID,
 			"",
@@ -472,7 +472,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			_ = s.audit.Write(model.AuditEvent{
 				Timestamp:       time.Now().UTC(),
 				TraceID:         traceID,
-				Type:            "ssh_download_file",
+				Type:            "ssh_transfer",
 				ConnectionID:    connectionID,
 				Host:            conn.Host,
 				RiskLevel:       string(model.RiskL2),
@@ -530,12 +530,12 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		if localTemp != "" {
 			_ = os.Remove(localTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := installLocalCreateOnly(localTemp, localAbs); err != nil {
-			s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
 			return nil, err
 		}
 	}
@@ -559,12 +559,12 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "checksum_mismatch", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", remoteResolved+" -> "+localAbs, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "ok", remoteResolved+" -> "+localAbs, durationMS)
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", remoteResolved+" -> "+localAbs, durationMS)
 	return map[string]any{
 		"bytes":         info.Size(),
 		"local_sha256":  localSHA,
@@ -1369,8 +1369,8 @@ func (s *Service) prepareSudoCommand(conn model.Connection, command string) (str
 			"profile_id":      profileID,
 			"message":         "sudo_password is missing; prompt user to enter it securely",
 			"next_action": map[string]any{
-				"tool":      "ssh_sudo_password_prompt",
-				"arguments": map[string]any{"profile_id": profileID, "prompt_mode": "web"},
+				"tool":      "ssh_credentials_prompt",
+				"arguments": map[string]any{"profile_id": profileID, "fields": []string{"sudo_password"}, "prompt_mode": "web"},
 			},
 		}, nil
 	}

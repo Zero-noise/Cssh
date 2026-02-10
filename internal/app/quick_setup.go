@@ -64,7 +64,10 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		"fields":   fields,
 		"defaults": defaults,
 		"next_action": map[string]any{
-			"tool": "ssh_quick_setup_save",
+			"tool": "ssh_profile_setup",
+			"arguments": map[string]any{
+				"step": "save",
+			},
 			"note": "After saving, use ssh_credentials_prompt for secure credential entry.",
 		},
 	}, nil
