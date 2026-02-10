@@ -39,7 +39,6 @@ type Config struct {
 	ApprovalMode           string `json:"approval_mode"`
 	SudoEnabled            bool   `json:"sudo_enabled"`
 	SudoCacheScope         string `json:"sudo_cache_scope"`
-	SudoRequireApproval    bool   `json:"sudo_require_approval"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 

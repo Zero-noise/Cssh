@@ -25,7 +25,6 @@ manual_confirm_scope = "high_risk_only"
 approval_mode = "queue"
 sudo_enabled = true
 sudo_cache_scope = "command_template"
-sudo_require_approval = true
 allow_root_login = false
 `
 
@@ -79,7 +78,6 @@ func Load(configPath string) (model.Config, error) {
 		ApprovalMode:           "queue",
 		SudoEnabled:            true,
 		SudoCacheScope:         "command_template",
-		SudoRequireApproval:    true,
 		AllowRootLogin:         false,
 	}
 
@@ -154,8 +152,6 @@ func Load(configPath string) (model.Config, error) {
 			if strings.TrimSpace(val) != "" {
 				cfg.SudoCacheScope = strings.TrimSpace(val)
 			}
-		case "sudo_require_approval":
-			cfg.SudoRequireApproval = strings.EqualFold(val, "true")
 		case "allow_root_login":
 			cfg.AllowRootLogin = strings.EqualFold(val, "true")
 		case "profiles_file":

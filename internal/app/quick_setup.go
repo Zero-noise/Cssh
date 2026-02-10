@@ -135,14 +135,15 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		return nil, err
 	}
 
-	secretSaved := map[string]bool{}
+	secretsSaved := map[string]bool{
+		"password":       s.hasSecretValue(profileID, "password"),
+		"key_passphrase": s.hasSecretValue(profileID, "key_passphrase"),
+		"sudo_password":  s.hasSecretValue(profileID, "sudo_password"),
+	}
 
 	warnings := []string{}
 	if !profile.AllowPublicHost && !security.IsPrivateOrLoopbackHost(profile.Host) {
 		warnings = append(warnings, "host looks public; connection will be blocked unless allow_public_host=true or VPN address is used")
-	}
-	if authMode == "key" && strings.TrimSpace(in.KeyPath) == "" {
-		warnings = append(warnings, "auth_mode=key but key_path is empty")
 	}
 
 	result := map[string]any{
@@ -152,7 +153,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		"auth_priority":    authPriority,
 		"workspace_roots":  profile.WorkspaceRoots,
 		"security_profile": profile.SecurityProfile,
-		"secret_saved":     secretSaved,
+		"secrets_saved":    secretsSaved,
 		"warnings":         warnings,
 		"connect_hint": map[string]any{
 			"tool":      "ssh_connect",
@@ -162,19 +163,21 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 
 	needsCredentials := false
 	credentialFields := []string{}
-	if containsStr(authPriority, "password") && !s.hasSecretValue(profileID, "password") {
+	if containsStr(authPriority, "password") && !secretsSaved["password"] {
 		needsCredentials = true
 		credentialFields = append(credentialFields, "password")
 	}
-	if containsStr(authPriority, "key") && !s.hasSecretValue(profileID, "key_passphrase") {
+	if containsStr(authPriority, "key") && !secretsSaved["key_passphrase"] {
 		needsCredentials = true
 		credentialFields = append(credentialFields, "key_passphrase")
 	}
 	if needsCredentials {
+		manualCmds := manualCredentialCommands(profileID, credentialFields)
 		result["credentials_hint"] = map[string]any{
-			"tool":      "ssh_credentials_prompt",
-			"arguments": map[string]any{"profile_id": profileID, "fields": credentialFields},
-			"message":   "Use ssh_credentials_prompt to let user enter credentials securely.",
+			"tool":            "ssh_credentials_prompt",
+			"arguments":       map[string]any{"profile_id": profileID, "fields": credentialFields},
+			"manual_commands": manualCmds,
+			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
 		}
 	}
 

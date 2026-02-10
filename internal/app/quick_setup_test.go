@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"cssh/internal/model"
@@ -52,7 +53,6 @@ func newTestService(t *testing.T) *Service {
 		EasySafeApprovalTTLsec: 900,
 		ApprovalMode:           "terminal",
 		SudoEnabled:            true,
-		SudoRequireApproval:    true,
 	}
 	svc := NewService(cfg)
 	svc.secrets = newTestSecretStore()
@@ -119,9 +119,23 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	if len(p.AuthPriority) != 1 || p.AuthPriority[0] != "password" {
 		t.Fatalf("unexpected auth priority: %#v", p.AuthPriority)
 	}
+	secretsSaved, ok := out["secrets_saved"].(map[string]bool)
+	if !ok {
+		t.Fatalf("secrets_saved should be present")
+	}
+	if secretsSaved["password"] {
+		t.Fatalf("password should not be marked saved before credential prompt")
+	}
 	hint, ok := out["credentials_hint"].(map[string]any)
 	if !ok {
 		t.Fatalf("credentials_hint should exist when password is missing")
+	}
+	msg, _ := hint["message"].(string)
+	if !strings.Contains(msg, "continue without restarting") {
+		t.Fatalf("credentials_hint should explain no-restart path: %q", msg)
+	}
+	if !strings.Contains(msg, "resume this conversation") {
+		t.Fatalf("credentials_hint should explain resume path: %q", msg)
 	}
 	args, ok := hint["arguments"].(map[string]any)
 	if !ok {
@@ -148,6 +162,13 @@ func TestQuickSetupSaveNoHintWhenSecretsExist(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("quick save err: %v", err)
+	}
+	secretsSaved, ok := out["secrets_saved"].(map[string]bool)
+	if !ok {
+		t.Fatalf("secrets_saved should be present")
+	}
+	if !secretsSaved["password"] || !secretsSaved["key_passphrase"] {
+		t.Fatalf("existing secrets should be reflected: %#v", secretsSaved)
 	}
 	if _, ok := out["credentials_hint"]; ok {
 		t.Fatalf("credentials_hint should be omitted when required secrets already exist")

@@ -365,6 +365,17 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			Fields:    []string{"sudo_password"},
 			Mode:      mode,
 		})
+	case "ssh_approve_request":
+		approvalID, err := app.RequireString(args, "approval_id")
+		if err != nil {
+			return nil, err
+		}
+		return s.svc.ApproveRequest(
+			approvalID,
+			stringArg(args, "decision"),
+			stringArg(args, "approved_by"),
+			stringArg(args, "reason"),
+		)
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
@@ -458,7 +469,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_exec",
-			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. High-risk L2 commands may return approval_required and need approval_token on retry.",
+			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. In easy_safe, critical L2 commands may return approval_required. In non-easy_safe profiles, any command may require approval. Retry with approval_token after ssh_approve_request.",
 			reqSchema([]string{"connection_id", "command"}, "connection_id", "command", "session_id", "cwd", "timeout_sec", "approval_token"),
 		),
 		tool(
@@ -543,13 +554,18 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_credentials_prompt",
-			"Open a secure local form (browser or editor) for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Call this AFTER ssh_quick_setup_save when auth requires password or key passphrase. Also use this when sudo commands fail due to missing sudo_password — prompt with fields=[\"sudo_password\"]. NEVER ask users for passwords in conversation — always use this tool.",
+			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual ./csshctl secret set-* commands with profile_id. Call this AFTER ssh_quick_setup_save when auth requires password or key passphrase. Also use this when sudo commands fail due to missing sudo_password.",
 			credentialPromptSchema(),
 		),
 		tool(
 			"ssh_sudo_password_prompt",
-			"Open secure local form specifically for sudo password entry. Requires profile_id. Use this when sudo execution requires sudo_password.",
+			"Prompt only for sudo_password. Default is secure web flow; if web is unavailable this returns manual ./csshctl command(s) with profile_id.",
 			reqSchema([]string{"profile_id"}, "profile_id", "prompt_mode"),
+		),
+		tool(
+			"ssh_approve_request",
+			"Approve or reject one pending privilege approval request from ssh_exec approval_required flow. Requires approval_id; decision defaults to approve.",
+			reqSchema([]string{"approval_id"}, "approval_id", "decision", "approved_by", "reason"),
 		),
 	}
 }
@@ -654,8 +670,16 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "boolean", "description": "When deleting profile, also delete password/key passphrase/sudo password from keychain. Default true."}
 	case "confirm_token":
 		return map[string]any{"type": "string", "description": "Confirmation token returned by ssh_profile_delete first call."}
+	case "approval_id":
+		return map[string]any{"type": "string", "description": "Approval request ID returned by ssh_exec when status=approval_required."}
+	case "decision":
+		return map[string]any{"type": "string", "enum": []string{"approve", "reject"}, "description": "Approval decision. Defaults to approve."}
+	case "approved_by":
+		return map[string]any{"type": "string", "description": "Human approver label recorded in audit trail."}
+	case "reason":
+		return map[string]any{"type": "string", "description": "Optional reject reason (used when decision=reject)."}
 	case "prompt_mode":
-		return map[string]any{"type": "string", "enum": []string{"auto", "terminal", "web"}, "description": "Prompt mode for credential entry."}
+		return map[string]any{"type": "string", "enum": []string{"auto", "terminal", "web"}, "description": "Credential prompt mode. auto/web prefer local web form then fallback to manual commands; terminal requires interactive TTY."}
 	case "connection_id":
 		return map[string]any{"type": "string", "description": "Connection ID returned by ssh_connect."}
 	case "grant_id":
@@ -671,7 +695,7 @@ func paramSchema(key string) map[string]any {
 	case "timeout_sec":
 		return map[string]any{"type": "integer", "description": "Execution timeout in seconds."}
 	case "approval_token":
-		return map[string]any{"type": "string", "description": "Approval ID/token required to execute previously blocked L2 command."}
+		return map[string]any{"type": "string", "description": "Approval ID/token required to execute an operation that returned approval_required."}
 	case "path":
 		return map[string]any{"type": "string", "description": "Remote filesystem path."}
 	case "local_path":

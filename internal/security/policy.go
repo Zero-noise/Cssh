@@ -26,7 +26,7 @@ type ExecPolicyDecision struct {
 	TemplateHash string
 }
 
-func EvaluateExecPolicy(command string, sudoRequireApproval bool) ExecPolicyDecision {
+func EvaluateExecPolicy(command string) ExecPolicyDecision {
 	cmd := strings.TrimSpace(command)
 	risk, reason := ClassifyCommandRisk(cmd)
 	capability := "exec_read"
@@ -39,16 +39,17 @@ func EvaluateExecPolicy(command string, sudoRequireApproval bool) ExecPolicyDeci
 
 	if LooksLikeSudo(cmd) {
 		capability = "sudo_exec"
-		risk = model.RiskL2
-		if sudoRequireApproval {
-			reason = "sudo command requires explicit approval"
+		// Sudo elevates privilege but is not always "critical destructive".
+		// Keep explicit approval for critical commands (risk L2), not all sudo.
+		if risk == model.RiskL0 {
+			risk = model.RiskL1
+			reason = "sudo command with elevated privileges"
+		} else if strings.TrimSpace(reason) == "" {
+			reason = "sudo command with elevated privileges"
 		}
 	}
 
 	needsApprove := risk == model.RiskL2
-	if LooksLikeSudo(cmd) && sudoRequireApproval {
-		needsApprove = true
-	}
 	tpl := BuildCommandTemplate(cmd)
 	return ExecPolicyDecision{
 		RiskLevel:    risk,

@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,14 +121,16 @@ func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, 
 
 func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
+	auditCommand := sanitizeCommandForAudit(command)
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
 	}
-	policy := security.EvaluateExecPolicy(command, s.cfg.SudoRequireApproval)
+	policy := security.EvaluateExecPolicy(command)
 	authz := privilegeAuthz{}
-	if policy.NeedsApprove {
-		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken)
+	needsApprove, approveReason := shouldRequireApproval(conn.SecurityProfile, policy)
+	if needsApprove {
+		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, approveReason, approvalToken)
 		if err != nil {
 			return nil, err
 		}
@@ -139,7 +141,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 				Type:            "ssh_exec",
 				ConnectionID:    connectionID,
 				SessionID:       sessionID,
-				Command:         command,
+				Command:         auditCommand,
 				RiskLevel:       string(policy.RiskLevel),
 				Status:          "approval_required",
 				SecurityProfile: conn.SecurityProfile,
@@ -153,9 +155,10 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 	}
 
 	runCommand := command
+	runInput := ""
 	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled {
 		var statusResp map[string]any
-		runCommand, statusResp, err = s.prepareSudoCommand(*conn, command)
+		runCommand, runInput, statusResp, err = s.prepareSudoCommand(*conn, command)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +167,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		}
 	}
 
-	res, err := s.ssh.Exec(connectionID, sessionID, runCommand, cwd, timeoutSec)
+	res, err := s.ssh.ExecWithInput(connectionID, sessionID, runCommand, cwd, timeoutSec, runInput)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +182,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		ConnectionID:    connectionID,
 		SessionID:       sessionID,
 		Host:            conn.Host,
-		Command:         command,
+		Command:         auditCommand,
 		RiskLevel:       string(policy.RiskLevel),
 		Status:          status,
 		ExitCode:        res.ExitCode,
@@ -1108,6 +1111,13 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 			"grant_ttl_sec":                   ttlSec,
 			"grant_reusable":                  reusable,
 			"confirmation_required_each_time": !reusable,
+			"next_action": map[string]any{
+				"tool": "ssh_approve_request",
+				"arguments": map[string]any{
+					"approval_id": approvalID,
+					"decision":    "approve",
+				},
+			},
 		}
 	}
 
@@ -1139,15 +1149,6 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		}
 		if req.Status == model.ApprovalRejected {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected")
-		}
-		if req.Status == model.ApprovalPending && isEasySafeProfile(conn.SecurityProfile) {
-			resolved, err := s.approvals.Resolve(req.ID, model.ApprovalApproved, "mcp_token_resubmit", "auto-approved via easy_safe token resubmit")
-			if err != nil {
-				return privilegeAuthz{}, err
-			}
-			if resolved != nil {
-				req = resolved
-			}
 		}
 		if req.Status != model.ApprovalApproved {
 			return privilegeAuthz{Allowed: false, StatusResp: statusResp(req.ID, req.Reason), GrantTTLsec: ttlSec, Reusable: reusable, ConfirmMode: "approval_queue"}, nil
@@ -1196,36 +1197,11 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		return authz, nil
 	}
 
-	if strings.EqualFold(strings.TrimSpace(s.cfg.ApprovalMode), "terminal") {
-		ok, actor, err := s.promptTerminalApproval(connectionID, capability, risk, reason, command, commandTpl, ttlSec)
-		if err == nil {
-			if ok {
-				authz := privilegeAuthz{
-					Allowed:      true,
-					GrantTTLsec:  ttlSec,
-					ConfirmMode:  "terminal_prompt",
-					Reusable:     reusable,
-					ApprovedBy:   actor,
-					TemplateHash: commandHash,
-				}
-				if reusable {
-					grantID, err := s.createPrivilegeGrant(connectionID, capability, commandHash, risk, actor, "terminal_prompt", ttlSec, now)
-					if err != nil {
-						return privilegeAuthz{}, err
-					}
-					authz.GrantID = grantID
-				}
-				return authz, nil
-			}
-			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected in terminal prompt")
-		}
-	}
-
 	req := model.ApprovalRequest{
 		ID:           util.NewID("apr"),
 		CreatedAt:    now,
 		Status:       model.ApprovalPending,
-		Command:      command,
+		Command:      sanitizeCommandForAudit(command),
 		ConnectionID: connectionID,
 		SessionID:    sessionID,
 		RiskLevel:    risk,
@@ -1287,37 +1263,57 @@ func isEasySafeProfile(profile string) bool {
 	return strings.EqualFold(strings.TrimSpace(profile), "easy_safe")
 }
 
-func (s *Service) promptTerminalApproval(connectionID, capability string, risk model.RiskLevel, reason, command, template string, ttlSec int) (bool, string, error) {
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		return false, "", err
+func shouldRequireApproval(securityProfile string, policy security.ExecPolicyDecision) (bool, string) {
+	if !isEasySafeProfile(securityProfile) {
+		return true, "security profile requires explicit approval for every command"
 	}
-	defer tty.Close()
+	return policy.NeedsApprove, policy.Reason
+}
 
-	_, _ = fmt.Fprintf(tty, "\n[cssh] privilege approval required\n")
-	_, _ = fmt.Fprintf(tty, "connection_id: %s\n", connectionID)
-	_, _ = fmt.Fprintf(tty, "capability: %s\n", capability)
-	_, _ = fmt.Fprintf(tty, "risk_level: %s\n", risk)
-	_, _ = fmt.Fprintf(tty, "reason: %s\n", reason)
-	_, _ = fmt.Fprintf(tty, "command: %s\n", strings.TrimSpace(command))
-	_, _ = fmt.Fprintf(tty, "template: %s\n", strings.TrimSpace(template))
-	if ttlSec > 0 {
-		_, _ = fmt.Fprintf(tty, "grant_ttl_sec: %d\n", ttlSec)
-	} else {
-		_, _ = fmt.Fprintf(tty, "grant_ttl_sec: 0 (confirm each time)\n")
+func (s *Service) ApproveRequest(approvalID, decision, actor, rejectReason string) (map[string]any, error) {
+	id := strings.TrimSpace(approvalID)
+	if id == "" {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "approval_id is required")
 	}
-	_, _ = fmt.Fprintf(tty, "approve now? [y/N]: ")
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	if decision == "" {
+		decision = "approve"
+	}
+	if strings.TrimSpace(actor) == "" {
+		actor = "mcp_user"
+	}
+	status := model.ApprovalApproved
+	switch decision {
+	case "approve", "approved":
+		status = model.ApprovalApproved
+	case "reject", "rejected":
+		status = model.ApprovalRejected
+		if strings.TrimSpace(rejectReason) == "" {
+			rejectReason = "rejected by mcp user"
+		}
+	default:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "decision must be approve or reject")
+	}
 
-	reader := bufio.NewReader(tty)
-	line, err := reader.ReadString('\n')
+	updated, err := s.approvals.Resolve(id, status, actor, rejectReason)
 	if err != nil {
-		return false, "", err
+		return nil, err
 	}
-	line = strings.TrimSpace(strings.ToLower(line))
-	if line == "y" || line == "yes" {
-		return true, os.Getenv("USER"), nil
+	if updated == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "approval_id not found")
 	}
-	return false, "", nil
+	res := map[string]any{
+		"approval_id":        updated.ID,
+		"requested_decision": decision,
+		"status":             updated.Status,
+		"approved_by":        updated.ApprovedBy,
+		"reject_reason":      updated.RejectReason,
+		"approval_token":     updated.ID,
+	}
+	if updated.ResolvedAt != nil {
+		res["resolved_at"] = updated.ResolvedAt.Format(time.RFC3339)
+	}
+	return res, nil
 }
 
 func (s *Service) issueProfileDeleteToken(profileID string) string {
@@ -1354,20 +1350,20 @@ func (s *Service) validateAndConsumeProfileDeleteToken(profileID, token string) 
 	return nil
 }
 
-func (s *Service) prepareSudoCommand(conn model.Connection, command string) (string, map[string]any, error) {
+func (s *Service) prepareSudoCommand(conn model.Connection, command string) (string, string, map[string]any, error) {
 	if !security.LooksLikeSudo(command) {
-		return command, nil, nil
+		return command, "", nil, nil
 	}
 	if !s.cfg.SudoEnabled {
-		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo execution is disabled by policy")
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo execution is disabled by policy")
 	}
 	profileID := strings.TrimSpace(conn.ProfileID)
 	if profileID == "" {
-		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo requires profile-based connection")
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo requires profile-based connection")
 	}
 	secret, err := s.secrets.Get(profileID, "sudo_password")
 	if err != nil || strings.TrimSpace(secret) == "" {
-		return "", map[string]any{
+		return "", "", map[string]any{
 			"status":          "credential_required",
 			"credential_kind": "sudo_password",
 			"profile_id":      profileID,
@@ -1381,22 +1377,30 @@ func (s *Service) prepareSudoCommand(conn model.Connection, command string) (str
 
 	cmd := strings.TrimSpace(command)
 	if cmd == "sudo" {
-		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo command is incomplete")
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo command is incomplete")
 	}
 	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "sudo"))
-	if !strings.HasPrefix(rest, "-A ") && rest != "-A" {
-		rest = "-A " + rest
+	if !strings.HasPrefix(rest, "-S ") && rest != "-S" && !strings.Contains(rest, " -S ") {
+		rest = "-S -p '' " + rest
 	}
-	wrapped := strings.Join([]string{
-		"ask=$(mktemp)",
-		"printf '%s\\n' '#!/bin/sh' " + util.ShellQuote("printf '%s\\n' "+util.ShellQuote(secret)) + " > \"$ask\"",
-		"chmod 700 \"$ask\"",
-		"SUDO_ASKPASS=\"$ask\" sudo " + rest,
-		"rc=$?",
-		"rm -f \"$ask\"",
-		"exit $rc",
-	}, "; ")
-	return wrapped, nil, nil
+	return "sudo " + rest, secret + "\n", nil, nil
+}
+
+var (
+	auditKVSecretRE   = regexp.MustCompile(`(?i)\b(password|passwd|passphrase|token|secret|api[_-]?key|access[_-]?key)\s*=\s*([^\s;|&]+)`)
+	auditFlagSecretRE = regexp.MustCompile(`(?i)\b(--?(?:password|passphrase|token|secret|api[_-]?key|access[_-]?key)|-p)\s+([^\s;|&]+)`)
+	auditURLSecretRE  = regexp.MustCompile(`://([^:@/\s]+):([^@/\s]+)@`)
+)
+
+func sanitizeCommandForAudit(command string) string {
+	out := strings.TrimSpace(command)
+	if out == "" {
+		return out
+	}
+	out = auditKVSecretRE.ReplaceAllString(out, "$1=***")
+	out = auditFlagSecretRE.ReplaceAllString(out, "$1 ***")
+	out = auditURLSecretRE.ReplaceAllString(out, "://$1:***@")
+	return out
 }
 
 func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Connection, error) {

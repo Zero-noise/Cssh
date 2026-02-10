@@ -3,6 +3,7 @@ package mcp
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
@@ -228,6 +229,26 @@ func TestProfileDeleteAndSudoPromptToolsSchema(t *testing.T) {
 	if _, exists := sudoProps["prompt_mode"]; !exists {
 		t.Fatalf("ssh_sudo_password_prompt should support prompt_mode")
 	}
+
+	approveTool := findToolDef(t, "ssh_approve_request")
+	approveSchema, ok := approveTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	approveReq := requiredAsAny(t, approveSchema)
+	if !containsString(approveReq, "approval_id") {
+		t.Fatalf("ssh_approve_request should require approval_id")
+	}
+	approveProps, ok := approveSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	if _, exists := approveProps["decision"]; !exists {
+		t.Fatalf("ssh_approve_request should include decision")
+	}
+	if _, exists := approveProps["approved_by"]; !exists {
+		t.Fatalf("ssh_approve_request should include approved_by")
+	}
 }
 
 func TestSSHDownloadFileSchema(t *testing.T) {
@@ -300,35 +321,6 @@ func TestInitializedNotificationGate(t *testing.T) {
 	}
 }
 
-func TestToolsCallNoStructuredContent(t *testing.T) {
-	tmp := t.TempDir()
-	svc := app.NewService(model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		RuntimeDir:        filepath.Join(tmp, "runtime"),
-		LogsDir:           filepath.Join(tmp, "logs"),
-		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
-	})
-	s := NewServer(svc)
-	s.seenInitialize = true
-	s.clientInitialized = true
-
-	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profiles_list","arguments":{}}`)}, 1)
-	if res.Error != nil {
-		t.Fatalf("unexpected error: %#v", res.Error)
-	}
-	rm, ok := res.Result.(map[string]any)
-	if !ok {
-		t.Fatalf("result is not a map")
-	}
-	if _, exists := rm["structuredContent"]; exists {
-		t.Fatalf("structuredContent should not exist in tools/call response")
-	}
-	if _, ok := rm["isError"].(bool); !ok {
-		t.Fatalf("isError bool should exist")
-	}
-}
-
 func TestCredentialPromptSchemaSupportsSudoPassword(t *testing.T) {
 	tool := findToolDef(t, "ssh_credentials_prompt")
 	schema, ok := tool["inputSchema"].(map[string]any)
@@ -383,5 +375,42 @@ func TestQuickSetupSaveSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 	}
 	if _, ok := props["allow_public_host"]; !ok {
 		t.Fatalf("allow_public_host should stay available in quick setup schema")
+	}
+}
+
+func TestApproveRequestToolCall(t *testing.T) {
+	tmp := t.TempDir()
+	svc := app.NewService(model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	})
+	req := model.ApprovalRequest{
+		ID:          "apr_tool_1",
+		CreatedAt:   time.Now().UTC(),
+		Status:      model.ApprovalPending,
+		Command:     "cat /etc/hosts",
+		RiskLevel:   model.RiskL0,
+		RequestedBy: "mcp",
+	}
+	if err := svc.Approvals().Create(req); err != nil {
+		t.Fatalf("create approval: %v", err)
+	}
+	s := NewServer(svc)
+	out, err := s.callTool("ssh_approve_request", map[string]any{
+		"approval_id": req.ID,
+		"decision":    "approve",
+		"approved_by": "alice",
+	})
+	if err != nil {
+		t.Fatalf("ssh_approve_request call failed: %v", err)
+	}
+	if out["status"] != model.ApprovalApproved {
+		t.Fatalf("unexpected status: %#v", out["status"])
+	}
+	if out["approval_token"] != req.ID {
+		t.Fatalf("unexpected approval_token: %#v", out["approval_token"])
 	}
 }

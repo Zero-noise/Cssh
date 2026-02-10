@@ -238,6 +238,10 @@ func (m *Manager) GetSession(id string) (*model.Session, error) {
 }
 
 func (m *Manager) Exec(connectionID, sessionID, command, cwd string, timeoutSec int) (ExecResult, error) {
+	return m.ExecWithInput(connectionID, sessionID, command, cwd, timeoutSec, "")
+}
+
+func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, timeoutSec int, stdin string) (ExecResult, error) {
 	if command == "" {
 		return ExecResult{}, errorsx.New(errorsx.CodeInvalidParams, "command is required")
 	}
@@ -283,6 +287,9 @@ func (m *Manager) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	start := time.Now()
 	err = cmd.Run()
 	d := time.Since(start)

@@ -41,9 +41,9 @@ claude mcp remove cssh
 ## Security Model (v2)
 
 - Default mode: `easy_safe`.
-- `easy_safe`: high-risk approvals create reusable grants for 15 minutes (by command template).
-- Non-`easy_safe`: high-risk operations require manual confirmation every time (no reusable grant).
-- Default `approval_mode` is `queue` to avoid terminal UI conflicts with MCP client confirmations.
+- `easy_safe`: only critical destructive commands require approval (for example `rm -rf /`, `reboot`, `shutdown`, `mkfs`). Approvals are reusable by command template for `easy_safe_approval_ttl_sec` seconds (default `900`, set to `0` to disable reuse).
+- Non-`easy_safe` (for example `ops_strict`): every command requires explicit approval (no reusable grant by default).
+- Approval flow is MCP-first (`ssh_approve_request`) to avoid `/dev/tty` prompt deadlocks in Claude Code/Codex sessions.
 - Remote connect defaults to profile-only (whitelisted profiles).
 - Write scope: only inside `workspace_roots`.
 - Credentials are stored in OS key store:
@@ -112,7 +112,7 @@ csshctl migrate security
 |------|-------------|
 | `ssh_connect` | Create an SSH connection, returns `connection_id` |
 | `ssh_open_session` | Create a reusable shell session |
-| `ssh_exec` | Run a command on remote host |
+| `ssh_exec` | Run a command on remote host (easy_safe: critical L2 approval; non-easy_safe: any command may require approval) |
 | `ssh_connection_status` | Check one/all active SSH connection health and session summary |
 | `ssh_privilege_status` | List privilege grants (active/all) |
 | `ssh_privilege_revoke` | Revoke one privilege grant immediately |
@@ -128,9 +128,30 @@ csshctl migrate security
 | `ssh_profiles_list` | List saved SSH profiles |
 | `ssh_profile_delete` | Delete one saved SSH profile (two-step confirm token flow, optional secret cleanup) |
 | `ssh_quick_setup_template` | Get a setup form template for AI-guided onboarding |
-| `ssh_quick_setup_save` | Save profile + secrets from the setup form |
-| `ssh_credentials_prompt` | Open secure local credential entry form (password/key passphrase/sudo password) |
-| `ssh_sudo_password_prompt` | Open secure local form specifically for sudo password |
+| `ssh_quick_setup_save` | Save profile metadata only (host/user/path/policy). Credentials are entered later via credential prompt |
+| `ssh_credentials_prompt` | Default secure web credential prompt; if web unavailable returns manual `./csshctl secret set-* --profile <id>` commands |
+| `ssh_sudo_password_prompt` | Same flow as above but scoped to `sudo_password` |
+| `ssh_approve_request` | Approve/reject one pending `ssh_exec` approval request |
+
+## Credential Fallback (No Web)
+
+Default credential flow is `ssh_credentials_prompt` with web form.
+If web is unavailable in current MCP session, tool response includes:
+
+- `profile_id`
+- `manual_commands` (for example `./csshctl secret set-key-passphrase --profile <profile_id>`)
+
+Run the returned command(s) in your local terminal.
+If you run them in another terminal tab/window, continue without restarting.
+If you run them after this session is closed, restart Claude Code/Codex and resume this conversation.
+
+Common commands:
+
+```bash
+./csshctl secret set-password --profile <profile_id>
+./csshctl secret set-key-passphrase --profile <profile_id>
+./csshctl secret set-sudo-password --profile <profile_id>
+```
 
 ## Fast Setup Flow (AI-Guided)
 
@@ -138,8 +159,9 @@ When a user says "I want to connect to this SSH host to do X", AI can run:
 
 1. `ssh_quick_setup_template` to get a compact fill-in form.
 2. Ask the user to provide the form values.
-3. `ssh_quick_setup_save` to persist profile + secrets automatically.
-4. Call `ssh_connect` with returned `profile_id`.
+3. `ssh_quick_setup_save` to persist profile metadata (credentials are not stored here).
+4. Call `ssh_credentials_prompt` (web by default). If web fails, run returned `manual_commands`.
+5. Call `ssh_connect` with returned `profile_id`.
 
 Example `ssh_quick_setup_save` arguments:
 

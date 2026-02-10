@@ -65,17 +65,13 @@ func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, er
 	mode := normalizePromptMode(in.Mode)
 	if mode == "terminal" {
 		if !canUseTerminalPrompt() {
-			return map[string]any{
-				"saved":      false,
-				"profile_id": profile.ID,
-				"method":     "manual",
-				"message":    "Terminal credential prompt is unavailable in this MCP session. Use prompt_mode=web, or run csshctl secret set-* manually.",
-			}, nil
+			return manualCredentialPromptResult(profile.ID, fields), nil
 		}
 		result, err := s.credentialPromptTerminal(profile, fields)
 		if err == nil {
 			return result, nil
 		}
+		return manualCredentialPromptResult(profile.ID, fields), nil
 	}
 	if mode == "web" || mode == "auto" {
 		if hasDisplay() {
@@ -84,28 +80,9 @@ func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, er
 				return result, nil
 			}
 		}
-		if hasDisplay() {
-			result, err := s.credentialPromptEditor(profile, fields)
-			if err == nil {
-				return result, nil
-			}
-		}
-	}
-	if mode == "auto" {
-		if canUseTerminalPrompt() {
-			result, err := s.credentialPromptTerminal(profile, fields)
-			if err == nil {
-				return result, nil
-			}
-		}
 	}
 
-	return map[string]any{
-		"saved":      false,
-		"profile_id": profile.ID,
-		"method":     "manual",
-		"message":    manualCredentialInstructions(profile.ID, fields),
-	}, nil
+	return manualCredentialPromptResult(profile.ID, fields), nil
 }
 
 func normalizePromptMode(v string) string {
@@ -168,21 +145,37 @@ func normalizeCredentialFields(fields []string) ([]string, []string) {
 }
 
 func manualCredentialInstructions(profileID string, fields []string) string {
+	cmds := manualCredentialCommands(profileID, fields)
+	if len(cmds) == 0 {
+		return "Could not open browser. Use ./csshctl secret set-* manually."
+	}
+	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
+}
+
+func manualCredentialCommands(profileID string, fields []string) []string {
 	cmds := make([]string, 0, len(fields))
 	for _, f := range fields {
 		switch f {
 		case "password":
-			cmds = append(cmds, "csshctl secret set-password --profile "+profileID)
+			cmds = append(cmds, "./csshctl secret set-password --profile "+profileID)
 		case "key_passphrase":
-			cmds = append(cmds, "csshctl secret set-key-passphrase --profile "+profileID)
+			cmds = append(cmds, "./csshctl secret set-key-passphrase --profile "+profileID)
 		case "sudo_password":
-			cmds = append(cmds, "csshctl secret set-sudo-password --profile "+profileID)
+			cmds = append(cmds, "./csshctl secret set-sudo-password --profile "+profileID)
 		}
 	}
-	if len(cmds) == 0 {
-		return "Could not open browser or editor. Use csshctl secret commands to set credentials manually."
+	return cmds
+}
+
+func manualCredentialPromptResult(profileID string, fields []string) map[string]any {
+	cmds := manualCredentialCommands(profileID, fields)
+	return map[string]any{
+		"saved":           false,
+		"profile_id":      profileID,
+		"method":          "manual",
+		"manual_commands": cmds,
+		"message":         manualCredentialInstructions(profileID, fields),
 	}
-	return "Could not open browser or editor. Set credentials manually with: " + strings.Join(cmds, " ; ")
 }
 
 func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (map[string]any, error) {
@@ -296,131 +289,6 @@ func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (
 	case <-time.After(5 * time.Minute):
 		return nil, fmt.Errorf("credential prompt timed out after 5 minutes")
 	}
-}
-
-func (s *Service) credentialPromptEditor(profile *model.Profile, fields []string) (map[string]any, error) {
-	tmpFile, err := os.CreateTemp("", "cssh-creds-*.txt")
-	if err != nil {
-		return nil, fmt.Errorf("create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("chmod: %w", err)
-	}
-
-	var tmplBuf strings.Builder
-	tmplBuf.WriteString("# CSSH Credential Entry\n")
-	tmplBuf.WriteString(fmt.Sprintf("# Profile: %s (%s)\n", profile.Name, profile.ID))
-	tmplBuf.WriteString(fmt.Sprintf("# Host: %s:%d  User: %s\n", profile.Host, profile.Port, profile.Username))
-	tmplBuf.WriteString("# Enter credentials below, save and close the editor.\n")
-	tmplBuf.WriteString("# Lines starting with # are ignored.\n\n")
-	for _, f := range fields {
-		tmplBuf.WriteString(f + ":\n")
-	}
-
-	if _, err := tmpFile.WriteString(tmplBuf.String()); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("write template: %w", err)
-	}
-	tmpFile.Close()
-
-	switch runtime.GOOS {
-	case "darwin":
-		cmd := exec.Command("open", "-t", "-W", tmpPath)
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("open editor: %w", err)
-		}
-	case "linux":
-		cmd := exec.Command("xdg-open", tmpPath)
-		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("xdg-open: %w", err)
-		}
-		// poll mtime for changes
-		initialInfo, err := os.Stat(tmpPath)
-		if err != nil {
-			return nil, fmt.Errorf("stat temp file: %w", err)
-		}
-		initialMtime := initialInfo.ModTime()
-		deadline := time.Now().Add(5 * time.Minute)
-		for time.Now().Before(deadline) {
-			time.Sleep(1 * time.Second)
-			info, err := os.Stat(tmpPath)
-			if err != nil {
-				continue
-			}
-			if info.ModTime().After(initialMtime) {
-				// give user a moment to finish saving
-				time.Sleep(1 * time.Second)
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("editor prompt timed out after 5 minutes")
-		}
-	default:
-		return nil, fmt.Errorf("unsupported OS for editor prompt: %s", runtime.GOOS)
-	}
-
-	content, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return nil, fmt.Errorf("read temp file: %w", err)
-	}
-
-	saved := map[string]bool{}
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		if val == "" {
-			continue
-		}
-		validField := false
-		for _, f := range fields {
-			if f == key {
-				validField = true
-				break
-			}
-		}
-		if !validField {
-			continue
-		}
-		if err := s.secrets.Set(profile.ID, key, val); err != nil {
-			return nil, fmt.Errorf("save %s: %w", key, err)
-		}
-		saved[key] = true
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan temp file: %w", err)
-	}
-
-	for _, f := range fields {
-		if _, ok := saved[f]; !ok {
-			saved[f] = false
-		}
-	}
-
-	return map[string]any{
-		"saved":         countSavedFields(saved) > 0,
-		"profile_id":    profile.ID,
-		"secrets_saved": saved,
-		"method":        "editor",
-		"connect_hint": map[string]any{
-			"tool":      "ssh_connect",
-			"arguments": map[string]any{"profile_id": profile.ID},
-		},
-	}, nil
 }
 
 func (s *Service) credentialPromptTerminal(profile *model.Profile, fields []string) (map[string]any, error) {
