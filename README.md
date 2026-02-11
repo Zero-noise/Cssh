@@ -55,7 +55,7 @@ claude mcp remove cssh
 | `ssh_list_dir` | List remote directory entries |
 | `ssh_search_text` | Search text in remote files |
 | `ssh_tail_log` | Tail remote log file |
-| `ssh_transfer` | Transfer files via SCP (upload / download) with optional SHA-256 verification |
+| `ssh_transfer` | Transfer files using `scp` client (SFTP by default, legacy SCP fallback) with optional SHA-256 verification |
 | `ssh_profile` | List or delete saved profiles |
 | `ssh_profile_setup` | Create profiles via guided setup flow |
 | `ssh_credentials_prompt` | Securely store credentials via local web form |
@@ -100,9 +100,21 @@ csshctl approve apr_xxx --by yourname
 
 `ssh_transfer` supports `direction=upload` (local → remote) and `direction=download` (remote → local).
 
+- `scp` is the transport client. On modern OpenSSH it uses SFTP mode by default; if SFTP subsystem is unavailable, Cssh retries with legacy SCP (`-O`).
 - Default mode is `create` (fails if target exists). Use `mode=overwrite` to replace.
 - SHA-256 checksum verification is enabled by default.
 - Local paths are restricted to the current working directory unless `allow_local_anywhere=true`.
+- Response includes `transfer_protocol` (`sftp` or `scp_legacy`) and `fallback_used` (`true/false`). When fallback happens, `fallback_reason` is also returned.
+
+## Recommended AI Workflow
+
+Use canonical tools only (legacy aliases remain compatible but deprecated):
+
+1. `ssh_profile_setup(step=template|save)`
+2. `ssh_credentials_prompt(profile_id=...)` (if auth requires credentials)
+3. `ssh_connect(profile_id=...)`
+4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
+5. `ssh_approve_request` only when a call returns `approval_required`
 
 ```json
 {

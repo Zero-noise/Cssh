@@ -8,6 +8,7 @@ import (
 
 	"cssh/internal/errorsx"
 	"cssh/internal/security"
+	"cssh/internal/sshbridge"
 )
 
 func TestNormalizeTransferMode(t *testing.T) {
@@ -122,5 +123,29 @@ func TestInstallLocalCreateOnlyFileExists(t *testing.T) {
 	}
 	if string(got) != "old" {
 		t.Fatalf("destination should keep old content, got=%q", string(got))
+	}
+}
+
+func TestTransferAuditDetailIncludesProtocolAndFallback(t *testing.T) {
+	got := transferAuditDetail("a -> b", sshbridge.TransferResult{
+		Protocol:       "scp_legacy",
+		FallbackUsed:   true,
+		FallbackReason: "sftp server unavailable",
+	})
+	if !strings.Contains(got, "protocol=scp_legacy") {
+		t.Fatalf("detail should include protocol, got=%q", got)
+	}
+	if !strings.Contains(got, "fallback_used=true") {
+		t.Fatalf("detail should include fallback flag, got=%q", got)
+	}
+	if !strings.Contains(got, "fallback_reason=sftp server unavailable") {
+		t.Fatalf("detail should include fallback reason, got=%q", got)
+	}
+}
+
+func TestTransferAuditDetailWithoutProtocol(t *testing.T) {
+	got := transferAuditDetail("a -> b", sshbridge.TransferResult{})
+	if got != "a -> b" {
+		t.Fatalf("unexpected detail without protocol: %q", got)
 	}
 }

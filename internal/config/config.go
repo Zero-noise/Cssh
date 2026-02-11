@@ -16,7 +16,7 @@ const defaultConfigBody = `# Cssh runtime configuration
 
 default_shell = "bash -lc"
 default_timeout_sec = 120
-allow_public_host = false
+allow_public_host = true
 security_profile_default = "easy_safe"
 connect_require_profile = true
 easy_safe_approval_ttl_sec = 900
@@ -66,7 +66,7 @@ func Load(configPath string) (model.Config, error) {
 	cfg := model.Config{
 		DefaultShell:           "bash -lc",
 		DefaultTimeoutSec:      120,
-		AllowPublicHost:        false,
+		AllowPublicHost:        true,
 		RuntimeDir:             filepath.Join(base, "runtime"),
 		LogsDir:                filepath.Join(base, "logs"),
 		ProfilesFile:           filepath.Join(base, "profiles.json"),

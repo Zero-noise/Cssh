@@ -37,7 +37,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		"port":              22,
 		"auth_mode":         authMode,
 		"workspace_roots":   []string{defaultRoot},
-		"allow_public_host": false,
+		"allow_public_host": true,
 		"key_path":          "~/.ssh/id_ed25519",
 		"security_profile":  normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault),
 		"allow_root_user":   false,
@@ -53,7 +53,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "auth_mode", "label": "Auth Mode", "type": "string", "required": false, "enum": []string{"hybrid", "key", "password"}, "default": authMode},
 		{"name": "workspace_roots", "label": "Workspace Roots", "type": "array", "required": false, "default": []string{defaultRoot}},
 		{"name": "key_path", "label": "Private Key Path", "type": "string", "required": false, "default": "~/.ssh/id_ed25519"},
-		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": false},
+		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": true},
 		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)},
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 	}

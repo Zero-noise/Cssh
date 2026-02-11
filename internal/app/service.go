@@ -392,17 +392,19 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		remoteTemp = transferTempPath(remoteResolved)
 		uploadTarget = remoteTemp
 	}
-	durationMS, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec)
+	transferRes, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec)
+	auditDetail := transferAuditDetail(localAbs+" -> "+remoteResolved, transferRes)
+	durationMS := transferRes.DurationMS
 	if err != nil {
 		if remoteTemp != "" {
 			s.remoteRemoveFile(connectionID, remoteTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := s.remoteInstallCreateOnly(connectionID, remoteTemp, remoteResolved); err != nil {
-			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 			return nil, err
 		}
 	}
@@ -419,21 +421,27 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			return nil, err
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", localAbs+" -> "+remoteResolved, durationMS)
-	return map[string]any{
-		"bytes":         info.Size(),
-		"local_sha256":  localSHA,
-		"remote_sha256": remoteSHA,
-		"local_path":    localAbs,
-		"remote_path":   remoteResolved,
-		"duration_ms":   durationMS,
-		"grant_id":      authz.GrantID,
-	}, nil
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+		"grant_id":          authz.GrantID,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	return resp, nil
 }
 
 func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
@@ -525,17 +533,19 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		localTemp = transferTempPath(localAbs)
 		downloadTarget = localTemp
 	}
-	durationMS, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec)
+	transferRes, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec)
+	auditDetail := transferAuditDetail(remoteResolved+" -> "+localAbs, transferRes)
+	durationMS := transferRes.DurationMS
 	if err != nil {
 		if localTemp != "" {
 			_ = os.Remove(localTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := installLocalCreateOnly(localTemp, localAbs); err != nil {
-			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 			return nil, err
 		}
 	}
@@ -559,21 +569,27 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", remoteResolved+" -> "+localAbs, durationMS)
-	return map[string]any{
-		"bytes":         info.Size(),
-		"local_sha256":  localSHA,
-		"remote_sha256": remoteSHA,
-		"local_path":    localAbs,
-		"remote_path":   remoteResolved,
-		"duration_ms":   durationMS,
-		"grant_id":      authz.GrantID,
-	}, nil
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+		"grant_id":          authz.GrantID,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	return resp, nil
 }
 
 func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd string) (map[string]any, error) {
@@ -1053,6 +1069,24 @@ func ensureChecksumsMatch(localSHA, remoteSHA string) error {
 		return nil
 	}
 	return errorsx.New(errorsx.CodeChecksumMismatch, "sha256 mismatch between local and remote file")
+}
+
+func transferAuditDetail(base string, tr sshbridge.TransferResult) string {
+	detail := strings.TrimSpace(base)
+	if tr.Protocol == "" {
+		return detail
+	}
+	extra := "protocol=" + tr.Protocol
+	if tr.FallbackUsed {
+		extra += ", fallback_used=true"
+		if tr.FallbackReason != "" {
+			extra += ", fallback_reason=" + tr.FallbackReason
+		}
+	}
+	if detail == "" {
+		return extra
+	}
+	return detail + " (" + extra + ")"
 }
 
 func (s *Service) writeTransferAudit(traceID, typ, connectionID, host, filePath, status, detail string, durationMS int64) {

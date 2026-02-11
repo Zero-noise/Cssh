@@ -17,12 +17,12 @@ All runtime artifacts are auto-created — no manual setup needed.
 Auto-generated with sensible defaults on first run. Key fields:
 
 ```toml
-[security]
-default_security_profile = "easy_safe"
+security_profile_default = "easy_safe"
 easy_safe_approval_ttl_sec = 900
-
-[connect]
-allow_public_host = false
+allow_public_host = true
+connect_require_profile = true
+approval_mode = "queue"
+sudo_enabled = true
 ```
 
 ## Audit Logs

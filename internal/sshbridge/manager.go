@@ -25,6 +25,18 @@ type ExecResult struct {
 	DurationMS int64
 }
 
+type TransferResult struct {
+	DurationMS     int64
+	Protocol       string
+	FallbackUsed   bool
+	FallbackReason string
+}
+
+const (
+	transferProtocolSFTP      = "sftp"
+	transferProtocolSCPLegacy = "scp_legacy"
+)
+
 type Manager struct {
 	runtimeDir      string
 	defaultShell    string
@@ -314,25 +326,25 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	return res, errorsx.New(errorsx.CodeInternal, err.Error())
 }
 
-func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeoutSec int) (int64, error) {
+func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeoutSec int) (TransferResult, error) {
 	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(remotePath) == "" {
-		return 0, errorsx.New(errorsx.CodeInvalidParams, "local_path and remote_path are required")
+		return TransferResult{}, errorsx.New(errorsx.CodeInvalidParams, "local_path and remote_path are required")
 	}
 	conn, err := m.GetConnection(connectionID)
 	if err != nil {
-		return 0, err
+		return TransferResult{}, err
 	}
 	target := scpRemoteSpec(conn.Username, conn.Host, remotePath)
 	return m.runSCP(conn, timeoutSec, localPath, target)
 }
 
-func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int) (int64, error) {
+func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int) (TransferResult, error) {
 	if strings.TrimSpace(remotePath) == "" || strings.TrimSpace(localPath) == "" {
-		return 0, errorsx.New(errorsx.CodeInvalidParams, "remote_path and local_path are required")
+		return TransferResult{}, errorsx.New(errorsx.CodeInvalidParams, "remote_path and local_path are required")
 	}
 	conn, err := m.GetConnection(connectionID)
 	if err != nil {
-		return 0, err
+		return TransferResult{}, err
 	}
 	source := scpRemoteSpec(conn.Username, conn.Host, remotePath)
 	return m.runSCP(conn, timeoutSec, source, localPath)
@@ -388,7 +400,7 @@ func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bo
 	return false, socketExists, msg, nil
 }
 
-func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target string) (int64, error) {
+func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target string) (TransferResult, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
 	}
@@ -396,28 +408,58 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 	start := time.Now()
 	firstStderr, firstErr := m.runSCPOnce(conn, totalTimeout, false, source, target)
 	if firstErr == nil {
-		return time.Since(start).Milliseconds(), nil
+		return TransferResult{
+			DurationMS: time.Since(start).Milliseconds(),
+			Protocol:   transferProtocolSFTP,
+		}, nil
 	}
 	if isExecTimeoutError(firstErr) {
-		return time.Since(start).Milliseconds(), firstErr
+		return TransferResult{
+			DurationMS: time.Since(start).Milliseconds(),
+			Protocol:   transferProtocolSFTP,
+		}, firstErr
 	}
 	if !shouldRetryLegacySCP(firstStderr) {
-		return time.Since(start).Milliseconds(), errorsx.New(errorsx.CodeInternal, formatSCPAttemptError(firstStderr, firstErr))
+		return TransferResult{
+			DurationMS: time.Since(start).Milliseconds(),
+			Protocol:   transferProtocolSFTP,
+		}, errorsx.New(errorsx.CodeInternal, formatSCPAttemptError(firstStderr, firstErr))
 	}
+	fallbackReason := formatSCPAttemptError(firstStderr, firstErr)
 	remaining := totalTimeout - time.Since(start)
 	if remaining <= 0 {
-		return time.Since(start).Milliseconds(), errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
+		return TransferResult{
+			DurationMS:     time.Since(start).Milliseconds(),
+			Protocol:       transferProtocolSCPLegacy,
+			FallbackUsed:   true,
+			FallbackReason: fallbackReason,
+		}, errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 	}
 	secondStderr, secondErr := m.runSCPOnce(conn, remaining, true, source, target)
 	if secondErr == nil {
-		return time.Since(start).Milliseconds(), nil
+		return TransferResult{
+			DurationMS:     time.Since(start).Milliseconds(),
+			Protocol:       transferProtocolSCPLegacy,
+			FallbackUsed:   true,
+			FallbackReason: fallbackReason,
+		}, nil
 	}
 	if isExecTimeoutError(secondErr) {
-		return time.Since(start).Milliseconds(), secondErr
+		return TransferResult{
+			DurationMS:     time.Since(start).Milliseconds(),
+			Protocol:       transferProtocolSCPLegacy,
+			FallbackUsed:   true,
+			FallbackReason: fallbackReason,
+		}, secondErr
 	}
 	msg := "scp sftp attempt failed: " + formatSCPAttemptError(firstStderr, firstErr) +
 		"; scp legacy retry failed: " + formatSCPAttemptError(secondStderr, secondErr)
-	return time.Since(start).Milliseconds(), errorsx.New(errorsx.CodeInternal, msg)
+	return TransferResult{
+		DurationMS:     time.Since(start).Milliseconds(),
+		Protocol:       transferProtocolSCPLegacy,
+		FallbackUsed:   true,
+		FallbackReason: fallbackReason,
+	}, errorsx.New(errorsx.CodeInternal, msg)
 }
 
 func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, legacy bool, source, target string) (string, error) {

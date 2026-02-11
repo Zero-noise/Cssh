@@ -3,6 +3,7 @@ package mcp
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -123,6 +124,22 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 	if args == nil {
 		args = map[string]any{}
 	}
+	canonicalName, deprecatedFrom, ok := resolveToolAlias(name)
+	if !ok {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
+	}
+	args = applyToolAliasDefaults(args, deprecatedFrom)
+	result, err := s.callCanonicalTool(canonicalName, args)
+	if err != nil {
+		return nil, err
+	}
+	if deprecatedFrom != "" {
+		result = withDeprecatedToolWarning(result, deprecatedFrom, canonicalName)
+	}
+	return result, nil
+}
+
+func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string]any, error) {
 	switch name {
 	case "ssh_connect":
 		in := model.ConnectionInput{
@@ -214,56 +231,6 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction must be one of: upload, download")
 		}
-	case "ssh_upload_file":
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		localPath, err := app.RequireString(args, "local_path")
-		if err != nil {
-			return nil, err
-		}
-		remotePath, err := app.RequireString(args, "remote_path")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.UploadFile(
-			connID,
-			localPath,
-			remotePath,
-			stringArg(args, "mode"),
-			stringArg(args, "cwd"),
-			app.ParseIntAny(args["timeout_sec"], 300),
-			app.ParseBoolAny(args["create_parents"], true),
-			app.ParseBoolAny(args["verify_checksum"], true),
-			app.ParseBoolAny(args["allow_local_anywhere"], false),
-			stringArg(args, "approval_token"),
-		)
-	case "ssh_download_file":
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		remotePath, err := app.RequireString(args, "remote_path")
-		if err != nil {
-			return nil, err
-		}
-		localPath, err := app.RequireString(args, "local_path")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.DownloadFile(
-			connID,
-			remotePath,
-			localPath,
-			stringArg(args, "mode"),
-			stringArg(args, "cwd"),
-			app.ParseIntAny(args["timeout_sec"], 300),
-			app.ParseBoolAny(args["create_parents"], true),
-			app.ParseBoolAny(args["verify_checksum"], true),
-			app.ParseBoolAny(args["allow_local_anywhere"], false),
-			stringArg(args, "approval_token"),
-		)
 	case "ssh_read_file":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -359,14 +326,6 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "action must be one of: list, delete")
 		}
-	case "ssh_profiles_list":
-		return s.svc.ProfilesList()
-	case "ssh_profile_delete":
-		profileID, err := app.RequireString(args, "profile_id")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.ProfileDelete(profileID, app.ParseBoolAny(args["delete_secrets"], true), stringArg(args, "confirm_token"))
 	case "ssh_profile_setup":
 		step := strings.ToLower(stringArg(args, "step"))
 		if step == "" {
@@ -412,43 +371,6 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
 		}
 		return s.svc.QuickSetupSave(in)
-	case "ssh_quick_setup_template":
-		return s.svc.QuickSetupTemplate(stringArg(args, "purpose"), stringArg(args, "auth_mode"), stringArg(args, "username"))
-	case "ssh_quick_setup_save":
-		purpose, err := app.RequireString(args, "purpose")
-		if err != nil {
-			return nil, err
-		}
-		host, err := app.RequireString(args, "host")
-		if err != nil {
-			return nil, err
-		}
-		username, err := app.RequireString(args, "username")
-		if err != nil {
-			return nil, err
-		}
-		roots := app.ParseStringSliceAny(args["workspace_roots"])
-		if len(roots) == 0 {
-			single := stringArg(args, "workspace_root")
-			if single != "" {
-				roots = []string{single}
-			}
-		}
-		in := app.QuickSetupInput{
-			Purpose:         purpose,
-			ProfileID:       stringArg(args, "profile_id"),
-			ProfileName:     stringArg(args, "profile_name"),
-			Host:            host,
-			Port:            app.ParseIntAny(args["port"], 22),
-			Username:        username,
-			AuthMode:        stringArg(args, "auth_mode"),
-			WorkspaceRoots:  roots,
-			KeyPath:         stringArg(args, "key_path"),
-			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], false),
-			SecurityProfile: stringArg(args, "security_profile"),
-			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
-		}
-		return s.svc.QuickSetupSave(in)
 	case "ssh_credentials_prompt":
 		profileID, err := app.RequireString(args, "profile_id")
 		if err != nil {
@@ -460,20 +382,6 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 			Mode:      stringArg(args, "prompt_mode"),
 		}
 		return s.svc.CredentialPrompt(in)
-	case "ssh_sudo_password_prompt":
-		profileID, err := app.RequireString(args, "profile_id")
-		if err != nil {
-			return nil, err
-		}
-		mode := stringArg(args, "prompt_mode")
-		if mode == "" {
-			mode = "web"
-		}
-		return s.svc.CredentialPrompt(app.CredentialPromptInput{
-			ProfileID: profileID,
-			Fields:    []string{"sudo_password"},
-			Mode:      mode,
-		})
 	case "ssh_approve_request":
 		approvalID, err := app.RequireString(args, "approval_id")
 		if err != nil {
@@ -488,6 +396,118 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
+}
+
+var canonicalToolNames = map[string]struct{}{
+	"ssh_connect":            {},
+	"ssh_open_session":       {},
+	"ssh_exec":               {},
+	"ssh_connection_status":  {},
+	"ssh_privilege_status":   {},
+	"ssh_privilege_revoke":   {},
+	"ssh_transfer":           {},
+	"ssh_read_file":          {},
+	"ssh_write_file":         {},
+	"ssh_apply_patch":        {},
+	"ssh_list_dir":           {},
+	"ssh_search_text":        {},
+	"ssh_tail_log":           {},
+	"ssh_disconnect":         {},
+	"ssh_profile":            {},
+	"ssh_profile_setup":      {},
+	"ssh_credentials_prompt": {},
+	"ssh_approve_request":    {},
+}
+
+var toolAliases = map[string]string{
+	"ssh_upload_file":          "ssh_transfer",
+	"ssh_download_file":        "ssh_transfer",
+	"ssh_profiles_list":        "ssh_profile",
+	"ssh_profile_delete":       "ssh_profile",
+	"ssh_quick_setup_template": "ssh_profile_setup",
+	"ssh_quick_setup_save":     "ssh_profile_setup",
+	"ssh_sudo_password_prompt": "ssh_credentials_prompt",
+}
+
+func resolveToolAlias(name string) (canonicalName, deprecatedFrom string, ok bool) {
+	if canonical, found := toolAliases[name]; found {
+		return canonical, name, true
+	}
+	if _, found := canonicalToolNames[name]; found {
+		return name, "", true
+	}
+	return "", "", false
+}
+
+func applyToolAliasDefaults(args map[string]any, deprecatedFrom string) map[string]any {
+	if deprecatedFrom == "" {
+		return args
+	}
+	out := make(map[string]any, len(args)+2)
+	for k, v := range args {
+		out[k] = v
+	}
+	switch deprecatedFrom {
+	case "ssh_upload_file":
+		if stringArg(out, "direction") == "" {
+			out["direction"] = "upload"
+		}
+	case "ssh_download_file":
+		if stringArg(out, "direction") == "" {
+			out["direction"] = "download"
+		}
+	case "ssh_profiles_list":
+		if stringArg(out, "action") == "" {
+			out["action"] = "list"
+		}
+	case "ssh_profile_delete":
+		if stringArg(out, "action") == "" {
+			out["action"] = "delete"
+		}
+	case "ssh_quick_setup_template":
+		if stringArg(out, "step") == "" {
+			out["step"] = "template"
+		}
+	case "ssh_quick_setup_save":
+		if stringArg(out, "step") == "" {
+			out["step"] = "save"
+		}
+	case "ssh_sudo_password_prompt":
+		if _, ok := out["fields"]; !ok {
+			out["fields"] = []string{"sudo_password"}
+		}
+		if stringArg(out, "prompt_mode") == "" {
+			out["prompt_mode"] = "web"
+		}
+	}
+	return out
+}
+
+func withDeprecatedToolWarning(result map[string]any, deprecatedFrom, canonicalName string) map[string]any {
+	if result == nil {
+		result = map[string]any{}
+	}
+	warning := fmt.Sprintf("Tool %s is deprecated; use %s.", deprecatedFrom, canonicalName)
+	var warnings []string
+	switch raw := result["warnings"].(type) {
+	case []string:
+		warnings = append(warnings, raw...)
+	case []any:
+		for _, item := range raw {
+			s, ok := item.(string)
+			if ok && strings.TrimSpace(s) != "" {
+				warnings = append(warnings, s)
+			}
+		}
+	case string:
+		if strings.TrimSpace(raw) != "" {
+			warnings = append(warnings, raw)
+		}
+	}
+	warnings = append(warnings, warning)
+	result["warnings"] = warnings
+	result["canonical_tool"] = canonicalName
+	return result
 }
 
 func stringArg(args map[string]any, key string) string {
@@ -598,7 +618,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_transfer",
-			"Transfer file via scp using existing connection_id. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
+			"Transfer file using scp client with existing connection_id. Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
 			transferSchema(),
 		),
 		tool(
