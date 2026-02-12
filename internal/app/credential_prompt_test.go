@@ -33,10 +33,10 @@ func TestNormalizeCredentialFieldsSudoPassword(t *testing.T) {
 
 func TestManualCredentialInstructions(t *testing.T) {
 	msg := manualCredentialInstructions("dev-1", []string{"password", "key_passphrase"})
-	if !strings.Contains(msg, "./csshctl secret set-password --profile dev-1") {
+	if !strings.Contains(msg, "csshctl secret set-password --profile dev-1") {
 		t.Fatalf("missing set-password command: %s", msg)
 	}
-	if !strings.Contains(msg, "./csshctl secret set-key-passphrase --profile dev-1") {
+	if !strings.Contains(msg, "csshctl secret set-key-passphrase --profile dev-1") {
 		t.Fatalf("missing set-key-passphrase command: %s", msg)
 	}
 	if !strings.Contains(msg, "continue without restarting") {
@@ -49,7 +49,7 @@ func TestManualCredentialInstructions(t *testing.T) {
 
 func TestManualCredentialInstructionsSudoPassword(t *testing.T) {
 	msg := manualCredentialInstructions("dev-1", []string{"sudo_password"})
-	if !strings.Contains(msg, "./csshctl secret set-sudo-password --profile dev-1") {
+	if !strings.Contains(msg, "csshctl secret set-sudo-password --profile dev-1") {
 		t.Fatalf("missing set-sudo-password command: %s", msg)
 	}
 }
@@ -60,7 +60,7 @@ func TestManualCredentialCommands(t *testing.T) {
 		t.Fatalf("unexpected command count: %d", len(cmds))
 	}
 	for _, cmd := range cmds {
-		if !strings.HasPrefix(cmd, "./csshctl secret ") {
+		if !strings.HasPrefix(cmd, "csshctl secret ") {
 			t.Fatalf("command should use local csshctl: %s", cmd)
 		}
 	}

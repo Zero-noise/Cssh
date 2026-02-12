@@ -28,9 +28,10 @@ Fallback: `csshctl approve <approval_id> --by <name>` from a local terminal.
 ## Access Controls
 
 - **Profile-only connect**: remote connections are restricted to pre-configured profiles. Direct host/username connect is blocked unless a matching profile exists.
-- **Public host policy**: public internet hosts are allowed by default (`allow_public_host=true`). To block them globally, set `allow_public_host=false`, or restrict per profile.
+- **Public host policy**: public internet hosts are allowed by default (`allow_public_host=true`). Effective rule is OR (global OR profile): if global is `true`, profile cannot further restrict; if global is `false`, only profiles with `allow_public_host=true` can connect public hosts.
 - **Write scope**: remote file writes (`ssh_write_file`, `ssh_apply_patch`) are restricted to directories listed in `workspace_roots`.
-- **Root user**: SSH as `root` is denied by default unless the profile sets `allow_root_user: true`.
+- **Runtime narrowing**: `ssh_connect(limit_dir=...)` can further narrow effective runtime scope to a subdirectory (must be inside configured `workspace_roots`).
+- **Root user**: root login is denied by default. A profile can allow it with `allow_root_user: true`; global `allow_root_login: true` also permits root and has higher priority.
 
 ## Credential Storage
 
@@ -54,3 +55,4 @@ csshctl secret set-password --profile <profile_id>
 csshctl secret set-key-passphrase --profile <profile_id>
 csshctl secret set-sudo-password --profile <profile_id>
 ```
+If `csshctl` is not in `PATH`, use an absolute path.

@@ -35,10 +35,7 @@ type Config struct {
 	ConnectRequireProfile  bool   `json:"connect_require_profile"`
 	EasySafeApprovalTTLsec int    `json:"easy_safe_approval_ttl_sec"`
 	NonEasyApprovalTTLsec  int    `json:"non_easy_safe_approval_ttl_sec"`
-	ManualConfirmScope     string `json:"manual_confirm_scope"`
-	ApprovalMode           string `json:"approval_mode"`
 	SudoEnabled            bool   `json:"sudo_enabled"`
-	SudoCacheScope         string `json:"sudo_cache_scope"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 
@@ -52,6 +49,7 @@ type ConnectionInput struct {
 	KeyRef          string   `json:"key_ref,omitempty"`
 	PasswordRef     string   `json:"password_ref,omitempty"`
 	WorkspaceRoots  []string `json:"workspace_roots,omitempty"`
+	LimitDir        string   `json:"limit_dir,omitempty"`
 	AllowPublicHost *bool    `json:"allow_public_host,omitempty"`
 }
 
@@ -67,6 +65,7 @@ type Connection struct {
 	Password        string
 	SudoPassword    string
 	WorkspaceRoots  []string
+	LimitDir        string
 	AllowPublicHost bool
 	SecurityProfile string
 	AllowRootUser   bool

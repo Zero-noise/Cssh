@@ -21,10 +21,7 @@ security_profile_default = "easy_safe"
 connect_require_profile = true
 easy_safe_approval_ttl_sec = 900
 non_easy_safe_approval_ttl_sec = 0
-manual_confirm_scope = "high_risk_only"
-approval_mode = "queue"
 sudo_enabled = true
-sudo_cache_scope = "command_template"
 allow_root_login = false
 `
 
@@ -74,10 +71,7 @@ func Load(configPath string) (model.Config, error) {
 		ConnectRequireProfile:  true,
 		EasySafeApprovalTTLsec: 900,
 		NonEasyApprovalTTLsec:  0,
-		ManualConfirmScope:     "high_risk_only",
-		ApprovalMode:           "queue",
 		SudoEnabled:            true,
-		SudoCacheScope:         "command_template",
 		AllowRootLogin:         false,
 	}
 
@@ -138,20 +132,8 @@ func Load(configPath string) (model.Config, error) {
 			if err == nil && n >= 0 {
 				cfg.NonEasyApprovalTTLsec = n
 			}
-		case "manual_confirm_scope":
-			if strings.TrimSpace(val) != "" {
-				cfg.ManualConfirmScope = strings.TrimSpace(val)
-			}
-		case "approval_mode":
-			if strings.TrimSpace(val) != "" {
-				cfg.ApprovalMode = strings.TrimSpace(val)
-			}
 		case "sudo_enabled":
 			cfg.SudoEnabled = strings.EqualFold(val, "true")
-		case "sudo_cache_scope":
-			if strings.TrimSpace(val) != "" {
-				cfg.SudoCacheScope = strings.TrimSpace(val)
-			}
 		case "allow_root_login":
 			cfg.AllowRootLogin = strings.EqualFold(val, "true")
 		case "profiles_file":
@@ -173,15 +155,6 @@ func Load(configPath string) (model.Config, error) {
 	}
 	if strings.TrimSpace(cfg.SecurityProfileDefault) == "" {
 		cfg.SecurityProfileDefault = "easy_safe"
-	}
-	if strings.TrimSpace(cfg.ManualConfirmScope) == "" {
-		cfg.ManualConfirmScope = "high_risk_only"
-	}
-	if strings.TrimSpace(cfg.ApprovalMode) == "" {
-		cfg.ApprovalMode = "queue"
-	}
-	if strings.TrimSpace(cfg.SudoCacheScope) == "" {
-		cfg.SudoCacheScope = "command_template"
 	}
 
 	if err := os.MkdirAll(cfg.RuntimeDir, 0o700); err != nil {

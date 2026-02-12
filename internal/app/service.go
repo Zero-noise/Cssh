@@ -71,6 +71,21 @@ func (s *Service) SecretStore() store.SecretStore    { return s.secrets }
 func (s *Service) Approvals() *approvals.Store       { return s.approvals }
 func (s *Service) Grants() *approvals.GrantStore     { return s.grants }
 
+func (s *Service) AuditToolCall(tool, status, detail string) {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		return
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   util.NewID("trace"),
+		Type:      "tool_call",
+		Command:   tool,
+		Status:    status,
+		Detail:    strings.TrimSpace(detail),
+	})
+}
+
 func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	connModel, err := s.resolveConnectionInput(input)
@@ -94,12 +109,19 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		Status:          "ok",
 		SecurityProfile: conn.SecurityProfile,
 	})
-	return map[string]any{
+	resp := map[string]any{
 		"connection_id":    conn.ID,
 		"capabilities":     []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
 		"workspace_roots":  conn.WorkspaceRoots,
 		"security_profile": conn.SecurityProfile,
-	}, nil
+	}
+	if strings.TrimSpace(conn.LimitDir) != "" {
+		resp["limit_dir"] = conn.LimitDir
+	}
+	if conn.AllowPublicHost && !security.IsPrivateOrLoopbackHost(conn.Host) {
+		resp["warnings"] = []string{"connected to a public host because allow_public_host=true; verify profile and remote host trust"}
+	}
+	return resp, nil
 }
 
 func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, error) {
@@ -204,6 +226,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 }
 
 func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	if timeoutSec <= 0 {
 		timeoutSec = 5
 	}
@@ -228,6 +251,7 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 			"port":                  conn.Port,
 			"username":              conn.Username,
 			"workspace_roots":       conn.WorkspaceRoots,
+			"limit_dir":             conn.LimitDir,
 			"security_profile":      conn.SecurityProfile,
 			"created_at":            conn.CreatedAt.Format(time.RFC3339),
 			"connected":             alive,
@@ -248,7 +272,15 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"connections": []map[string]any{item}}, nil
+		out := map[string]any{"connections": []map[string]any{item}}
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_connection_status",
+			ConnectionID: connectionID,
+			Status:       "ok",
+		})
+		return out, nil
 	}
 
 	conns := s.ssh.ListConnections()
@@ -266,10 +298,19 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 		}
 		items = append(items, item)
 	}
-	return map[string]any{"connections": items}, nil
+	out := map[string]any{"connections": items}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_connection_status",
+		Status:    "ok",
+		Detail:    "all_connections",
+	})
+	return out, nil
 }
 
 func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	items, err := s.grants.List(connectionID, activeOnly)
 	if err != nil {
 		return nil, err
@@ -289,10 +330,19 @@ func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[str
 			"source":                g.Source,
 		})
 	}
-	return map[string]any{"grants": out}, nil
+	resp := map[string]any{"grants": out}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_privilege_status",
+		ConnectionID: connectionID,
+		Status:       "ok",
+	})
+	return resp, nil
 }
 
 func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	g, err := s.grants.Revoke(grantID)
 	if err != nil {
 		return nil, err
@@ -300,14 +350,23 @@ func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
 	if g == nil {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "grant_id not found")
 	}
-	return map[string]any{
+	resp := map[string]any{
 		"revoked":               true,
 		"grant_id":              g.ID,
 		"connection_id":         g.ConnectionID,
 		"capability":            g.Capability,
 		"command_template_hash": g.CommandHash,
 		"status":                g.Status,
-	}, nil
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_privilege_revoke",
+		ConnectionID: g.ConnectionID,
+		Status:       "ok",
+		GrantID:      g.ID,
+	})
+	return resp, nil
 }
 
 func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
@@ -605,16 +664,29 @@ func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd stri
 	if resolved == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
 	}
+	isFile, err := s.remoteRegularFileExists(connectionID, resolved)
+	if err != nil {
+		return nil, err
+	}
+	if !isFile {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "path not found or not a regular file")
+	}
 
 	sizeRes, err := s.ssh.Exec(connectionID, "", "wc -c < "+util.ShellQuote(resolved), "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if sizeRes.ExitCode != 0 {
+		return nil, commandResultError(sizeRes, "read file size failed")
 	}
 	sizeStr := strings.TrimSpace(sizeRes.Stdout)
 	size, _ := strconv.Atoi(sizeStr)
 	res, err := s.ssh.Exec(connectionID, "", "head -c "+strconv.Itoa(maxBytes)+" "+util.ShellQuote(resolved), "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "read file content failed")
 	}
 	truncated := size > maxBytes
 	_ = s.audit.Write(model.AuditEvent{
@@ -733,6 +805,7 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[st
 }
 
 func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -749,15 +822,27 @@ func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[
 	if err != nil {
 		return nil, err
 	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "list directory failed")
+	}
 	lines := splitNonEmpty(res.Stdout)
 	entries := make([]map[string]any, 0, len(lines))
 	for _, it := range lines {
 		entries = append(entries, map[string]any{"path": it})
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_list_dir",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"entries": entries}, nil
 }
 
 func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -771,13 +856,28 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 	}
 	var cmd string
 	if glob == "" {
-		cmd = "grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit)
+		cmd = strings.Join([]string{
+			"set -o pipefail",
+			"grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit),
+			"rc=$?",
+			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"exit \"$rc\"",
+		}, "; ")
 	} else {
-		cmd = "find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit)
+		cmd = strings.Join([]string{
+			"set -o pipefail",
+			"find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit),
+			"rc=$?",
+			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"exit \"$rc\"",
+		}, "; ")
 	}
 	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "search text failed")
 	}
 	matches := make([]map[string]any, 0)
 	for _, line := range splitNonEmpty(res.Stdout) {
@@ -792,11 +892,23 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 			"line":    ln,
 			"snippet": parts[2],
 		})
+		if len(matches) >= limit {
+			break
+		}
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_search_text",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"matches": matches}, nil
 }
 
 func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -813,14 +925,48 @@ func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) 
 	if err != nil {
 		return nil, err
 	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "tail log failed")
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_tail_log",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"content": res.Stdout}, nil
 }
 
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	host := ""
+	conn, _ := s.ssh.GetConnection(connectionID)
+	if conn != nil {
+		host = conn.Host
+	}
 	_ = s.grants.RevokeByConnection(connectionID)
 	if err := s.ssh.Disconnect(connectionID); err != nil {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_disconnect",
+			ConnectionID: connectionID,
+			Host:         host,
+			Status:       "error",
+			Detail:       err.Error(),
+		})
 		return nil, err
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_disconnect",
+		ConnectionID: connectionID,
+		Host:         host,
+		Status:       "ok",
+	})
 	return map[string]any{"closed": true}, nil
 }
 
@@ -1115,6 +1261,17 @@ func splitNonEmpty(s string) []string {
 	return out
 }
 
+func commandResultError(res sshbridge.ExecResult, fallback string) error {
+	msg := strings.TrimSpace(res.Stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(res.Stdout)
+	}
+	if msg == "" {
+		msg = fallback
+	}
+	return errorsx.New(errorsx.CodeInternal, msg)
+}
+
 type privilegeAuthz struct {
 	Allowed      bool
 	StatusResp   map[string]any
@@ -1305,6 +1462,7 @@ func shouldRequireApproval(securityProfile string, policy security.ExecPolicyDec
 }
 
 func (s *Service) ApproveRequest(approvalID, decision, actor, rejectReason string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	id := strings.TrimSpace(approvalID)
 	if id == "" {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "approval_id is required")
@@ -1347,6 +1505,15 @@ func (s *Service) ApproveRequest(approvalID, decision, actor, rejectReason strin
 	if updated.ResolvedAt != nil {
 		res["resolved_at"] = updated.ResolvedAt.Format(time.RFC3339)
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_approve_request",
+		ConnectionID: updated.ConnectionID,
+		ApprovalID:   updated.ID,
+		ApprovedBy:   updated.ApprovedBy,
+		Status:       string(updated.Status),
+	})
 	return res, nil
 }
 
@@ -1460,6 +1627,11 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		if securityProfile == "" {
 			securityProfile = "easy_safe"
 		}
+		roots := append([]string{}, p.WorkspaceRoots...)
+		limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
+		if err != nil {
+			return model.Connection{}, err
+		}
 		return model.Connection{
 			ProfileID:       p.ID,
 			Host:            p.Host,
@@ -1470,7 +1642,8 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 			KeyPassphrase:   keyPassphrase,
 			Password:        password,
 			SudoPassword:    sudoPassword,
-			WorkspaceRoots:  append([]string{}, p.WorkspaceRoots...),
+			WorkspaceRoots:  roots,
+			LimitDir:        limitDir,
 			AllowPublicHost: allowPublic,
 			SecurityProfile: securityProfile,
 			AllowRootUser:   p.AllowRootUser,
@@ -1519,6 +1692,10 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 	for i := range roots {
 		roots[i] = path.Clean(roots[i])
 	}
+	limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
+	if err != nil {
+		return model.Connection{}, err
+	}
 	securityProfile := strings.TrimSpace(s.cfg.SecurityProfileDefault)
 	if securityProfile == "" {
 		securityProfile = "easy_safe"
@@ -1531,10 +1708,26 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		KeyPath:         config.ExpandHome(keyPath),
 		Password:        password,
 		WorkspaceRoots:  roots,
+		LimitDir:        limitDir,
 		AllowPublicHost: allowPublic,
 		SecurityProfile: securityProfile,
 		AllowRootUser:   s.cfg.AllowRootLogin,
 	}, nil
+}
+
+func applyLimitDir(raw string, roots []string) (string, []string, error) {
+	limit := strings.TrimSpace(raw)
+	if limit == "" {
+		return "", roots, nil
+	}
+	if !strings.HasPrefix(limit, "/") {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "limit_dir must be an absolute path")
+	}
+	limit = path.Clean(limit)
+	if !security.IsWithinRoots(limit, roots) {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "limit_dir must be within workspace_roots")
+	}
+	return limit, []string{limit}, nil
 }
 
 func (s *Service) resolveProfileRef(profileID, profileName string) (*model.Profile, error) {

@@ -4,11 +4,13 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 
 	"cssh/internal/config"
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
 	"cssh/internal/security"
+	"cssh/internal/util"
 )
 
 type QuickSetupInput struct {
@@ -27,6 +29,7 @@ type QuickSetupInput struct {
 }
 
 func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	authMode = normalizeAuthMode(authMode)
 	if username == "" {
 		username = "ubuntu"
@@ -58,7 +61,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 	}
 
-	return map[string]any{
+	resp := map[string]any{
 		"title":    "SSH Quick Setup Form",
 		"summary":  "Fill profile fields first. Credentials are entered later via ssh_credentials_prompt and saved directly into OS keychain.",
 		"fields":   fields,
@@ -70,10 +73,19 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 			},
 			"note": "After saving, use ssh_credentials_prompt for secure credential entry.",
 		},
-	}, nil
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_profile_setup",
+		Status:    "ok",
+		Detail:    "step=template",
+	})
+	return resp, nil
 }
 
 func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	if strings.TrimSpace(in.Purpose) == "" {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "purpose is required")
 	}
@@ -180,10 +192,17 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 			"tool":            "ssh_credentials_prompt",
 			"arguments":       map[string]any{"profile_id": profileID, "fields": credentialFields},
 			"manual_commands": manualCmds,
-			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
+			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
 		}
 	}
 
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_profile_setup",
+		Status:    "ok",
+		Detail:    "step=save profile_id=" + profileID,
+	})
 	return result, nil
 }
 
@@ -196,6 +215,7 @@ func (s *Service) hasSecretValue(profileID, kind string) bool {
 }
 
 func (s *Service) ProfilesList() (map[string]any, error) {
+	traceID := util.NewID("trace")
 	items, err := s.profiles.List()
 	if err != nil {
 		return nil, err
@@ -215,10 +235,19 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			"allow_root_user":   p.AllowRootUser,
 		})
 	}
-	return map[string]any{"profiles": out}, nil
+	resp := map[string]any{"profiles": out}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_profile",
+		Status:    "ok",
+		Detail:    "action=list",
+	})
+	return resp, nil
 }
 
 func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmToken string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	id := strings.TrimSpace(profileID)
 	if id == "" {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
@@ -232,14 +261,22 @@ func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmTok
 	}
 	if strings.TrimSpace(confirmToken) == "" {
 		token := s.issueProfileDeleteToken(id)
-		return map[string]any{
+		resp := map[string]any{
 			"status":          "confirm_required",
 			"profile_id":      id,
 			"profile_name":    p.Name,
 			"confirm_token":   token,
 			"confirm_ttl_sec": 300,
 			"message":         "Deletion requires confirmation token. Retry with confirm_token to proceed.",
-		}, nil
+		}
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp: time.Now().UTC(),
+			TraceID:   traceID,
+			Type:      "ssh_profile",
+			Status:    "confirm_required",
+			Detail:    "action=delete profile_id=" + id,
+		})
+		return resp, nil
 	}
 	if err := s.validateAndConsumeProfileDeleteToken(id, confirmToken); err != nil {
 		return nil, err
@@ -255,12 +292,20 @@ func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmTok
 			}
 		}
 	}
-	return map[string]any{
+	resp := map[string]any{
 		"deleted":         true,
 		"profile_id":      id,
 		"profile_name":    p.Name,
 		"secrets_deleted": secretsDeleted,
-	}, nil
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_profile",
+		Status:    "ok",
+		Detail:    "action=delete profile_id=" + id,
+	})
+	return resp, nil
 }
 
 func normalizeSecurityProfileDefault(v string) string {

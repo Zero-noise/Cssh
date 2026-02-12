@@ -267,6 +267,9 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		if err != nil {
 			return ExecResult{}, err
 		}
+		if s.ConnectionID != connectionID {
+			return ExecResult{}, errorsx.New(errorsx.CodeInvalidParams, "session_id does not belong to connection_id")
+		}
 		shell = s.Shell
 		if cwd == "" {
 			cwd = s.CWD

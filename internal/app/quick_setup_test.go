@@ -51,7 +51,6 @@ func newTestService(t *testing.T) *Service {
 		SecurityProfileDefault: "easy_safe",
 		ConnectRequireProfile:  true,
 		EasySafeApprovalTTLsec: 900,
-		ApprovalMode:           "terminal",
 		SudoEnabled:            true,
 	}
 	svc := NewService(cfg)

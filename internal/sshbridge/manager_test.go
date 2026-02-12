@@ -1,6 +1,11 @@
 package sshbridge
 
-import "testing"
+import (
+	"testing"
+
+	"cssh/internal/errorsx"
+	"cssh/internal/model"
+)
 
 func TestShouldRetryLegacySCP(t *testing.T) {
 	cases := []struct {
@@ -45,5 +50,17 @@ func TestSCPRemoteSpec(t *testing.T) {
 	want := "ubuntu@[fe80::1]:/tmp/a b.txt"
 	if got != want {
 		t.Fatalf("unexpected spec: got=%q want=%q", got, want)
+	}
+}
+
+func TestExecWithInputRejectsSessionFromOtherConnection(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	m.connections["conn_a"] = &model.Connection{ID: "conn_a"}
+	m.sessions["sess_b"] = &model.Session{ID: "sess_b", ConnectionID: "conn_b"}
+
+	_, err := m.ExecWithInput("conn_a", "sess_b", "echo hi", "", 10, "")
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok || ce.Code != errorsx.CodeInvalidParams {
+		t.Fatalf("expected invalid params error, got %#v", err)
 	}
 }

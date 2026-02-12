@@ -108,7 +108,13 @@ func (s *Server) handle(req request, id any) response {
 		}
 		result, err := s.callTool(p.Name, p.Arguments)
 		if err != nil {
+			if s.svc != nil {
+				s.svc.AuditToolCall(p.Name, "error", err.Error())
+			}
 			return toRPCError(id, err)
+		}
+		if s.svc != nil {
+			s.svc.AuditToolCall(p.Name, "ok", "")
 		}
 		text := app.PrettyJSON(result)
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
@@ -152,6 +158,7 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			KeyRef:         stringArg(args, "key_ref"),
 			PasswordRef:    stringArg(args, "password_ref"),
 			WorkspaceRoots: app.ParseStringSliceAny(args["workspace_roots"]),
+			LimitDir:       stringArg(args, "limit_dir"),
 		}
 		if v, ok := args["allow_public_host"]; ok {
 			b := app.ParseBoolAny(v, false)
@@ -366,7 +373,7 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			AuthMode:        stringArg(args, "auth_mode"),
 			WorkspaceRoots:  roots,
 			KeyPath:         stringArg(args, "key_path"),
-			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], false),
+			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
 			SecurityProfile: stringArg(args, "security_profile"),
 			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
 		}
@@ -588,7 +595,7 @@ func toolDefs() []map[string]any {
 	return []map[string]any{
 		tool(
 			"ssh_connect",
-			"Create an SSH connection and return connection_id. Workflow: ssh_profile_setup(step=template/save) or ssh_profile(action=list) -> ssh_connect -> optional ssh_open_session -> ssh_exec. Profile-based connect is the default policy.",
+			"Create an SSH connection and return connection_id. Workflow: ssh_profile_setup(step=template/save) or ssh_profile(action=list) -> ssh_connect -> optional ssh_open_session -> ssh_exec. Profile-based connect is the default policy. Optional limit_dir can narrow runtime access to a specific subdirectory.",
 			connectSchema(),
 		),
 		tool(
@@ -668,7 +675,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_credentials_prompt",
-			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual ./csshctl secret set-* commands with profile_id. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
+			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual csshctl secret set-* commands with profile_id. If csshctl is not in PATH, use an absolute path. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
 		),
 		tool(
@@ -697,7 +704,7 @@ func credentialPromptSchema() map[string]any {
 
 func connectSchema() map[string]any {
 	props := map[string]any{}
-	for _, key := range []string{"profile_id", "profile_name", "host", "port", "username", "auth_mode", "key_ref", "password_ref", "workspace_roots", "allow_public_host"} {
+	for _, key := range []string{"profile_id", "profile_name", "host", "port", "username", "auth_mode", "key_ref", "password_ref", "workspace_roots", "limit_dir", "allow_public_host"} {
 		props[key] = paramSchema(key)
 	}
 	return map[string]any{
@@ -767,10 +774,12 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "description": "Secret reference used to resolve password for direct connect mode."}
 	case "workspace_roots":
 		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Allowed remote root paths for read/write operations."}
+	case "limit_dir":
+		return map[string]any{"type": "string", "description": "Optional runtime restriction directory. When set, effective workspace_roots become this directory only (must be within configured roots)."}
 	case "workspace_root":
 		return map[string]any{"type": "string", "description": "Single workspace root (shortcut if not using workspace_roots array)."}
 	case "allow_public_host":
-		return map[string]any{"type": "boolean", "description": "Allow public internet host. Default false for safety."}
+		return map[string]any{"type": "boolean", "description": "Allow public internet host. Effective default comes from profile/global policy."}
 	case "security_profile":
 		return map[string]any{"type": "string", "enum": []string{"easy_safe", "ops_strict"}, "description": "Security profile for privilege approval behavior."}
 	case "allow_root_user":

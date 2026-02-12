@@ -18,6 +18,7 @@ import (
 
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/util"
 )
 
 type CredentialPromptInput struct {
@@ -33,15 +34,30 @@ var allowedCredentialFields = map[string]struct{}{
 }
 
 func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	writeAudit := func(status, detail string) {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp: time.Now().UTC(),
+			TraceID:   traceID,
+			Type:      "ssh_credentials_prompt",
+			Status:    status,
+			Detail:    detail,
+		})
+	}
 	if strings.TrimSpace(in.ProfileID) == "" {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
+		err := errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 	profile, err := s.profiles.Get(strings.TrimSpace(in.ProfileID))
 	if err != nil {
+		writeAudit("error", err.Error())
 		return nil, err
 	}
 	if profile == nil {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile not found: "+in.ProfileID)
+		err := errorsx.New(errorsx.CodeInvalidParams, "profile not found: "+in.ProfileID)
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 
 	fields := in.Fields
@@ -50,39 +66,51 @@ func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, er
 	}
 	fields, invalid := normalizeCredentialFields(fields)
 	if len(in.Fields) > 0 && len(invalid) > 0 {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "invalid fields: "+strings.Join(invalid, ", "))
+		err := errorsx.New(errorsx.CodeInvalidParams, "invalid fields: "+strings.Join(invalid, ", "))
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 	if len(fields) == 0 {
-		return map[string]any{
+		resp := map[string]any{
 			"saved":         false,
 			"profile_id":    profile.ID,
 			"secrets_saved": map[string]bool{},
 			"method":        "none",
 			"message":       "No credential fields needed for this profile's auth_priority.",
-		}, nil
+		}
+		writeAudit("ok", "method=none profile_id="+profile.ID)
+		return resp, nil
 	}
 
 	mode := normalizePromptMode(in.Mode)
 	if mode == "terminal" {
 		if !canUseTerminalPrompt() {
-			return manualCredentialPromptResult(profile.ID, fields), nil
+			resp := manualCredentialPromptResult(profile.ID, fields)
+			writeAudit("ok", "method=manual profile_id="+profile.ID)
+			return resp, nil
 		}
 		result, err := s.credentialPromptTerminal(profile, fields)
 		if err == nil {
+			writeAudit("ok", "method=terminal profile_id="+profile.ID)
 			return result, nil
 		}
-		return manualCredentialPromptResult(profile.ID, fields), nil
+		resp := manualCredentialPromptResult(profile.ID, fields)
+		writeAudit("ok", "method=manual profile_id="+profile.ID)
+		return resp, nil
 	}
 	if mode == "web" || mode == "auto" {
 		if hasDisplay() {
 			result, err := s.credentialPromptWeb(profile, fields)
 			if err == nil {
+				writeAudit("ok", "method=web profile_id="+profile.ID)
 				return result, nil
 			}
 		}
 	}
 
-	return manualCredentialPromptResult(profile.ID, fields), nil
+	resp := manualCredentialPromptResult(profile.ID, fields)
+	writeAudit("ok", "method=manual profile_id="+profile.ID)
+	return resp, nil
 }
 
 func normalizePromptMode(v string) string {
@@ -147,9 +175,9 @@ func normalizeCredentialFields(fields []string) ([]string, []string) {
 func manualCredentialInstructions(profileID string, fields []string) string {
 	cmds := manualCredentialCommands(profileID, fields)
 	if len(cmds) == 0 {
-		return "Could not open browser. Use ./csshctl secret set-* manually."
+		return "Could not open browser. Use csshctl secret set-* manually. If csshctl is not in PATH, use an absolute path."
 	}
-	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
+	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
 }
 
 func manualCredentialCommands(profileID string, fields []string) []string {
@@ -157,11 +185,11 @@ func manualCredentialCommands(profileID string, fields []string) []string {
 	for _, f := range fields {
 		switch f {
 		case "password":
-			cmds = append(cmds, "./csshctl secret set-password --profile "+profileID)
+			cmds = append(cmds, "csshctl secret set-password --profile "+profileID)
 		case "key_passphrase":
-			cmds = append(cmds, "./csshctl secret set-key-passphrase --profile "+profileID)
+			cmds = append(cmds, "csshctl secret set-key-passphrase --profile "+profileID)
 		case "sudo_password":
-			cmds = append(cmds, "./csshctl secret set-sudo-password --profile "+profileID)
+			cmds = append(cmds, "csshctl secret set-sudo-password --profile "+profileID)
 		}
 	}
 	return cmds

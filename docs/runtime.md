@@ -21,7 +21,6 @@ security_profile_default = "easy_safe"
 easy_safe_approval_ttl_sec = 900
 allow_public_host = true
 connect_require_profile = true
-approval_mode = "queue"
 sudo_enabled = true
 ```
 
