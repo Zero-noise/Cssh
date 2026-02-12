@@ -18,28 +18,46 @@ import (
 
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/util"
 )
 
 type CredentialPromptInput struct {
 	ProfileID string
-	Fields    []string // "password", "key_passphrase"
+	Fields    []string // "password", "key_passphrase", "sudo_password"
+	Mode      string   // auto|terminal|web
 }
 
 var allowedCredentialFields = map[string]struct{}{
 	"password":       {},
 	"key_passphrase": {},
+	"sudo_password":  {},
 }
 
 func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	writeAudit := func(status, detail string) {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp: time.Now().UTC(),
+			TraceID:   traceID,
+			Type:      "ssh_credentials_prompt",
+			Status:    status,
+			Detail:    detail,
+		})
+	}
 	if strings.TrimSpace(in.ProfileID) == "" {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
+		err := errorsx.New(errorsx.CodeInvalidParams, "profile_id is required")
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 	profile, err := s.profiles.Get(strings.TrimSpace(in.ProfileID))
 	if err != nil {
+		writeAudit("error", err.Error())
 		return nil, err
 	}
 	if profile == nil {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile not found: "+in.ProfileID)
+		err := errorsx.New(errorsx.CodeInvalidParams, "profile not found: "+in.ProfileID)
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 
 	fields := in.Fields
@@ -48,39 +66,75 @@ func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, er
 	}
 	fields, invalid := normalizeCredentialFields(fields)
 	if len(in.Fields) > 0 && len(invalid) > 0 {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "invalid fields: "+strings.Join(invalid, ", "))
+		err := errorsx.New(errorsx.CodeInvalidParams, "invalid fields: "+strings.Join(invalid, ", "))
+		writeAudit("error", err.Error())
+		return nil, err
 	}
 	if len(fields) == 0 {
-		return map[string]any{
+		resp := map[string]any{
 			"saved":         false,
 			"profile_id":    profile.ID,
 			"secrets_saved": map[string]bool{},
 			"method":        "none",
 			"message":       "No credential fields needed for this profile's auth_priority.",
-		}, nil
+		}
+		writeAudit("ok", "method=none profile_id="+profile.ID)
+		return resp, nil
 	}
 
-	if hasDisplay() {
-		result, err := s.credentialPromptWeb(profile, fields)
+	mode := normalizePromptMode(in.Mode)
+	if mode == "terminal" {
+		if !canUseTerminalPrompt() {
+			resp := manualCredentialPromptResult(profile.ID, fields)
+			writeAudit("ok", "method=manual profile_id="+profile.ID)
+			return resp, nil
+		}
+		result, err := s.credentialPromptTerminal(profile, fields)
 		if err == nil {
+			writeAudit("ok", "method=terminal profile_id="+profile.ID)
 			return result, nil
 		}
-		// fall through to editor
+		resp := manualCredentialPromptResult(profile.ID, fields)
+		writeAudit("ok", "method=manual profile_id="+profile.ID)
+		return resp, nil
 	}
-
-	if hasDisplay() {
-		result, err := s.credentialPromptEditor(profile, fields)
-		if err == nil {
-			return result, nil
+	if mode == "web" || mode == "auto" {
+		if hasDisplay() {
+			result, err := s.credentialPromptWeb(profile, fields)
+			if err == nil {
+				writeAudit("ok", "method=web profile_id="+profile.ID)
+				return result, nil
+			}
 		}
 	}
 
-	return map[string]any{
-		"saved":      false,
-		"profile_id": profile.ID,
-		"method":     "manual",
-		"message":    manualCredentialInstructions(profile.ID, fields),
-	}, nil
+	resp := manualCredentialPromptResult(profile.ID, fields)
+	writeAudit("ok", "method=manual profile_id="+profile.ID)
+	return resp, nil
+}
+
+func normalizePromptMode(v string) string {
+	mode := strings.ToLower(strings.TrimSpace(v))
+	switch mode {
+	case "terminal", "web":
+		return mode
+	default:
+		return "auto"
+	}
+}
+
+func canUseTerminalPrompt() bool {
+	inInfo, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	outInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	inTTY := (inInfo.Mode() & os.ModeCharDevice) != 0
+	outTTY := (outInfo.Mode() & os.ModeCharDevice) != 0
+	return inTTY && outTTY
 }
 
 func inferCredentialFields(p *model.Profile) []string {
@@ -119,6 +173,14 @@ func normalizeCredentialFields(fields []string) ([]string, []string) {
 }
 
 func manualCredentialInstructions(profileID string, fields []string) string {
+	cmds := manualCredentialCommands(profileID, fields)
+	if len(cmds) == 0 {
+		return "Could not open browser. Use csshctl secret set-* manually. If csshctl is not in PATH, use an absolute path."
+	}
+	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
+}
+
+func manualCredentialCommands(profileID string, fields []string) []string {
 	cmds := make([]string, 0, len(fields))
 	for _, f := range fields {
 		switch f {
@@ -126,12 +188,22 @@ func manualCredentialInstructions(profileID string, fields []string) string {
 			cmds = append(cmds, "csshctl secret set-password --profile "+profileID)
 		case "key_passphrase":
 			cmds = append(cmds, "csshctl secret set-key-passphrase --profile "+profileID)
+		case "sudo_password":
+			cmds = append(cmds, "csshctl secret set-sudo-password --profile "+profileID)
 		}
 	}
-	if len(cmds) == 0 {
-		return "Could not open browser or editor. Use csshctl secret commands to set credentials manually."
+	return cmds
+}
+
+func manualCredentialPromptResult(profileID string, fields []string) map[string]any {
+	cmds := manualCredentialCommands(profileID, fields)
+	return map[string]any{
+		"saved":           false,
+		"profile_id":      profileID,
+		"method":          "manual",
+		"manual_commands": cmds,
+		"message":         manualCredentialInstructions(profileID, fields),
 	}
-	return "Could not open browser or editor. Set credentials manually with: " + strings.Join(cmds, " ; ")
 }
 
 func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (map[string]any, error) {
@@ -247,129 +319,89 @@ func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (
 	}
 }
 
-func (s *Service) credentialPromptEditor(profile *model.Profile, fields []string) (map[string]any, error) {
-	tmpFile, err := os.CreateTemp("", "cssh-creds-*.txt")
+func (s *Service) credentialPromptTerminal(profile *model.Profile, fields []string) (map[string]any, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("create temp file: %w", err)
+		return nil, fmt.Errorf("open tty: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
+	defer tty.Close()
 
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("chmod: %w", err)
-	}
-
-	var tmplBuf strings.Builder
-	tmplBuf.WriteString("# CSSH Credential Entry\n")
-	tmplBuf.WriteString(fmt.Sprintf("# Profile: %s (%s)\n", profile.Name, profile.ID))
-	tmplBuf.WriteString(fmt.Sprintf("# Host: %s:%d  User: %s\n", profile.Host, profile.Port, profile.Username))
-	tmplBuf.WriteString("# Enter credentials below, save and close the editor.\n")
-	tmplBuf.WriteString("# Lines starting with # are ignored.\n\n")
-	for _, f := range fields {
-		tmplBuf.WriteString(f + ":\n")
-	}
-
-	if _, err := tmpFile.WriteString(tmplBuf.String()); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("write template: %w", err)
-	}
-	tmpFile.Close()
-
-	switch runtime.GOOS {
-	case "darwin":
-		cmd := exec.Command("open", "-t", "-W", tmpPath)
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("open editor: %w", err)
-		}
-	case "linux":
-		cmd := exec.Command("xdg-open", tmpPath)
-		if err := cmd.Start(); err != nil {
-			return nil, fmt.Errorf("xdg-open: %w", err)
-		}
-		// poll mtime for changes
-		initialInfo, err := os.Stat(tmpPath)
-		if err != nil {
-			return nil, fmt.Errorf("stat temp file: %w", err)
-		}
-		initialMtime := initialInfo.ModTime()
-		deadline := time.Now().Add(5 * time.Minute)
-		for time.Now().Before(deadline) {
-			time.Sleep(1 * time.Second)
-			info, err := os.Stat(tmpPath)
-			if err != nil {
-				continue
-			}
-			if info.ModTime().After(initialMtime) {
-				// give user a moment to finish saving
-				time.Sleep(1 * time.Second)
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("editor prompt timed out after 5 minutes")
-		}
-	default:
-		return nil, fmt.Errorf("unsupported OS for editor prompt: %s", runtime.GOOS)
-	}
-
-	content, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return nil, fmt.Errorf("read temp file: %w", err)
-	}
+	_, _ = fmt.Fprintf(tty, "\n[cssh] credential prompt\n")
+	_, _ = fmt.Fprintf(tty, "profile: %s (%s)\n", profile.Name, profile.ID)
+	_, _ = fmt.Fprintf(tty, "host: %s:%d user: %s\n", profile.Host, profile.Port, profile.Username)
 
 	saved := map[string]bool{}
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
-	for scanner.Scan() {
-		line := scanner.Text()
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		val := strings.TrimSpace(parts[1])
-		if val == "" {
-			continue
-		}
-		validField := false
-		for _, f := range fields {
-			if f == key {
-				validField = true
-				break
-			}
-		}
-		if !validField {
-			continue
-		}
-		if err := s.secrets.Set(profile.ID, key, val); err != nil {
-			return nil, fmt.Errorf("save %s: %w", key, err)
-		}
-		saved[key] = true
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan temp file: %w", err)
-	}
-
+	reader := bufio.NewReader(tty)
 	for _, f := range fields {
-		if _, ok := saved[f]; !ok {
-			saved[f] = false
+		label := fieldLabel(f)
+		val, err := readSecretFromTTY(reader, tty, label)
+		if err != nil {
+			return nil, err
 		}
+		if strings.TrimSpace(val) == "" {
+			saved[f] = false
+			continue
+		}
+		if err := s.secrets.Set(profile.ID, f, val); err != nil {
+			return nil, fmt.Errorf("save %s: %w", f, err)
+		}
+		saved[f] = true
 	}
-
 	return map[string]any{
 		"saved":         countSavedFields(saved) > 0,
 		"profile_id":    profile.ID,
 		"secrets_saved": saved,
-		"method":        "editor",
+		"method":        "terminal_prompt",
 		"connect_hint": map[string]any{
 			"tool":      "ssh_connect",
 			"arguments": map[string]any{"profile_id": profile.ID},
 		},
 	}, nil
+}
+
+func fieldLabel(name string) string {
+	switch name {
+	case "password":
+		return "SSH Password"
+	case "key_passphrase":
+		return "Key Passphrase"
+	case "sudo_password":
+		return "Sudo Password"
+	default:
+		return name
+	}
+}
+
+func readSecretFromTTY(reader *bufio.Reader, tty *os.File, label string) (string, error) {
+	echoDisabled := disableTTYEcho(tty)
+	defer func() {
+		if echoDisabled {
+			_ = enableTTYEcho(tty)
+			_, _ = fmt.Fprintln(tty)
+		}
+	}()
+	_, _ = fmt.Fprintf(tty, "%s (leave empty to skip): ", label)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", label, err)
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func disableTTYEcho(tty *os.File) bool {
+	cmd := exec.Command("stty", "-echo")
+	cmd.Stdin = tty
+	cmd.Stdout = tty
+	cmd.Stderr = tty
+	return cmd.Run() == nil
+}
+
+func enableTTYEcho(tty *os.File) error {
+	cmd := exec.Command("stty", "echo")
+	cmd.Stdin = tty
+	cmd.Stdout = tty
+	cmd.Stderr = tty
+	return cmd.Run()
 }
 
 func hasDisplay() bool {
@@ -450,7 +482,7 @@ Auth Mode: <span>{{range $i, $v := .Profile.AuthPriority}}{{if $i}}, {{end}}{{$v
 <input type="hidden" name="nonce" value="{{.Nonce}}">
 {{range .Fields}}
 <div class="field">
-<label>{{if eq . "password"}}Password{{else if eq . "key_passphrase"}}Key Passphrase{{else}}{{.}}{{end}}</label>
+<label>{{if eq . "password"}}Password{{else if eq . "key_passphrase"}}Key Passphrase{{else if eq . "sudo_password"}}Sudo Password{{else}}{{.}}{{end}}</label>
 <div class="input-wrap">
 <input type="password" name="{{.}}" id="f_{{.}}" autocomplete="off">
 <button type="button" class="toggle" onclick="toggleVis('f_{{.}}',this)">Show</button>

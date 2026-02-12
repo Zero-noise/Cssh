@@ -1,7 +1,7 @@
 # Cssh
 
 Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code / Codex).
-It provides tool calls for SSH connect/exec, file read/write, patch apply, search, log tail, approval workflow, and audit logging.
+It lets AI agents securely connect, execute commands, transfer files, and manage remote servers over SSH — all through MCP tool calls.
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ git clone https://github.com/yourname/cssh.git
 cd cssh
 go build -o cssh-mcp ./cmd/cssh-mcp
 
-# 2. Register as MCP server in Claude Code (globally available)
+# 2. Register as MCP server in Claude Code
 claude mcp add --transport stdio --scope user cssh -- $(pwd)/cssh-mcp
 
 # 3. Verify
@@ -25,7 +25,7 @@ claude mcp list
 # Expected: cssh: /path/to/cssh-mcp - ✓ Connected
 ```
 
-That's it. Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through setup.
+That's it. Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
 
 ## Uninstall
 
@@ -33,41 +33,48 @@ That's it. Open Claude Code and tell the AI: "Help me connect to my SSH server",
 claude mcp remove cssh
 ```
 
-## Components
+## Security Model
 
-- `cmd/cssh-mcp`: MCP server over stdio (NDJSON framing, protocol version `2025-11-25`).
-- `cmd/csshctl`: CLI for profile/secrets/approval management.
+- **Profile-based access**: connections are restricted to pre-configured profiles. Public-host access follows OR precedence (`global allow_public_host` OR `profile allow_public_host`), and defaults to `true`.
+- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, every command requires explicit approval.
+- **Write protection**: remote file writes are restricted to directories listed in `workspace_roots`.
+- **Runtime narrowing**: `ssh_connect(limit_dir=...)` can narrow AI runtime access to one subdirectory within `workspace_roots`.
+- **Credential storage**: passwords and key passphrases are stored in the OS keychain (macOS Keychain / Linux Secret Service), never in config files.
+- **Root policy**: `allow_root_user` is per-profile; global `allow_root_login=true` overrides and permits root login.
 
-## Security Model (MVP)
+## Tools
 
-- Default policy: restricted + escalation.
-- Write scope: only inside `workspace_roots`.
-- High-risk (`L2`) commands require explicit approval via `csshctl approve <approval_id>`.
-- Credentials are stored in OS key store:
-  - macOS: Keychain (`security` command)
-  - Linux: Secret Service (`secret-tool`)
-- Public host is denied by default unless `allow_public_host=true`.
-
-## Runtime Files
-
-Default config path: `~/.csbridge/config.toml` (auto-created on first run).
-
-Runtime artifacts (all auto-created, no manual setup needed):
-- config: `~/.csbridge/config.toml`
-- profiles store: `~/.csbridge/profiles.json`
-- approvals queue: `~/.csbridge/runtime/approvals.jsonl`
-- audit logs: `~/.csbridge/logs/audit-YYYYMMDD.jsonl`
+| Tool | Description |
+|------|-------------|
+| `ssh_connect` | Create an SSH connection, returns `connection_id` |
+| `ssh_open_session` | Create a reusable shell session |
+| `ssh_exec` | Run a command on remote host |
+| `ssh_connection_status` | Check connection health |
+| `ssh_disconnect` | Close a connection |
+| `ssh_read_file` | Read remote file |
+| `ssh_write_file` | Write remote file |
+| `ssh_apply_patch` | Apply unified diff patch on remote host |
+| `ssh_list_dir` | List remote directory entries |
+| `ssh_search_text` | Search text in remote files |
+| `ssh_tail_log` | Tail remote log file |
+| `ssh_transfer` | Transfer files using `scp` client (SFTP by default, legacy SCP fallback) with optional SHA-256 verification |
+| `ssh_profile` | List or delete saved profiles |
+| `ssh_profile_setup` | Create profiles via guided setup flow |
+| `ssh_credentials_prompt` | Securely store credentials via local web form |
+| `ssh_privilege_status` | List active privilege grants |
+| `ssh_privilege_revoke` | Revoke a privilege grant |
+| `ssh_approve_request` | Approve or reject a pending command |
 
 ## Build
 
 ```bash
-go build -o cssh-mcp ./cmd/cssh-mcp
-go build -o csshctl ./cmd/csshctl
+# Both binaries
+go build -o cssh-mcp ./cmd/cssh-mcp && go build -o csshctl ./cmd/csshctl
 ```
 
-> **Note**: After modifying `.go` source files, you must re-run `go build` to regenerate the binary. Claude Code runs the compiled binary, not the source code.
+> **Note**: After modifying `.go` source files, re-run `go build` to regenerate the binary.
 
-## CLI Usage
+## CLI Reference
 
 ```bash
 # Add a profile
@@ -75,114 +82,54 @@ csshctl profile add \
   --id devbox \
   --name rayna-dev \
   --host 100.88.0.10 \
-  --port 22 \
   --user ubuntu \
   --workspace-roots /home/ubuntu/project \
   --auth-priority key,password \
-  --key-path ~/.ssh/id_ed25519
+  --key-path ~/.ssh/id_ed25519 \
+  --security-profile easy_safe
 
-# Store password for fallback auth
+# Store credentials
 csshctl secret set-password --profile devbox
-
-# Store private key passphrase (optional)
 csshctl secret set-key-passphrase --profile devbox
+csshctl secret set-sudo-password --profile devbox
 
-# List pending approvals
+# Manage approvals
 csshctl approvals list --status pending
-
-# Approve a high-risk command
 csshctl approve apr_xxx --by yourname
 ```
 
-## Tool List
+## File Transfer
 
-| Tool | Description |
-|------|-------------|
-| `ssh_connect` | Create an SSH connection, returns `connection_id` |
-| `ssh_open_session` | Create a reusable shell session |
-| `ssh_exec` | Run a command on remote host |
-| `ssh_connection_status` | Check one/all active SSH connection health and session summary |
-| `ssh_upload_file` | Upload one local file to remote host via scp (with optional SHA-256 verify) |
-| `ssh_download_file` | Download one remote file to local machine via scp (with optional SHA-256 verify) |
-| `ssh_read_file` | Read remote file (workspace_roots guarded) |
-| `ssh_write_file` | Write remote file (workspace_roots guarded) |
-| `ssh_apply_patch` | Apply unified diff patch on remote host |
-| `ssh_list_dir` | List remote directory entries |
-| `ssh_search_text` | Search text in remote files |
-| `ssh_tail_log` | Tail remote log file |
-| `ssh_disconnect` | Close an SSH connection |
-| `ssh_profiles_list` | List saved SSH profiles |
-| `ssh_quick_setup_template` | Get a setup form template for AI-guided onboarding |
-| `ssh_quick_setup_save` | Save profile + secrets from the setup form |
+`ssh_transfer` supports `direction=upload` (local → remote) and `direction=download` (remote → local).
 
-## Fast Setup Flow (AI-Guided)
+- `scp` is the transport client. On modern OpenSSH it uses SFTP mode by default; if SFTP subsystem is unavailable, Cssh retries with legacy SCP (`-O`).
+- Default mode is `create` (fails if target exists). Use `mode=overwrite` to replace.
+- SHA-256 checksum verification is enabled by default.
+- Local paths are restricted to the current working directory unless `allow_local_anywhere=true`.
+- Response includes `transfer_protocol` (`sftp` or `scp_legacy`) and `fallback_used` (`true/false`). When fallback happens, `fallback_reason` is also returned.
 
-When a user says "I want to connect to this SSH host to do X", AI can run:
+## Recommended AI Workflow
 
-1. `ssh_quick_setup_template` to get a compact fill-in form.
-2. Ask the user to provide the form values.
-3. `ssh_quick_setup_save` to persist profile + secrets automatically.
-4. Call `ssh_connect` with returned `profile_id`.
+Use canonical tools only (legacy aliases remain compatible but deprecated):
 
-Example `ssh_quick_setup_save` arguments:
+1. `ssh_profile_setup(step=template|save)`
+2. `ssh_credentials_prompt(profile_id=...)` (if auth requires credentials)
+3. `ssh_connect(profile_id=...)`
+4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
+5. `ssh_approve_request` only when a call returns `approval_required`
 
 ```json
 {
-  "purpose": "debug jsonl worker",
-  "profile_name": "rayna-dev",
-  "host": "100.88.0.10",
-  "username": "ubuntu",
-  "auth_mode": "hybrid",
-  "workspace_roots": ["/home/ubuntu/project"],
-  "key_path": "~/.ssh/id_ed25519"
+  "direction": "upload",
+  "connection_id": "conn_xxx",
+  "local_path": "./model.bin",
+  "remote_path": "/home/ubuntu/project/model.bin"
 }
 ```
-
-For multiple servers, keep unique names (for AI readability) and unique profile IDs (for exact targeting).
-`ssh_connect` supports both `profile_name` and `profile_id`.
 
 ## Notes
 
-- Password SSH auth is implemented through `SSH_ASKPASS` flow.
-- `ssh_apply_patch` requires `patch` and `base64` on remote host.
-- `ssh_search_text` uses `grep/find` on remote host.
-
-## File Transfer (SCP)
-
-`ssh_upload_file` and `ssh_download_file` reuse the active SSH control socket from `connection_id`.
-This usually avoids re-entering password after `ssh_connect`.
-
-- Default `mode` is `create` (fails if target exists).
-- Set `mode=overwrite` to replace existing target file.
-- Default `verify_checksum=true` returns `local_sha256` and `remote_sha256`.
-- Local path is restricted to current working directory by default.
-  Set `allow_local_anywhere=true` explicitly if you need paths outside current working directory.
-
-Example upload:
-
-```json
-{
-  "connection_id": "conn_xxx",
-  "local_path": "/Users/me/workspace/model.bin",
-  "remote_path": "/home/ubuntu/project/model.bin",
-  "mode": "create",
-  "create_parents": true,
-  "verify_checksum": true,
-  "allow_local_anywhere": true,
-  "timeout_sec": 300
-}
-```
-
-Example download:
-
-```json
-{
-  "connection_id": "conn_xxx",
-  "remote_path": "/home/ubuntu/project/logs/latest.log",
-  "local_path": "/Users/me/workspace/latest.log",
-  "mode": "create",
-  "create_parents": true,
-  "verify_checksum": true,
-  "timeout_sec": 300
-}
-```
+- Password auth uses `SSH_ASKPASS` flow.
+- `ssh_apply_patch` requires `patch` and `base64` on the remote host.
+- `ssh_search_text` uses `grep`/`find` on the remote host.
+- Default config path: `~/.csbridge/config.toml` (auto-created on first run).

@@ -38,4 +38,11 @@ func TestApprovalStoreLifecycle(t *testing.T) {
 	if updated.Status != model.ApprovalApproved {
 		t.Fatalf("resolve status: %s", updated.Status)
 	}
+	used, err := s.MarkUsed("apr_1")
+	if err != nil {
+		t.Fatalf("mark used: %v", err)
+	}
+	if used == nil || used.UsedAt == nil {
+		t.Fatalf("expected used_at to be set")
+	}
 }

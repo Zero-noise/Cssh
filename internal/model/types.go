@@ -10,24 +10,33 @@ const (
 )
 
 type Profile struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name,omitempty"`
-	Host            string   `json:"host"`
-	Port            int      `json:"port"`
-	Username        string   `json:"username"`
-	AuthPriority    []string `json:"auth_priority"`
-	KeyPath         string   `json:"key_path,omitempty"`
-	WorkspaceRoots  []string `json:"workspace_roots"`
-	AllowPublicHost bool     `json:"allow_public_host"`
+	ID                string   `json:"id"`
+	Name              string   `json:"name,omitempty"`
+	Host              string   `json:"host"`
+	Port              int      `json:"port"`
+	Username          string   `json:"username"`
+	AuthPriority      []string `json:"auth_priority"`
+	KeyPath           string   `json:"key_path,omitempty"`
+	WorkspaceRoots    []string `json:"workspace_roots"`
+	AllowPublicHost   bool     `json:"allow_public_host"`
+	SecurityProfile   string   `json:"security_profile,omitempty"`
+	AllowRootUser     bool     `json:"allow_root_user,omitempty"`
+	ToolPolicyVersion int      `json:"tool_policy_version,omitempty"`
 }
 
 type Config struct {
-	DefaultShell      string `json:"default_shell"`
-	DefaultTimeoutSec int    `json:"default_timeout_sec"`
-	AllowPublicHost   bool   `json:"allow_public_host"`
-	RuntimeDir        string `json:"runtime_dir"`
-	LogsDir           string `json:"logs_dir"`
-	ProfilesFile      string `json:"profiles_file"`
+	DefaultShell           string `json:"default_shell"`
+	DefaultTimeoutSec      int    `json:"default_timeout_sec"`
+	AllowPublicHost        bool   `json:"allow_public_host"`
+	RuntimeDir             string `json:"runtime_dir"`
+	LogsDir                string `json:"logs_dir"`
+	ProfilesFile           string `json:"profiles_file"`
+	SecurityProfileDefault string `json:"security_profile_default"`
+	ConnectRequireProfile  bool   `json:"connect_require_profile"`
+	EasySafeApprovalTTLsec int    `json:"easy_safe_approval_ttl_sec"`
+	NonEasyApprovalTTLsec  int    `json:"non_easy_safe_approval_ttl_sec"`
+	SudoEnabled            bool   `json:"sudo_enabled"`
+	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 
 type ConnectionInput struct {
@@ -40,11 +49,13 @@ type ConnectionInput struct {
 	KeyRef          string   `json:"key_ref,omitempty"`
 	PasswordRef     string   `json:"password_ref,omitempty"`
 	WorkspaceRoots  []string `json:"workspace_roots,omitempty"`
+	LimitDir        string   `json:"limit_dir,omitempty"`
 	AllowPublicHost *bool    `json:"allow_public_host,omitempty"`
 }
 
 type Connection struct {
 	ID              string
+	ProfileID       string
 	Host            string
 	Port            int
 	Username        string
@@ -52,8 +63,12 @@ type Connection struct {
 	KeyPath         string
 	KeyPassphrase   string
 	Password        string
+	SudoPassword    string
 	WorkspaceRoots  []string
+	LimitDir        string
 	AllowPublicHost bool
+	SecurityProfile string
+	AllowRootUser   bool
 	ControlPath     string
 	CreatedAt       time.Time
 }
@@ -91,26 +106,59 @@ type ApprovalRequest struct {
 	ConnectionID string         `json:"connection_id"`
 	SessionID    string         `json:"session_id,omitempty"`
 	RiskLevel    RiskLevel      `json:"risk_level"`
+	Capability   string         `json:"capability,omitempty"`
+	CommandTpl   string         `json:"command_template,omitempty"`
+	CommandHash  string         `json:"command_template_hash,omitempty"`
+	GrantTTLsec  int            `json:"grant_ttl_sec,omitempty"`
 	Reason       string         `json:"reason"`
 	RequestedBy  string         `json:"requested_by"`
 	ApprovedBy   string         `json:"approved_by,omitempty"`
 	RejectReason string         `json:"reject_reason,omitempty"`
+	UsedAt       *time.Time     `json:"used_at,omitempty"`
+}
+
+type PrivilegeGrantStatus string
+
+const (
+	PrivilegeGrantActive  PrivilegeGrantStatus = "active"
+	PrivilegeGrantRevoked PrivilegeGrantStatus = "revoked"
+	PrivilegeGrantExpired PrivilegeGrantStatus = "expired"
+)
+
+type PrivilegeGrant struct {
+	ID           string               `json:"id"`
+	CreatedAt    time.Time            `json:"created_at"`
+	ExpiresAt    time.Time            `json:"expires_at"`
+	RevokedAt    *time.Time           `json:"revoked_at,omitempty"`
+	Status       PrivilegeGrantStatus `json:"status"`
+	ConnectionID string               `json:"connection_id"`
+	Capability   string               `json:"capability"`
+	CommandHash  string               `json:"command_template_hash"`
+	RiskLevel    RiskLevel            `json:"risk_level"`
+	ApprovedBy   string               `json:"approved_by,omitempty"`
+	Source       string               `json:"source,omitempty"`
 }
 
 type AuditEvent struct {
-	Timestamp    time.Time `json:"timestamp"`
-	TraceID      string    `json:"trace_id"`
-	Type         string    `json:"type"`
-	ConnectionID string    `json:"connection_id,omitempty"`
-	SessionID    string    `json:"session_id,omitempty"`
-	Host         string    `json:"host,omitempty"`
-	Command      string    `json:"command,omitempty"`
-	RiskLevel    string    `json:"risk_level,omitempty"`
-	ApprovalID   string    `json:"approval_id,omitempty"`
-	ApprovedBy   string    `json:"approved_by,omitempty"`
-	Status       string    `json:"status,omitempty"`
-	ExitCode     int       `json:"exit_code,omitempty"`
-	DurationMS   int64     `json:"duration_ms,omitempty"`
-	FilePath     string    `json:"file_path,omitempty"`
-	Detail       string    `json:"detail,omitempty"`
+	Timestamp       time.Time `json:"timestamp"`
+	TraceID         string    `json:"trace_id"`
+	Type            string    `json:"type"`
+	ConnectionID    string    `json:"connection_id,omitempty"`
+	SessionID       string    `json:"session_id,omitempty"`
+	Host            string    `json:"host,omitempty"`
+	Command         string    `json:"command,omitempty"`
+	RiskLevel       string    `json:"risk_level,omitempty"`
+	ApprovalID      string    `json:"approval_id,omitempty"`
+	ApprovedBy      string    `json:"approved_by,omitempty"`
+	Status          string    `json:"status,omitempty"`
+	ExitCode        int       `json:"exit_code,omitempty"`
+	DurationMS      int64     `json:"duration_ms,omitempty"`
+	FilePath        string    `json:"file_path,omitempty"`
+	Detail          string    `json:"detail,omitempty"`
+	SecurityProfile string    `json:"security_profile,omitempty"`
+	Capability      string    `json:"capability,omitempty"`
+	CommandHash     string    `json:"command_template_hash,omitempty"`
+	GrantID         string    `json:"grant_id,omitempty"`
+	GrantTTLsec     int       `json:"grant_ttl_sec,omitempty"`
+	ConfirmMode     string    `json:"confirm_mode,omitempty"`
 }

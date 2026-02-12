@@ -16,7 +16,13 @@ const defaultConfigBody = `# Cssh runtime configuration
 
 default_shell = "bash -lc"
 default_timeout_sec = 120
-allow_public_host = false
+allow_public_host = true
+security_profile_default = "easy_safe"
+connect_require_profile = true
+easy_safe_approval_ttl_sec = 900
+non_easy_safe_approval_ttl_sec = 0
+sudo_enabled = true
+allow_root_login = false
 `
 
 func ExpandHome(p string) string {
@@ -55,12 +61,18 @@ func Load(configPath string) (model.Config, error) {
 	configPath = ExpandHome(configPath)
 	base := filepath.Dir(configPath)
 	cfg := model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		AllowPublicHost:   false,
-		RuntimeDir:        filepath.Join(base, "runtime"),
-		LogsDir:           filepath.Join(base, "logs"),
-		ProfilesFile:      filepath.Join(base, "profiles.json"),
+		DefaultShell:           "bash -lc",
+		DefaultTimeoutSec:      120,
+		AllowPublicHost:        true,
+		RuntimeDir:             filepath.Join(base, "runtime"),
+		LogsDir:                filepath.Join(base, "logs"),
+		ProfilesFile:           filepath.Join(base, "profiles.json"),
+		SecurityProfileDefault: "easy_safe",
+		ConnectRequireProfile:  true,
+		EasySafeApprovalTTLsec: 900,
+		NonEasyApprovalTTLsec:  0,
+		SudoEnabled:            true,
+		AllowRootLogin:         false,
 	}
 
 	if err := os.MkdirAll(base, 0o700); err != nil {
@@ -104,6 +116,26 @@ func Load(configPath string) (model.Config, error) {
 			}
 		case "allow_public_host":
 			cfg.AllowPublicHost = strings.EqualFold(val, "true")
+		case "security_profile_default":
+			if strings.TrimSpace(val) != "" {
+				cfg.SecurityProfileDefault = strings.TrimSpace(val)
+			}
+		case "connect_require_profile":
+			cfg.ConnectRequireProfile = strings.EqualFold(val, "true")
+		case "easy_safe_approval_ttl_sec":
+			n, err := strconv.Atoi(val)
+			if err == nil && n >= 0 {
+				cfg.EasySafeApprovalTTLsec = n
+			}
+		case "non_easy_safe_approval_ttl_sec":
+			n, err := strconv.Atoi(val)
+			if err == nil && n >= 0 {
+				cfg.NonEasyApprovalTTLsec = n
+			}
+		case "sudo_enabled":
+			cfg.SudoEnabled = strings.EqualFold(val, "true")
+		case "allow_root_login":
+			cfg.AllowRootLogin = strings.EqualFold(val, "true")
 		case "profiles_file":
 			if val != "" {
 				cfg.ProfilesFile = ExpandHome(val)
@@ -120,6 +152,9 @@ func Load(configPath string) (model.Config, error) {
 	}
 	if err := s.Err(); err != nil {
 		return cfg, fmt.Errorf("scan config: %w", err)
+	}
+	if strings.TrimSpace(cfg.SecurityProfileDefault) == "" {
+		cfg.SecurityProfileDefault = "easy_safe"
 	}
 
 	if err := os.MkdirAll(cfg.RuntimeDir, 0o700); err != nil {

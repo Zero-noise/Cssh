@@ -168,3 +168,40 @@ func (s *Store) Resolve(id string, status model.ApprovalStatus, actor, reason st
 	}
 	return updated, nil
 }
+
+func (s *Store) MarkUsed(id string) (*model.ApprovalRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items, err := s.loadAll()
+	if err != nil {
+		return nil, err
+	}
+	var updated *model.ApprovalRequest
+	now := time.Now().UTC()
+	for i := range items {
+		if items[i].ID != id {
+			continue
+		}
+		if items[i].Status != model.ApprovalApproved {
+			cp := items[i]
+			updated = &cp
+			break
+		}
+		if items[i].UsedAt != nil {
+			cp := items[i]
+			updated = &cp
+			break
+		}
+		items[i].UsedAt = &now
+		cp := items[i]
+		updated = &cp
+		break
+	}
+	if updated == nil {
+		return nil, nil
+	}
+	if err := s.rewriteAll(items); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}

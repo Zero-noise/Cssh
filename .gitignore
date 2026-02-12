@@ -1,19 +1,19 @@
-# Local build outputs
+# Build outputs
 /cssh-mcp
 /csshctl
 /bin/
 
-# Go test/build artifacts
+# Go artifacts
 *.test
+*.out
 coverage.out
 *.coverprofile
+.gocache/
 
-# Local tool/runtime state
+# Local runtime/state (may include secrets)
 .cache/
-.csbridge/config.toml
-.csbridge/profiles.json
-.csbridge/runtime/
-.csbridge/logs/
+.claude/
+.csbridge/
 
 # Editor/OS noise
 .DS_Store

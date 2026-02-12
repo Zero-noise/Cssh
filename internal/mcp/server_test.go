@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
@@ -130,14 +132,14 @@ func TestSSHConnectionStatusSchema(t *testing.T) {
 	}
 }
 
-func TestSSHUploadFileSchema(t *testing.T) {
-	tool := findToolDef(t, "ssh_upload_file")
+func TestSSHTransferSchema(t *testing.T) {
+	tool := findToolDef(t, "ssh_transfer")
 	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
 	}
 	requiredAny := requiredAsAny(t, schema)
-	for _, k := range []string{"connection_id", "local_path", "remote_path"} {
+	for _, k := range []string{"direction", "connection_id", "local_path", "remote_path"} {
 		if !containsString(requiredAny, k) {
 			t.Fatalf("required should contain %s: %#v", k, requiredAny)
 		}
@@ -146,7 +148,7 @@ func TestSSHUploadFileSchema(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	for _, k := range []string{"mode", "create_parents", "verify_checksum", "allow_local_anywhere", "timeout_sec"} {
+	for _, k := range []string{"mode", "create_parents", "verify_checksum", "allow_local_anywhere", "timeout_sec", "approval_token"} {
 		if _, exists := props[k]; !exists {
 			t.Fatalf("properties should include %s", k)
 		}
@@ -162,19 +164,85 @@ func TestSSHUploadFileSchema(t *testing.T) {
 	if !containsString(enumAny, "create") || !containsString(enumAny, "overwrite") || containsString(enumAny, "append") {
 		t.Fatalf("unexpected mode enum: %#v", enumAny)
 	}
+	directionProp, ok := props["direction"].(map[string]any)
+	if !ok {
+		t.Fatalf("direction property missing")
+	}
+	directionEnum := toAnySlice(directionProp["enum"])
+	if !containsString(directionEnum, "upload") || !containsString(directionEnum, "download") {
+		t.Fatalf("direction enum should include upload/download: %#v", directionEnum)
+	}
 }
 
-func TestSSHDownloadFileSchema(t *testing.T) {
-	tool := findToolDef(t, "ssh_download_file")
-	schema, ok := tool["inputSchema"].(map[string]any)
+func TestPrivilegeToolsSchema(t *testing.T) {
+	statusTool := findToolDef(t, "ssh_privilege_status")
+	statusSchema, ok := statusTool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
 	}
-	requiredAny := requiredAsAny(t, schema)
-	for _, k := range []string{"connection_id", "remote_path", "local_path"} {
-		if !containsString(requiredAny, k) {
-			t.Fatalf("required should contain %s: %#v", k, requiredAny)
+	statusProps, ok := statusSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	for _, k := range []string{"connection_id", "active_only"} {
+		if _, exists := statusProps[k]; !exists {
+			t.Fatalf("ssh_privilege_status missing %s", k)
 		}
+	}
+
+	revokeTool := findToolDef(t, "ssh_privilege_revoke")
+	revokeSchema, ok := revokeTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	req := requiredAsAny(t, revokeSchema)
+	if !containsString(req, "grant_id") {
+		t.Fatalf("ssh_privilege_revoke should require grant_id")
+	}
+}
+
+func TestProfileAndApprovalToolsSchema(t *testing.T) {
+	profileTool := findToolDef(t, "ssh_profile")
+	profileSchema, ok := profileTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	profileProps, ok := profileSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	actionProp, ok := profileProps["action"].(map[string]any)
+	if !ok {
+		t.Fatalf("ssh_profile should include action")
+	}
+	actionEnum := toAnySlice(actionProp["enum"])
+	if !containsString(actionEnum, "list") || !containsString(actionEnum, "delete") {
+		t.Fatalf("ssh_profile action enum should include list/delete: %#v", actionEnum)
+	}
+	for _, k := range []string{"profile_id", "delete_secrets", "confirm_token"} {
+		if _, exists := profileProps[k]; !exists {
+			t.Fatalf("ssh_profile should include %s", k)
+		}
+	}
+
+	approveTool := findToolDef(t, "ssh_approve_request")
+	approveSchema, ok := approveTool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	approveReq := requiredAsAny(t, approveSchema)
+	if !containsString(approveReq, "approval_id") {
+		t.Fatalf("ssh_approve_request should require approval_id")
+	}
+	approveProps, ok := approveSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	if _, exists := approveProps["decision"]; !exists {
+		t.Fatalf("ssh_approve_request should include decision")
+	}
+	if _, exists := approveProps["approved_by"]; !exists {
+		t.Fatalf("ssh_approve_request should include approved_by")
 	}
 }
 
@@ -222,7 +290,7 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 func TestInitializedNotificationGate(t *testing.T) {
 	s := NewServer(nil)
 
-	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profiles_list","arguments":{}}`)}, 1)
+	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`)}, 1)
 	if res.Error == nil || res.Error.Code != -32002 {
 		t.Fatalf("expected not-initialized error, got: %#v", res)
 	}
@@ -234,37 +302,44 @@ func TestInitializedNotificationGate(t *testing.T) {
 	}
 }
 
-func TestToolsCallNoStructuredContent(t *testing.T) {
-	tmp := t.TempDir()
-	svc := app.NewService(model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		RuntimeDir:        filepath.Join(tmp, "runtime"),
-		LogsDir:           filepath.Join(tmp, "logs"),
-		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
-	})
-	s := NewServer(svc)
-	s.seenInitialize = true
-	s.clientInitialized = true
-
-	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profiles_list","arguments":{}}`)}, 1)
-	if res.Error != nil {
-		t.Fatalf("unexpected error: %#v", res.Error)
-	}
-	rm, ok := res.Result.(map[string]any)
+func TestCredentialPromptSchemaSupportsSudoPassword(t *testing.T) {
+	tool := findToolDef(t, "ssh_credentials_prompt")
+	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
-		t.Fatalf("result is not a map")
+		t.Fatalf("inputSchema missing")
 	}
-	if _, exists := rm["structuredContent"]; exists {
-		t.Fatalf("structuredContent should not exist in tools/call response")
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
 	}
-	if _, ok := rm["isError"].(bool); !ok {
-		t.Fatalf("isError bool should exist")
+	fieldsProp, ok := props["fields"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields property missing")
+	}
+	items, ok := fieldsProp["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("fields items missing")
+	}
+	enumAny := toAnySlice(items["enum"])
+	if enumAny == nil {
+		t.Fatalf("fields enum missing")
+	}
+	if !containsString(enumAny, "sudo_password") {
+		t.Fatalf("fields enum should include sudo_password: %#v", enumAny)
+	}
+	if !containsString(enumAny, "password") {
+		t.Fatalf("fields enum should include password: %#v", enumAny)
+	}
+	if !containsString(enumAny, "key_passphrase") {
+		t.Fatalf("fields enum should include key_passphrase: %#v", enumAny)
+	}
+	if _, ok := props["prompt_mode"]; !ok {
+		t.Fatalf("credential prompt schema should include prompt_mode")
 	}
 }
 
-func TestQuickSetupSaveSchemaDoesNotAcceptCredentialValues(t *testing.T) {
-	tool := findToolDef(t, "ssh_quick_setup_save")
+func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
+	tool := findToolDef(t, "ssh_profile_setup")
 	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
@@ -277,9 +352,114 @@ func TestQuickSetupSaveSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 		t.Fatalf("password should not be exposed in quick setup schema")
 	}
 	if _, ok := props["key_passphrase"]; ok {
-		t.Fatalf("key_passphrase should not be exposed in quick setup schema")
+		t.Fatalf("key_passphrase should not be exposed in profile setup schema")
 	}
 	if _, ok := props["allow_public_host"]; !ok {
-		t.Fatalf("allow_public_host should stay available in quick setup schema")
+		t.Fatalf("allow_public_host should stay available in profile setup schema")
+	}
+	stepProp, ok := props["step"].(map[string]any)
+	if !ok {
+		t.Fatalf("step should be exposed in profile setup schema")
+	}
+	stepEnum := toAnySlice(stepProp["enum"])
+	if !containsString(stepEnum, "template") || !containsString(stepEnum, "save") {
+		t.Fatalf("step enum should include template/save: %#v", stepEnum)
+	}
+}
+
+func TestApproveRequestToolCall(t *testing.T) {
+	tmp := t.TempDir()
+	svc := app.NewService(model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	})
+	req := model.ApprovalRequest{
+		ID:          "apr_tool_1",
+		CreatedAt:   time.Now().UTC(),
+		Status:      model.ApprovalPending,
+		Command:     "cat /etc/hosts",
+		RiskLevel:   model.RiskL0,
+		RequestedBy: "mcp",
+	}
+	if err := svc.Approvals().Create(req); err != nil {
+		t.Fatalf("create approval: %v", err)
+	}
+	s := NewServer(svc)
+	out, err := s.callTool("ssh_approve_request", map[string]any{
+		"approval_id": req.ID,
+		"decision":    "approve",
+		"approved_by": "alice",
+	})
+	if err != nil {
+		t.Fatalf("ssh_approve_request call failed: %v", err)
+	}
+	if out["status"] != model.ApprovalApproved {
+		t.Fatalf("unexpected status: %#v", out["status"])
+	}
+	if out["approval_token"] != req.ID {
+		t.Fatalf("unexpected approval_token: %#v", out["approval_token"])
+	}
+}
+
+func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
+	legacy := []string{
+		"ssh_upload_file",
+		"ssh_download_file",
+		"ssh_profiles_list",
+		"ssh_profile_delete",
+		"ssh_quick_setup_template",
+		"ssh_quick_setup_save",
+		"ssh_sudo_password_prompt",
+	}
+	tools := toolDefs()
+	for _, alias := range legacy {
+		for _, td := range tools {
+			name, _ := td["name"].(string)
+			if name == alias {
+				t.Fatalf("legacy alias should not be exposed in tools/list: %s", alias)
+			}
+		}
+	}
+}
+
+func TestAliasCallReturnsCanonicalWarning(t *testing.T) {
+	tmp := t.TempDir()
+	svc := app.NewService(model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	})
+	s := NewServer(svc)
+
+	out, err := s.callTool("ssh_profiles_list", nil)
+	if err != nil {
+		t.Fatalf("ssh_profiles_list alias call failed: %v", err)
+	}
+	if out["canonical_tool"] != "ssh_profile" {
+		t.Fatalf("canonical_tool mismatch: %#v", out["canonical_tool"])
+	}
+	rawWarnings, ok := out["warnings"].([]string)
+	if !ok || len(rawWarnings) == 0 {
+		t.Fatalf("warnings should include deprecation hint: %#v", out["warnings"])
+	}
+	if !strings.Contains(rawWarnings[0], "deprecated") {
+		t.Fatalf("warning should mention deprecation: %#v", rawWarnings)
+	}
+}
+
+func TestApplyToolAliasDefaultsForSudoPrompt(t *testing.T) {
+	in := map[string]any{"profile_id": "p1"}
+	out := applyToolAliasDefaults(in, "ssh_sudo_password_prompt")
+	fields, ok := out["fields"].([]string)
+	if !ok || len(fields) != 1 || fields[0] != "sudo_password" {
+		t.Fatalf("unexpected fields defaults: %#v", out["fields"])
+	}
+	if out["prompt_mode"] != "web" {
+		t.Fatalf("prompt_mode should default to web, got: %#v", out["prompt_mode"])
 	}
 }

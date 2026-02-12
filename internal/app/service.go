@@ -10,9 +10,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cssh/internal/approvals"
@@ -31,18 +33,29 @@ type Service struct {
 	profiles  *store.ProfileStore
 	secrets   store.SecretStore
 	approvals *approvals.Store
+	grants    *approvals.GrantStore
 	audit     *audit.Logger
 	ssh       *sshbridge.Manager
+
+	deleteMu     sync.Mutex
+	deleteTokens map[string]profileDeleteConfirm
+}
+
+type profileDeleteConfirm struct {
+	ProfileID string
+	ExpiresAt time.Time
 }
 
 func NewService(cfg model.Config) *Service {
 	return &Service{
-		cfg:       cfg,
-		profiles:  store.NewProfileStore(cfg.ProfilesFile),
-		secrets:   store.NewSecretStore(),
-		approvals: approvals.NewStore(pathJoin(cfg.RuntimeDir, "approvals.jsonl")),
-		audit:     audit.NewLogger(cfg.LogsDir),
-		ssh:       sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
+		cfg:          cfg,
+		profiles:     store.NewProfileStore(cfg.ProfilesFile),
+		secrets:      store.NewSecretStore(),
+		approvals:    approvals.NewStore(pathJoin(cfg.RuntimeDir, "approvals.jsonl")),
+		grants:       approvals.NewGrantStore(pathJoin(cfg.RuntimeDir, "grants.json")),
+		audit:        audit.NewLogger(cfg.LogsDir),
+		ssh:          sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
+		deleteTokens: map[string]profileDeleteConfirm{},
 	}
 }
 
@@ -56,6 +69,22 @@ func pathJoin(a, b string) string {
 func (s *Service) ProfileStore() *store.ProfileStore { return s.profiles }
 func (s *Service) SecretStore() store.SecretStore    { return s.secrets }
 func (s *Service) Approvals() *approvals.Store       { return s.approvals }
+func (s *Service) Grants() *approvals.GrantStore     { return s.grants }
+
+func (s *Service) AuditToolCall(tool, status, detail string) {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		return
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   util.NewID("trace"),
+		Type:      "tool_call",
+		Command:   tool,
+		Status:    status,
+		Detail:    strings.TrimSpace(detail),
+	})
+}
 
 func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 	traceID := util.NewID("trace")
@@ -72,18 +101,27 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		return nil, err
 	}
 	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_connect",
-		ConnectionID: conn.ID,
-		Host:         conn.Host,
-		Status:       "ok",
+		Timestamp:       time.Now().UTC(),
+		TraceID:         traceID,
+		Type:            "ssh_connect",
+		ConnectionID:    conn.ID,
+		Host:            conn.Host,
+		Status:          "ok",
+		SecurityProfile: conn.SecurityProfile,
 	})
-	return map[string]any{
-		"connection_id":   conn.ID,
-		"capabilities":    []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
-		"workspace_roots": conn.WorkspaceRoots,
-	}, nil
+	resp := map[string]any{
+		"connection_id":    conn.ID,
+		"capabilities":     []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
+		"workspace_roots":  conn.WorkspaceRoots,
+		"security_profile": conn.SecurityProfile,
+	}
+	if strings.TrimSpace(conn.LimitDir) != "" {
+		resp["limit_dir"] = conn.LimitDir
+	}
+	if conn.AllowPublicHost && !security.IsPrivateOrLoopbackHost(conn.Host) {
+		resp["warnings"] = []string{"connected to a public host because allow_public_host=true; verify profile and remote host trust"}
+	}
+	return resp, nil
 }
 
 func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, error) {
@@ -105,32 +143,53 @@ func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, 
 
 func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
+	auditCommand := sanitizeCommandForAudit(command)
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
 	}
-	risk, reason := security.ClassifyCommandRisk(command)
-	if risk == model.RiskL2 {
-		ok, statusResp, err := s.checkApproval(connectionID, sessionID, command, reason, approvalToken)
+	policy := security.EvaluateExecPolicy(command)
+	authz := privilegeAuthz{}
+	needsApprove, approveReason := shouldRequireApproval(conn.SecurityProfile, policy)
+	if needsApprove {
+		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, approveReason, approvalToken)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
+		if !authz.Allowed {
 			_ = s.audit.Write(model.AuditEvent{
-				Timestamp:    time.Now().UTC(),
-				TraceID:      traceID,
-				Type:         "ssh_exec",
-				ConnectionID: connectionID,
-				SessionID:    sessionID,
-				Command:      command,
-				RiskLevel:    string(risk),
-				Status:       "approval_required",
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_exec",
+				ConnectionID:    connectionID,
+				SessionID:       sessionID,
+				Command:         auditCommand,
+				RiskLevel:       string(policy.RiskLevel),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      policy.Capability,
+				CommandHash:     policy.TemplateHash,
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
 			})
+			return authz.StatusResp, nil
+		}
+	}
+
+	runCommand := command
+	runInput := ""
+	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled {
+		var statusResp map[string]any
+		runCommand, runInput, statusResp, err = s.prepareSudoCommand(*conn, command)
+		if err != nil {
+			return nil, err
+		}
+		if statusResp != nil {
 			return statusResp, nil
 		}
 	}
 
-	res, err := s.ssh.Exec(connectionID, sessionID, command, cwd, timeoutSec)
+	res, err := s.ssh.ExecWithInput(connectionID, sessionID, runCommand, cwd, timeoutSec, runInput)
 	if err != nil {
 		return nil, err
 	}
@@ -139,27 +198,35 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		status = "nonzero_exit"
 	}
 	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_exec",
-		ConnectionID: connectionID,
-		SessionID:    sessionID,
-		Host:         conn.Host,
-		Command:      command,
-		RiskLevel:    string(risk),
-		Status:       status,
-		ExitCode:     res.ExitCode,
-		DurationMS:   res.DurationMS,
+		Timestamp:       time.Now().UTC(),
+		TraceID:         traceID,
+		Type:            "ssh_exec",
+		ConnectionID:    connectionID,
+		SessionID:       sessionID,
+		Host:            conn.Host,
+		Command:         auditCommand,
+		RiskLevel:       string(policy.RiskLevel),
+		Status:          status,
+		ExitCode:        res.ExitCode,
+		DurationMS:      res.DurationMS,
+		SecurityProfile: conn.SecurityProfile,
+		Capability:      policy.Capability,
+		CommandHash:     policy.TemplateHash,
+		GrantID:         authz.GrantID,
+		GrantTTLsec:     authz.GrantTTLsec,
+		ConfirmMode:     authz.ConfirmMode,
 	})
 	return map[string]any{
 		"exit_code":   res.ExitCode,
 		"stdout":      res.Stdout,
 		"stderr":      res.Stderr,
 		"duration_ms": res.DurationMS,
+		"grant_id":    authz.GrantID,
 	}, nil
 }
 
 func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	if timeoutSec <= 0 {
 		timeoutSec = 5
 	}
@@ -184,6 +251,8 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 			"port":                  conn.Port,
 			"username":              conn.Username,
 			"workspace_roots":       conn.WorkspaceRoots,
+			"limit_dir":             conn.LimitDir,
+			"security_profile":      conn.SecurityProfile,
 			"created_at":            conn.CreatedAt.Format(time.RFC3339),
 			"connected":             alive,
 			"control_socket_exists": socketExists,
@@ -203,7 +272,15 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"connections": []map[string]any{item}}, nil
+		out := map[string]any{"connections": []map[string]any{item}}
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_connection_status",
+			ConnectionID: connectionID,
+			Status:       "ok",
+		})
+		return out, nil
 	}
 
 	conns := s.ssh.ListConnections()
@@ -221,10 +298,78 @@ func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[str
 		}
 		items = append(items, item)
 	}
-	return map[string]any{"connections": items}, nil
+	out := map[string]any{"connections": items}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_connection_status",
+		Status:    "ok",
+		Detail:    "all_connections",
+	})
+	return out, nil
 }
 
-func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool) (map[string]any, error) {
+func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	items, err := s.grants.List(connectionID, activeOnly)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, g := range items {
+		out = append(out, map[string]any{
+			"grant_id":              g.ID,
+			"connection_id":         g.ConnectionID,
+			"capability":            g.Capability,
+			"command_template_hash": g.CommandHash,
+			"risk_level":            g.RiskLevel,
+			"status":                g.Status,
+			"created_at":            g.CreatedAt.Format(time.RFC3339),
+			"expires_at":            g.ExpiresAt.Format(time.RFC3339),
+			"approved_by":           g.ApprovedBy,
+			"source":                g.Source,
+		})
+	}
+	resp := map[string]any{"grants": out}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_privilege_status",
+		ConnectionID: connectionID,
+		Status:       "ok",
+	})
+	return resp, nil
+}
+
+func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	g, err := s.grants.Revoke(grantID)
+	if err != nil {
+		return nil, err
+	}
+	if g == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "grant_id not found")
+	}
+	resp := map[string]any{
+		"revoked":               true,
+		"grant_id":              g.ID,
+		"connection_id":         g.ConnectionID,
+		"capability":            g.Capability,
+		"command_template_hash": g.CommandHash,
+		"status":                g.Status,
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_privilege_revoke",
+		ConnectionID: g.ConnectionID,
+		Status:       "ok",
+		GrantID:      g.ID,
+	})
+	return resp, nil
+}
+
+func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -238,6 +383,41 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	}
 	if err := s.ensureConnectionAlive(connectionID); err != nil {
 		return nil, err
+	}
+	authz := privilegeAuthz{}
+	if allowLocalAnywhere {
+		template := "ssh_transfer direction=upload allow_local_anywhere"
+		authz, err = s.authorizePrivilege(
+			connectionID,
+			"",
+			"local_anywhere_transfer",
+			template,
+			template,
+			security.HashCommandTemplate(template),
+			model.RiskL2,
+			"allow_local_anywhere requires explicit approval",
+			approvalToken,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !authz.Allowed {
+			_ = s.audit.Write(model.AuditEvent{
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_transfer",
+				ConnectionID:    connectionID,
+				Host:            conn.Host,
+				RiskLevel:       string(model.RiskL2),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      "local_anywhere_transfer",
+				CommandHash:     security.HashCommandTemplate(template),
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
+			})
+			return authz.StatusResp, nil
+		}
 	}
 
 	localAbs, err := security.ResolveLocalPath(localPath)
@@ -271,17 +451,19 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		remoteTemp = transferTempPath(remoteResolved)
 		uploadTarget = remoteTemp
 	}
-	durationMS, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec)
+	transferRes, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec)
+	auditDetail := transferAuditDetail(localAbs+" -> "+remoteResolved, transferRes)
+	durationMS := transferRes.DurationMS
 	if err != nil {
 		if remoteTemp != "" {
 			s.remoteRemoveFile(connectionID, remoteTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := s.remoteInstallCreateOnly(connectionID, remoteTemp, remoteResolved); err != nil {
-			s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 			return nil, err
 		}
 	}
@@ -298,23 +480,30 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			return nil, err
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "checksum_mismatch", localAbs+" -> "+remoteResolved, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_upload_file", connectionID, conn.Host, remoteResolved, "ok", localAbs+" -> "+remoteResolved, durationMS)
-	return map[string]any{
-		"bytes":         info.Size(),
-		"local_sha256":  localSHA,
-		"remote_sha256": remoteSHA,
-		"local_path":    localAbs,
-		"remote_path":   remoteResolved,
-		"duration_ms":   durationMS,
-	}, nil
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+		"grant_id":          authz.GrantID,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	return resp, nil
 }
 
-func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool) (map[string]any, error) {
+func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -328,6 +517,41 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	}
 	if err := s.ensureConnectionAlive(connectionID); err != nil {
 		return nil, err
+	}
+	authz := privilegeAuthz{}
+	if allowLocalAnywhere {
+		template := "ssh_transfer direction=download allow_local_anywhere"
+		authz, err = s.authorizePrivilege(
+			connectionID,
+			"",
+			"local_anywhere_transfer",
+			template,
+			template,
+			security.HashCommandTemplate(template),
+			model.RiskL2,
+			"allow_local_anywhere requires explicit approval",
+			approvalToken,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if !authz.Allowed {
+			_ = s.audit.Write(model.AuditEvent{
+				Timestamp:       time.Now().UTC(),
+				TraceID:         traceID,
+				Type:            "ssh_transfer",
+				ConnectionID:    connectionID,
+				Host:            conn.Host,
+				RiskLevel:       string(model.RiskL2),
+				Status:          "approval_required",
+				SecurityProfile: conn.SecurityProfile,
+				Capability:      "local_anywhere_transfer",
+				CommandHash:     security.HashCommandTemplate(template),
+				GrantTTLsec:     authz.GrantTTLsec,
+				ConfirmMode:     authz.ConfirmMode,
+			})
+			return authz.StatusResp, nil
+		}
 	}
 
 	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
@@ -368,17 +592,19 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		localTemp = transferTempPath(localAbs)
 		downloadTarget = localTemp
 	}
-	durationMS, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec)
+	transferRes, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec)
+	auditDetail := transferAuditDetail(remoteResolved+" -> "+localAbs, transferRes)
+	durationMS := transferRes.DurationMS
 	if err != nil {
 		if localTemp != "" {
 			_ = os.Remove(localTemp)
 		}
-		s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 		return nil, err
 	}
 	if mode == "create" {
 		if err := installLocalCreateOnly(localTemp, localAbs); err != nil {
-			s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "nonzero_exit", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 			return nil, err
 		}
 	}
@@ -402,20 +628,27 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
 		}
 		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
-			s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "checksum_mismatch", remoteResolved+" -> "+localAbs, durationMS)
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
 			return nil, err
 		}
 	}
 
-	s.writeTransferAudit(traceID, "ssh_download_file", connectionID, conn.Host, remoteResolved, "ok", remoteResolved+" -> "+localAbs, durationMS)
-	return map[string]any{
-		"bytes":         info.Size(),
-		"local_sha256":  localSHA,
-		"remote_sha256": remoteSHA,
-		"local_path":    localAbs,
-		"remote_path":   remoteResolved,
-		"duration_ms":   durationMS,
-	}, nil
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+		"grant_id":          authz.GrantID,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	return resp, nil
 }
 
 func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd string) (map[string]any, error) {
@@ -431,16 +664,29 @@ func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd stri
 	if resolved == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
 	}
+	isFile, err := s.remoteRegularFileExists(connectionID, resolved)
+	if err != nil {
+		return nil, err
+	}
+	if !isFile {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "path not found or not a regular file")
+	}
 
 	sizeRes, err := s.ssh.Exec(connectionID, "", "wc -c < "+util.ShellQuote(resolved), "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if sizeRes.ExitCode != 0 {
+		return nil, commandResultError(sizeRes, "read file size failed")
 	}
 	sizeStr := strings.TrimSpace(sizeRes.Stdout)
 	size, _ := strconv.Atoi(sizeStr)
 	res, err := s.ssh.Exec(connectionID, "", "head -c "+strconv.Itoa(maxBytes)+" "+util.ShellQuote(resolved), "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "read file content failed")
 	}
 	truncated := size > maxBytes
 	_ = s.audit.Write(model.AuditEvent{
@@ -559,6 +805,7 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[st
 }
 
 func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -575,15 +822,27 @@ func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[
 	if err != nil {
 		return nil, err
 	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "list directory failed")
+	}
 	lines := splitNonEmpty(res.Stdout)
 	entries := make([]map[string]any, 0, len(lines))
 	for _, it := range lines {
 		entries = append(entries, map[string]any{"path": it})
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_list_dir",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"entries": entries}, nil
 }
 
 func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -597,13 +856,28 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 	}
 	var cmd string
 	if glob == "" {
-		cmd = "grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit)
+		cmd = strings.Join([]string{
+			"set -o pipefail",
+			"grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit),
+			"rc=$?",
+			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"exit \"$rc\"",
+		}, "; ")
 	} else {
-		cmd = "find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit)
+		cmd = strings.Join([]string{
+			"set -o pipefail",
+			"find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit),
+			"rc=$?",
+			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"exit \"$rc\"",
+		}, "; ")
 	}
 	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
 	if err != nil {
 		return nil, err
+	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "search text failed")
 	}
 	matches := make([]map[string]any, 0)
 	for _, line := range splitNonEmpty(res.Stdout) {
@@ -618,11 +892,23 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 			"line":    ln,
 			"snippet": parts[2],
 		})
+		if len(matches) >= limit {
+			break
+		}
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_search_text",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"matches": matches}, nil
 }
 
 func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) (map[string]any, error) {
+	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
@@ -639,13 +925,48 @@ func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) 
 	if err != nil {
 		return nil, err
 	}
+	if res.ExitCode != 0 {
+		return nil, commandResultError(res, "tail log failed")
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_tail_log",
+		ConnectionID: connectionID,
+		FilePath:     resolved,
+		Status:       "ok",
+	})
 	return map[string]any{"content": res.Stdout}, nil
 }
 
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	host := ""
+	conn, _ := s.ssh.GetConnection(connectionID)
+	if conn != nil {
+		host = conn.Host
+	}
+	_ = s.grants.RevokeByConnection(connectionID)
 	if err := s.ssh.Disconnect(connectionID); err != nil {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_disconnect",
+			ConnectionID: connectionID,
+			Host:         host,
+			Status:       "error",
+			Detail:       err.Error(),
+		})
 		return nil, err
 	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_disconnect",
+		ConnectionID: connectionID,
+		Host:         host,
+		Status:       "ok",
+	})
 	return map[string]any{"closed": true}, nil
 }
 
@@ -896,6 +1217,24 @@ func ensureChecksumsMatch(localSHA, remoteSHA string) error {
 	return errorsx.New(errorsx.CodeChecksumMismatch, "sha256 mismatch between local and remote file")
 }
 
+func transferAuditDetail(base string, tr sshbridge.TransferResult) string {
+	detail := strings.TrimSpace(base)
+	if tr.Protocol == "" {
+		return detail
+	}
+	extra := "protocol=" + tr.Protocol
+	if tr.FallbackUsed {
+		extra += ", fallback_used=true"
+		if tr.FallbackReason != "" {
+			extra += ", fallback_reason=" + tr.FallbackReason
+		}
+	}
+	if detail == "" {
+		return extra
+	}
+	return detail + " (" + extra + ")"
+}
+
 func (s *Service) writeTransferAudit(traceID, typ, connectionID, host, filePath, status, detail string, durationMS int64) {
 	_ = s.audit.Write(model.AuditEvent{
 		Timestamp:    time.Now().UTC(),
@@ -922,52 +1261,347 @@ func splitNonEmpty(s string) []string {
 	return out
 }
 
-func (s *Service) checkApproval(connectionID, sessionID, command, reason, token string) (bool, map[string]any, error) {
+func commandResultError(res sshbridge.ExecResult, fallback string) error {
+	msg := strings.TrimSpace(res.Stderr)
+	if msg == "" {
+		msg = strings.TrimSpace(res.Stdout)
+	}
+	if msg == "" {
+		msg = fallback
+	}
+	return errorsx.New(errorsx.CodeInternal, msg)
+}
+
+type privilegeAuthz struct {
+	Allowed      bool
+	StatusResp   map[string]any
+	GrantID      string
+	GrantTTLsec  int
+	ConfirmMode  string
+	Reusable     bool
+	ApprovedBy   string
+	TemplateHash string
+}
+
+func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token string) (privilegeAuthz, error) {
+	conn, err := s.ssh.GetConnection(connectionID)
+	if err != nil {
+		return privilegeAuthz{}, err
+	}
+	now := time.Now().UTC()
+	ttlSec := s.approvalTTL(conn)
+	reusable := ttlSec > 0
+	statusResp := func(approvalID string, reqReason string) map[string]any {
+		return map[string]any{
+			"status":                          "approval_required",
+			"approval_id":                     approvalID,
+			"reason":                          reqReason,
+			"risk_level":                      risk,
+			"capability":                      capability,
+			"command_template_hash":           commandHash,
+			"grant_ttl_sec":                   ttlSec,
+			"grant_reusable":                  reusable,
+			"confirmation_required_each_time": !reusable,
+			"next_action": map[string]any{
+				"tool": "ssh_approve_request",
+				"arguments": map[string]any{
+					"approval_id": approvalID,
+					"decision":    "approve",
+				},
+			},
+		}
+	}
+
+	if reusable {
+		existing, err := s.grants.FindActive(connectionID, capability, commandHash, now)
+		if err != nil {
+			return privilegeAuthz{}, err
+		}
+		if existing != nil {
+			return privilegeAuthz{
+				Allowed:      true,
+				GrantID:      existing.ID,
+				GrantTTLsec:  ttlSec,
+				ConfirmMode:  "cached_grant",
+				Reusable:     true,
+				ApprovedBy:   existing.ApprovedBy,
+				TemplateHash: commandHash,
+			}, nil
+		}
+	}
+
 	if token != "" {
 		req, err := s.approvals.Get(token)
 		if err != nil {
-			return false, nil, err
+			return privilegeAuthz{}, err
 		}
 		if req == nil {
-			return false, nil, errorsx.New(errorsx.CodeApprovalRequired, "approval token not found")
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRequired, "approval token not found")
 		}
 		if req.Status == model.ApprovalRejected {
-			return false, nil, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected")
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval rejected")
 		}
-		if req.Status == model.ApprovalApproved {
-			if req.Command != command || req.ConnectionID != connectionID {
-				return false, nil, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current command")
+		if req.Status != model.ApprovalApproved {
+			return privilegeAuthz{Allowed: false, StatusResp: statusResp(req.ID, req.Reason), GrantTTLsec: ttlSec, Reusable: reusable, ConfirmMode: "approval_queue"}, nil
+		}
+		if req.ConnectionID != connectionID {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
+		}
+		if strings.TrimSpace(req.CommandHash) != "" {
+			if req.CommandHash != commandHash {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
 			}
-			return true, nil, nil
+		} else if strings.TrimSpace(req.Command) != strings.TrimSpace(command) {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current command")
 		}
-		return false, map[string]any{
-			"status":      "approval_required",
-			"approval_id": req.ID,
-			"reason":      req.Reason,
-			"risk_level":  req.RiskLevel,
-		}, nil
+		if strings.TrimSpace(req.Capability) != "" && req.Capability != capability {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current capability")
+		}
+		if !reusable {
+			if req.UsedAt != nil {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token already consumed")
+			}
+			updated, err := s.approvals.MarkUsed(req.ID)
+			if err != nil {
+				return privilegeAuthz{}, err
+			}
+			if updated == nil {
+				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token not found")
+			}
+			req = updated
+		}
+		authz := privilegeAuthz{
+			Allowed:      true,
+			GrantTTLsec:  ttlSec,
+			ConfirmMode:  "approval_token",
+			Reusable:     reusable,
+			ApprovedBy:   req.ApprovedBy,
+			TemplateHash: commandHash,
+		}
+		if reusable {
+			grantID, err := s.createPrivilegeGrant(connectionID, capability, commandHash, risk, req.ApprovedBy, "approval_token", ttlSec, now)
+			if err != nil {
+				return privilegeAuthz{}, err
+			}
+			authz.GrantID = grantID
+		}
+		return authz, nil
 	}
 
 	req := model.ApprovalRequest{
 		ID:           util.NewID("apr"),
-		CreatedAt:    time.Now().UTC(),
+		CreatedAt:    now,
 		Status:       model.ApprovalPending,
-		Command:      command,
+		Command:      sanitizeCommandForAudit(command),
 		ConnectionID: connectionID,
 		SessionID:    sessionID,
-		RiskLevel:    model.RiskL2,
+		RiskLevel:    risk,
+		Capability:   capability,
+		CommandTpl:   commandTpl,
+		CommandHash:  commandHash,
+		GrantTTLsec:  ttlSec,
 		Reason:       reason,
 		RequestedBy:  "mcp",
 	}
 	if err := s.approvals.Create(req); err != nil {
-		return false, nil, err
+		return privilegeAuthz{}, err
 	}
-	return false, map[string]any{
-		"status":      "approval_required",
-		"approval_id": req.ID,
-		"reason":      req.Reason,
-		"risk_level":  req.RiskLevel,
+	return privilegeAuthz{
+		Allowed:     false,
+		StatusResp:  statusResp(req.ID, req.Reason),
+		GrantTTLsec: ttlSec,
+		ConfirmMode: "approval_queue",
+		Reusable:    reusable,
 	}, nil
+}
+
+func (s *Service) approvalTTL(conn *model.Connection) int {
+	if isEasySafeProfile(conn.SecurityProfile) {
+		if s.cfg.EasySafeApprovalTTLsec < 0 {
+			return 0
+		}
+		return s.cfg.EasySafeApprovalTTLsec
+	}
+	if s.cfg.NonEasyApprovalTTLsec < 0 {
+		return 0
+	}
+	return s.cfg.NonEasyApprovalTTLsec
+}
+
+func (s *Service) createPrivilegeGrant(connectionID, capability, commandHash string, risk model.RiskLevel, approvedBy, source string, ttlSec int, now time.Time) (string, error) {
+	if ttlSec <= 0 {
+		return "", nil
+	}
+	g := model.PrivilegeGrant{
+		ID:           util.NewID("grt"),
+		CreatedAt:    now,
+		ExpiresAt:    now.Add(time.Duration(ttlSec) * time.Second),
+		Status:       model.PrivilegeGrantActive,
+		ConnectionID: connectionID,
+		Capability:   capability,
+		CommandHash:  commandHash,
+		RiskLevel:    risk,
+		ApprovedBy:   approvedBy,
+		Source:       source,
+	}
+	if err := s.grants.Create(g); err != nil {
+		return "", err
+	}
+	return g.ID, nil
+}
+
+func isEasySafeProfile(profile string) bool {
+	return strings.EqualFold(strings.TrimSpace(profile), "easy_safe")
+}
+
+func shouldRequireApproval(securityProfile string, policy security.ExecPolicyDecision) (bool, string) {
+	if !isEasySafeProfile(securityProfile) {
+		return true, "security profile requires explicit approval for every command"
+	}
+	return policy.NeedsApprove, policy.Reason
+}
+
+func (s *Service) ApproveRequest(approvalID, decision, actor, rejectReason string) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	id := strings.TrimSpace(approvalID)
+	if id == "" {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "approval_id is required")
+	}
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	if decision == "" {
+		decision = "approve"
+	}
+	if strings.TrimSpace(actor) == "" {
+		actor = "mcp_user"
+	}
+	status := model.ApprovalApproved
+	switch decision {
+	case "approve", "approved":
+		status = model.ApprovalApproved
+	case "reject", "rejected":
+		status = model.ApprovalRejected
+		if strings.TrimSpace(rejectReason) == "" {
+			rejectReason = "rejected by mcp user"
+		}
+	default:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "decision must be approve or reject")
+	}
+
+	updated, err := s.approvals.Resolve(id, status, actor, rejectReason)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "approval_id not found")
+	}
+	res := map[string]any{
+		"approval_id":        updated.ID,
+		"requested_decision": decision,
+		"status":             updated.Status,
+		"approved_by":        updated.ApprovedBy,
+		"reject_reason":      updated.RejectReason,
+		"approval_token":     updated.ID,
+	}
+	if updated.ResolvedAt != nil {
+		res["resolved_at"] = updated.ResolvedAt.Format(time.RFC3339)
+	}
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:    time.Now().UTC(),
+		TraceID:      traceID,
+		Type:         "ssh_approve_request",
+		ConnectionID: updated.ConnectionID,
+		ApprovalID:   updated.ID,
+		ApprovedBy:   updated.ApprovedBy,
+		Status:       string(updated.Status),
+	})
+	return res, nil
+}
+
+func (s *Service) issueProfileDeleteToken(profileID string) string {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	now := time.Now().UTC()
+	for k, v := range s.deleteTokens {
+		if now.After(v.ExpiresAt) {
+			delete(s.deleteTokens, k)
+		}
+	}
+	token := util.NewID("del")
+	s.deleteTokens[token] = profileDeleteConfirm{
+		ProfileID: profileID,
+		ExpiresAt: now.Add(5 * time.Minute),
+	}
+	return token
+}
+
+func (s *Service) validateAndConsumeProfileDeleteToken(profileID, token string) error {
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	rec, ok := s.deleteTokens[token]
+	if !ok {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token is invalid or expired")
+	}
+	delete(s.deleteTokens, token)
+	if rec.ProfileID != profileID {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token does not match profile_id")
+	}
+	if time.Now().UTC().After(rec.ExpiresAt) {
+		return errorsx.New(errorsx.CodeInvalidParams, "confirm_token is expired")
+	}
+	return nil
+}
+
+func (s *Service) prepareSudoCommand(conn model.Connection, command string) (string, string, map[string]any, error) {
+	if !security.LooksLikeSudo(command) {
+		return command, "", nil, nil
+	}
+	if !s.cfg.SudoEnabled {
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo execution is disabled by policy")
+	}
+	profileID := strings.TrimSpace(conn.ProfileID)
+	if profileID == "" {
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo requires profile-based connection")
+	}
+	secret, err := s.secrets.Get(profileID, "sudo_password")
+	if err != nil || strings.TrimSpace(secret) == "" {
+		return "", "", map[string]any{
+			"status":          "credential_required",
+			"credential_kind": "sudo_password",
+			"profile_id":      profileID,
+			"message":         "sudo_password is missing; prompt user to enter it securely",
+			"next_action": map[string]any{
+				"tool":      "ssh_credentials_prompt",
+				"arguments": map[string]any{"profile_id": profileID, "fields": []string{"sudo_password"}, "prompt_mode": "web"},
+			},
+		}, nil
+	}
+
+	cmd := strings.TrimSpace(command)
+	if cmd == "sudo" {
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo command is incomplete")
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(cmd, "sudo"))
+	if !strings.HasPrefix(rest, "-S ") && rest != "-S" && !strings.Contains(rest, " -S ") {
+		rest = "-S -p '' " + rest
+	}
+	return "sudo " + rest, secret + "\n", nil, nil
+}
+
+var (
+	auditKVSecretRE   = regexp.MustCompile(`(?i)\b(password|passwd|passphrase|token|secret|api[_-]?key|access[_-]?key)\s*=\s*([^\s;|&]+)`)
+	auditFlagSecretRE = regexp.MustCompile(`(?i)\b(--?(?:password|passphrase|token|secret|api[_-]?key|access[_-]?key)|-p)\s+([^\s;|&]+)`)
+	auditURLSecretRE  = regexp.MustCompile(`://([^:@/\s]+):([^@/\s]+)@`)
+)
+
+func sanitizeCommandForAudit(command string) string {
+	out := strings.TrimSpace(command)
+	if out == "" {
+		return out
+	}
+	out = auditKVSecretRE.ReplaceAllString(out, "$1=***")
+	out = auditFlagSecretRE.ReplaceAllString(out, "$1 ***")
+	out = auditURLSecretRE.ReplaceAllString(out, "://$1:***@")
+	return out
 }
 
 func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Connection, error) {
@@ -976,13 +1610,30 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		if err != nil {
 			return model.Connection{}, err
 		}
+		if strings.EqualFold(strings.TrimSpace(p.Username), "root") && !p.AllowRootUser && !s.cfg.AllowRootLogin {
+			return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy; enable allow_root_user in profile to override")
+		}
 		allowPublic := p.AllowPublicHost || s.cfg.AllowPublicHost
 		if input.AllowPublicHost != nil {
 			allowPublic = *input.AllowPublicHost
 		}
 		password, _ := s.secrets.Get(p.ID, "password")
 		keyPassphrase, _ := s.secrets.Get(p.ID, "key_passphrase")
+		sudoPassword, _ := s.secrets.Get(p.ID, "sudo_password")
+		securityProfile := strings.TrimSpace(p.SecurityProfile)
+		if securityProfile == "" {
+			securityProfile = s.cfg.SecurityProfileDefault
+		}
+		if securityProfile == "" {
+			securityProfile = "easy_safe"
+		}
+		roots := append([]string{}, p.WorkspaceRoots...)
+		limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
+		if err != nil {
+			return model.Connection{}, err
+		}
 		return model.Connection{
+			ProfileID:       p.ID,
 			Host:            p.Host,
 			Port:            p.Port,
 			Username:        p.Username,
@@ -990,13 +1641,23 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 			KeyPath:         p.KeyPath,
 			KeyPassphrase:   keyPassphrase,
 			Password:        password,
-			WorkspaceRoots:  append([]string{}, p.WorkspaceRoots...),
+			SudoPassword:    sudoPassword,
+			WorkspaceRoots:  roots,
+			LimitDir:        limitDir,
 			AllowPublicHost: allowPublic,
+			SecurityProfile: securityProfile,
+			AllowRootUser:   p.AllowRootUser,
 		}, nil
 	}
 
+	if s.cfg.ConnectRequireProfile {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "direct host connection denied by policy; use profile_id/profile_name")
+	}
 	if input.Host == "" || input.Username == "" {
 		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "provide profile_id/profile_name or host/username")
+	}
+	if strings.EqualFold(strings.TrimSpace(input.Username), "root") && !s.cfg.AllowRootLogin {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy")
 	}
 	allowPublic := s.cfg.AllowPublicHost
 	if input.AllowPublicHost != nil {
@@ -1031,6 +1692,14 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 	for i := range roots {
 		roots[i] = path.Clean(roots[i])
 	}
+	limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
+	if err != nil {
+		return model.Connection{}, err
+	}
+	securityProfile := strings.TrimSpace(s.cfg.SecurityProfileDefault)
+	if securityProfile == "" {
+		securityProfile = "easy_safe"
+	}
 	return model.Connection{
 		Host:            input.Host,
 		Port:            input.Port,
@@ -1039,8 +1708,26 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		KeyPath:         config.ExpandHome(keyPath),
 		Password:        password,
 		WorkspaceRoots:  roots,
+		LimitDir:        limitDir,
 		AllowPublicHost: allowPublic,
+		SecurityProfile: securityProfile,
+		AllowRootUser:   s.cfg.AllowRootLogin,
 	}, nil
+}
+
+func applyLimitDir(raw string, roots []string) (string, []string, error) {
+	limit := strings.TrimSpace(raw)
+	if limit == "" {
+		return "", roots, nil
+	}
+	if !strings.HasPrefix(limit, "/") {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "limit_dir must be an absolute path")
+	}
+	limit = path.Clean(limit)
+	if !security.IsWithinRoots(limit, roots) {
+		return "", nil, errorsx.New(errorsx.CodeInvalidParams, "limit_dir must be within workspace_roots")
+	}
+	return limit, []string{limit}, nil
 }
 
 func (s *Service) resolveProfileRef(profileID, profileName string) (*model.Profile, error) {
