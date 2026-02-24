@@ -389,17 +389,6 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			Mode:      stringArg(args, "prompt_mode"),
 		}
 		return s.svc.CredentialPrompt(in)
-	case "ssh_approve_request":
-		approvalID, err := app.RequireString(args, "approval_id")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.ApproveRequest(
-			approvalID,
-			stringArg(args, "decision"),
-			stringArg(args, "approved_by"),
-			stringArg(args, "reason"),
-		)
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
@@ -423,7 +412,6 @@ var canonicalToolNames = map[string]struct{}{
 	"ssh_profile":            {},
 	"ssh_profile_setup":      {},
 	"ssh_credentials_prompt": {},
-	"ssh_approve_request":    {},
 }
 
 var toolAliases = map[string]string{
@@ -605,7 +593,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_exec",
-			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. In easy_safe, critical L2 commands may return approval_required. In non-easy_safe profiles, any command may require approval. Retry with approval_token after ssh_approve_request.",
+			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. Catastrophic commands (rm -rf /, fork bombs) are hard-denied. Dangerous commands (mkfs, shutdown) return approval_required. When approval_required is returned, the user must run `csshctl approve <id>` in a separate terminal, then retry with approval_token.",
 			reqSchema([]string{"connection_id", "command"}, "connection_id", "command", "session_id", "cwd", "timeout_sec", "approval_token"),
 		),
 		tool(
@@ -677,11 +665,6 @@ func toolDefs() []map[string]any {
 			"ssh_credentials_prompt",
 			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual csshctl secret set-* commands with profile_id. If csshctl is not in PATH, use an absolute path. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
-		),
-		tool(
-			"ssh_approve_request",
-			"Approve or reject one pending privilege approval request from ssh_exec approval_required flow. Requires approval_id; decision defaults to approve.",
-			reqSchema([]string{"approval_id"}, "approval_id", "decision", "approved_by", "reason"),
 		),
 	}
 }

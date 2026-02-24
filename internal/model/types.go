@@ -22,6 +22,10 @@ type Profile struct {
 	SecurityProfile   string   `json:"security_profile,omitempty"`
 	AllowRootUser     bool     `json:"allow_root_user,omitempty"`
 	ToolPolicyVersion int      `json:"tool_policy_version,omitempty"`
+	MaxAutoRisk       string   `json:"max_auto_risk,omitempty"`
+	AllowReboot       bool     `json:"allow_reboot,omitempty"`
+	AllowDiskOps      bool     `json:"allow_disk_ops,omitempty"`
+	DenyPatterns      []string `json:"deny_patterns,omitempty"`
 }
 
 type Config struct {
@@ -32,10 +36,8 @@ type Config struct {
 	LogsDir                string `json:"logs_dir"`
 	ProfilesFile           string `json:"profiles_file"`
 	SecurityProfileDefault string `json:"security_profile_default"`
-	ConnectRequireProfile  bool   `json:"connect_require_profile"`
-	EasySafeApprovalTTLsec int    `json:"easy_safe_approval_ttl_sec"`
-	NonEasyApprovalTTLsec  int    `json:"non_easy_safe_approval_ttl_sec"`
-	SudoEnabled            bool   `json:"sudo_enabled"`
+	ConnectRequireProfile bool `json:"connect_require_profile"`
+	SudoEnabled           bool `json:"sudo_enabled"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 
@@ -69,6 +71,10 @@ type Connection struct {
 	AllowPublicHost bool
 	SecurityProfile string
 	AllowRootUser   bool
+	MaxAutoRisk     string
+	AllowReboot     bool
+	AllowDiskOps    bool
+	DenyPatterns    []string
 	ControlPath     string
 	CreatedAt       time.Time
 }
@@ -89,6 +95,14 @@ const (
 	RiskL2 RiskLevel = "L2"
 )
 
+type DenyClass string
+
+const (
+	DenyAlways      DenyClass = "deny_always"
+	DenyNeedApprove DenyClass = "deny_need_approve"
+	DenyNone        DenyClass = "deny_none"
+)
+
 type ApprovalStatus string
 
 const (
@@ -105,11 +119,13 @@ type ApprovalRequest struct {
 	Command      string         `json:"command"`
 	ConnectionID string         `json:"connection_id"`
 	SessionID    string         `json:"session_id,omitempty"`
+	Host         string         `json:"host,omitempty"`
+	Username     string         `json:"username,omitempty"`
 	RiskLevel    RiskLevel      `json:"risk_level"`
+	DenyClass    DenyClass      `json:"deny_class,omitempty"`
 	Capability   string         `json:"capability,omitempty"`
 	CommandTpl   string         `json:"command_template,omitempty"`
 	CommandHash  string         `json:"command_template_hash,omitempty"`
-	GrantTTLsec  int            `json:"grant_ttl_sec,omitempty"`
 	Reason       string         `json:"reason"`
 	RequestedBy  string         `json:"requested_by"`
 	ApprovedBy   string         `json:"approved_by,omitempty"`
@@ -158,7 +174,6 @@ type AuditEvent struct {
 	SecurityProfile string    `json:"security_profile,omitempty"`
 	Capability      string    `json:"capability,omitempty"`
 	CommandHash     string    `json:"command_template_hash,omitempty"`
-	GrantID         string    `json:"grant_id,omitempty"`
-	GrantTTLsec     int       `json:"grant_ttl_sec,omitempty"`
-	ConfirmMode     string    `json:"confirm_mode,omitempty"`
+	GrantID     string `json:"grant_id,omitempty"`
+	ConfirmMode string `json:"confirm_mode,omitempty"`
 }

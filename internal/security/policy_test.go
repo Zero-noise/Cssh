@@ -1,6 +1,10 @@
 package security
 
-import "testing"
+import (
+	"testing"
+
+	"cssh/internal/model"
+)
 
 func TestBuildCommandTemplate(t *testing.T) {
 	in := `sudo apt-get install nginx=1 -y && echo "ok"`
@@ -27,6 +31,9 @@ func TestEvaluateExecPolicySudo(t *testing.T) {
 	if d.TemplateHash == "" {
 		t.Fatalf("template hash missing")
 	}
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone, got: %s", d.DenyClass)
+	}
 }
 
 func TestEvaluateExecPolicySudoCritical(t *testing.T) {
@@ -42,5 +49,57 @@ func TestEvaluateExecPolicySudoCritical(t *testing.T) {
 	}
 	if d.TemplateHash == "" {
 		t.Fatalf("template hash missing")
+	}
+	// Default EvaluateExecPolicy uses maxAutoRisk=L2, so DenyNeedApprove
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for reboot, got: %s", d.DenyClass)
+	}
+}
+
+func TestEvaluateExecPolicyWithProfileDenyClass(t *testing.T) {
+	// DenyAlways: rm -rf /
+	d := EvaluateExecPolicyWithProfile("rm -rf /", "L2", false, false, nil, nil)
+	if d.DenyClass != model.DenyAlways {
+		t.Fatalf("expected DenyAlways for rm -rf /, got: %s", d.DenyClass)
+	}
+
+	// DenyNone: ls
+	d = EvaluateExecPolicyWithProfile("ls -la", "L2", false, false, nil, nil)
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone for ls, got: %s", d.DenyClass)
+	}
+
+	// DenyNeedApprove: mkfs
+	d = EvaluateExecPolicyWithProfile("mkfs /dev/sdb", "L2", false, false, nil, nil)
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for mkfs, got: %s", d.DenyClass)
+	}
+
+	// AllowDiskOps overrides mkfs to DenyNone
+	d = EvaluateExecPolicyWithProfile("mkfs /dev/sdb", "L2", false, true, nil, nil)
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone for mkfs with AllowDiskOps, got: %s", d.DenyClass)
+	}
+}
+
+func TestEvaluateExecPolicyWorkspaceRoots(t *testing.T) {
+	roots := []string{"/opt/app"}
+
+	// rm within workspace roots → DenyNone
+	d := EvaluateExecPolicyWithProfile("rm /opt/app/file", "L2", false, false, nil, roots)
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone for rm within roots, got: %s", d.DenyClass)
+	}
+
+	// rm outside workspace roots → DenyNeedApprove
+	d = EvaluateExecPolicyWithProfile("rm /etc/hosts", "L2", false, false, nil, roots)
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for rm outside roots, got: %s", d.DenyClass)
+	}
+
+	// cp within workspace roots → DenyNone
+	d = EvaluateExecPolicyWithProfile("cp /opt/app/a /opt/app/b", "L2", false, false, nil, roots)
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone for cp within roots, got: %s", d.DenyClass)
 	}
 }

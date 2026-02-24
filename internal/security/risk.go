@@ -8,6 +8,7 @@ import (
 	"cssh/internal/model"
 )
 
+// highRiskPatterns is kept for backward compatibility with ClassifyCommandRisk.
 var highRiskPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(shutdown|reboot|poweroff|halt)\b`),
 	regexp.MustCompile(`(?i)\binit\s+(0|6)\b`),
@@ -20,6 +21,49 @@ var highRiskPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bchmod\s+777\b`),
 	regexp.MustCompile(`(?i)\bchown\s+-R\s+root\b`),
 	regexp.MustCompile(`:\(\)\s*\{\s*:\|:\s*&\s*\};:`),
+}
+
+// denyAlwaysPatterns: fork bomb only (rm -rf / and critical find -delete are handled by dedicated functions).
+var denyAlwaysPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`:\(\)\s*\{\s*:\|:\s*&\s*\};:`),
+}
+
+// denyNeedApprovePatterns: dangerous but potentially legitimate commands requiring out-of-band approval.
+var denyNeedApprovePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bdd\s+of=/dev/`),
+	regexp.MustCompile(`(?i)\bmkfs\b`),
+	regexp.MustCompile(`(?i)\b(wipefs|fdisk|sfdisk|parted)\b`),
+	regexp.MustCompile(`(?i)\b(shutdown|reboot|poweroff|halt)\b`),
+	regexp.MustCompile(`(?i)\binit\s+(0|6)\b`),
+}
+
+// denyNoneHighRiskPatterns: L2 for audit purposes, auto-execute.
+var denyNoneHighRiskPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bdd\s+if=`),
+	regexp.MustCompile(`(?i)\buseradd\b|\busermod\b|\buserdel\b`),
+	regexp.MustCompile(`(?i)\bsystemctl\s+(stop|disable|mask)\b`),
+	regexp.MustCompile(`(?i)\bchmod\s+777\b`),
+	regexp.MustCompile(`(?i)\bchown\s+-R\s+root\b`),
+}
+
+// shutdown/reboot patterns used for AllowReboot override.
+var shutdownPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(shutdown|reboot|poweroff|halt)\b`),
+	regexp.MustCompile(`(?i)\binit\s+(0|6)\b`),
+}
+
+// disk operation patterns used for AllowDiskOps override.
+var diskOpsPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bdd\s+of=/dev/`),
+	regexp.MustCompile(`(?i)\bmkfs\b`),
+	regexp.MustCompile(`(?i)\b(wipefs|fdisk|sfdisk|parted)\b`),
+}
+
+// DenyClassification holds the result of ClassifyDenyClass.
+type DenyClassification struct {
+	DenyClass model.DenyClass
+	RiskLevel model.RiskLevel
+	Reason    string
 }
 
 var writePatterns = []*regexp.Regexp{
@@ -280,4 +324,244 @@ func isCriticalFindDeletePath(p string) bool {
 		}
 	}
 	return false
+}
+
+// ClassifyDenyClass determines the deny class of a command considering profile policy fields.
+func ClassifyDenyClass(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string) DenyClassification {
+	normalized := strings.TrimSpace(cmd)
+	if normalized == "" {
+		return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL0, Reason: "empty command"}
+	}
+
+	// Unwrap shell wrappers and classify all variants, taking highest severity.
+	variants := UnwrapShellWrappers(normalized)
+	best := classifyDenyClassSingle(normalized, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+	for _, v := range variants {
+		if v == normalized {
+			continue
+		}
+		c := classifyDenyClassSingle(v, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+		if denyClassSeverity(c.DenyClass) > denyClassSeverity(best.DenyClass) {
+			best = c
+		} else if denyClassSeverity(c.DenyClass) == denyClassSeverity(best.DenyClass) && riskSeverity(c.RiskLevel) > riskSeverity(best.RiskLevel) {
+			best = c
+		}
+	}
+	return best
+}
+
+func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string) DenyClassification {
+	// DenyAlways: fork bomb
+	for _, pat := range denyAlwaysPatterns {
+		if pat.MatchString(cmd) {
+			return DenyClassification{DenyClass: model.DenyAlways, RiskLevel: model.RiskL2, Reason: "catastrophic command (fork bomb)"}
+		}
+	}
+	// DenyAlways: critical rm -rf /
+	if isCriticalRmRoot(cmd) {
+		return DenyClassification{DenyClass: model.DenyAlways, RiskLevel: model.RiskL2, Reason: "catastrophic command (rm -rf /)"}
+	}
+	// DenyAlways: critical find -delete on system paths
+	if risk, reason, ok := classifyFindDeleteRisk(cmd); ok && risk == model.RiskL2 {
+		return DenyClassification{DenyClass: model.DenyAlways, RiskLevel: model.RiskL2, Reason: reason}
+	}
+
+	// DenyNeedApprove patterns (with profile overrides)
+	for _, pat := range denyNeedApprovePatterns {
+		if !pat.MatchString(cmd) {
+			continue
+		}
+		// Check if this is a shutdown/reboot command and AllowReboot is true
+		if allowReboot && matchesAny(cmd, shutdownPatterns) {
+			return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL2, Reason: "shutdown/reboot allowed by profile"}
+		}
+		// Check if this is a disk ops command and AllowDiskOps is true
+		if allowDiskOps && matchesAny(cmd, diskOpsPatterns) {
+			return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL2, Reason: "disk operation allowed by profile"}
+		}
+		return DenyClassification{DenyClass: model.DenyNeedApprove, RiskLevel: model.RiskL2, Reason: "dangerous command requires approval"}
+	}
+
+	// User deny patterns → DenyNeedApprove
+	for _, pattern := range denyPatterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(cmd) {
+			return DenyClassification{DenyClass: model.DenyNeedApprove, RiskLevel: model.RiskL2, Reason: "matched user deny pattern: " + pattern}
+		}
+	}
+
+	// denyNoneHighRiskPatterns → L2, DenyNone
+	for _, pat := range denyNoneHighRiskPatterns {
+		if pat.MatchString(cmd) {
+			risk := model.RiskL2
+			dc := model.DenyNone
+			// If maxAutoRisk="L1" and risk is L2 → upgrade to DenyNeedApprove
+			if strings.EqualFold(strings.TrimSpace(maxAutoRisk), "L1") {
+				dc = model.DenyNeedApprove
+			}
+			return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: "matched high risk policy"}
+		}
+	}
+
+	// find -delete on non-critical paths → L1, DenyNone
+	if risk, reason, ok := classifyFindDeleteRisk(cmd); ok {
+		dc := model.DenyNone
+		if strings.EqualFold(strings.TrimSpace(maxAutoRisk), "L1") && risk == model.RiskL2 {
+			dc = model.DenyNeedApprove
+		}
+		return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: reason}
+	}
+
+	// Write patterns → L1
+	for _, pat := range writePatterns {
+		if pat.MatchString(cmd) {
+			risk := model.RiskL1
+			dc := model.DenyNone
+			if strings.EqualFold(strings.TrimSpace(maxAutoRisk), "L1") {
+				// L1 write commands stay DenyNone (L1 threshold means only L2 gets upgraded)
+			}
+			return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: "matched write operation policy"}
+		}
+	}
+
+	// Default: L0, DenyNone
+	return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL0, Reason: "read-only command"}
+}
+
+// UnwrapShellWrappers detects common shell wrappers and returns inner commands.
+// Best-effort. Does not cover base64/hex encoding, heredocs, or variable expansion.
+func UnwrapShellWrappers(cmd string) []string {
+	result := []string{cmd}
+	inner := unwrapOnce(cmd)
+	for _, i := range inner {
+		if i != cmd {
+			result = append(result, i)
+			// One level of recursion only
+			for _, j := range unwrapOnce(i) {
+				if j != i && j != cmd {
+					result = append(result, j)
+				}
+			}
+		}
+	}
+	return result
+}
+
+var (
+	bashCRE = regexp.MustCompile(`(?:^|\s)(?:bash|sh)\s+-c\s+`)
+	evalRE  = regexp.MustCompile(`(?:^|\s)eval\s+`)
+	pipeSH  = regexp.MustCompile(`\|\s*(?:bash|sh)\s*$`)
+)
+
+func unwrapOnce(cmd string) []string {
+	var results []string
+	trimmed := strings.TrimSpace(cmd)
+
+	// bash -c '...' / sh -c "..."
+	if bashCRE.MatchString(trimmed) {
+		loc := bashCRE.FindStringIndex(trimmed)
+		if loc != nil {
+			rest := trimmed[loc[1]:]
+			if inner := extractQuotedOrFirstArg(rest); inner != "" {
+				results = append(results, inner)
+			}
+		}
+	}
+
+	// eval "..."
+	if evalRE.MatchString(trimmed) {
+		loc := evalRE.FindStringIndex(trimmed)
+		if loc != nil {
+			rest := trimmed[loc[1]:]
+			if inner := extractQuotedOrFirstArg(rest); inner != "" {
+				results = append(results, inner)
+			}
+		}
+	}
+
+	// echo "..." | bash / | sh
+	if pipeSH.MatchString(trimmed) {
+		loc := pipeSH.FindStringIndex(trimmed)
+		if loc != nil {
+			before := strings.TrimSpace(trimmed[:loc[0]])
+			// Try to extract the echoed content
+			if strings.HasPrefix(before, "echo ") {
+				content := strings.TrimSpace(strings.TrimPrefix(before, "echo"))
+				if inner := stripQuotes(content); inner != "" {
+					results = append(results, inner)
+				}
+			}
+		}
+	}
+
+	return results
+}
+
+func extractQuotedOrFirstArg(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) == 0 {
+		return ""
+	}
+	if s[0] == '\'' {
+		end := strings.Index(s[1:], "'")
+		if end >= 0 {
+			return s[1 : end+1]
+		}
+	}
+	if s[0] == '"' {
+		end := strings.Index(s[1:], "\"")
+		if end >= 0 {
+			return s[1 : end+1]
+		}
+	}
+	// Unquoted: take until end of string
+	return s
+}
+
+func stripQuotes(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if (s[0] == '\'' && s[len(s)-1] == '\'') || (s[0] == '"' && s[len(s)-1] == '"') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+func matchesAny(cmd string, patterns []*regexp.Regexp) bool {
+	for _, p := range patterns {
+		if p.MatchString(cmd) {
+			return true
+		}
+	}
+	return false
+}
+
+func denyClassSeverity(dc model.DenyClass) int {
+	switch dc {
+	case model.DenyAlways:
+		return 2
+	case model.DenyNeedApprove:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func riskSeverity(r model.RiskLevel) int {
+	switch r {
+	case model.RiskL2:
+		return 2
+	case model.RiskL1:
+		return 1
+	default:
+		return 0
+	}
 }

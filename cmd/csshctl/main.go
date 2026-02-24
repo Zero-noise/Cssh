@@ -51,7 +51,7 @@ func main() {
 
 func usage() {
 	fmt.Print(`csshctl commands:
-  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false]
+  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false] [--max-auto-risk L2] [--allow-reboot=false] [--allow-disk-ops=false] [--deny-patterns pat1,pat2]
   profile list
   profile show --id ID
   profile remove --id ID
@@ -64,7 +64,7 @@ func usage() {
   secret delete-sudo-password --profile ID
 
   approvals list [--status pending|approved|rejected]
-  approve APPROVAL_ID [--by NAME]
+  approve APPROVAL_ID [--by NAME] [-y]
   reject APPROVAL_ID [--by NAME] [--reason TEXT]
 
   migrate security
@@ -91,6 +91,10 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		allowPublic := fs.Bool("allow-public", false, "allow public host")
 		securityProfile := fs.String("security-profile", cfg.SecurityProfileDefault, "security profile (easy_safe|ops_strict)")
 		allowRootUser := fs.Bool("allow-root-user", false, "allow root username in this profile")
+		maxAutoRisk := fs.String("max-auto-risk", "", "max risk level to auto-execute (L1 or L2)")
+		allowReboot := fs.Bool("allow-reboot", false, "allow shutdown/reboot commands without approval")
+		allowDiskOps := fs.Bool("allow-disk-ops", false, "allow disk operations (mkfs, dd, etc.) without approval")
+		denyPatternsStr := fs.String("deny-patterns", "", "comma separated regex patterns to deny")
 		_ = fs.Parse(args[1:])
 		if *id == "" || *host == "" || *user == "" {
 			fatal(fmt.Errorf("id, host, user are required"))
@@ -111,11 +115,16 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 			AllowPublicHost:   *allowPublic,
 			SecurityProfile:   normalizeSecurityProfile(*securityProfile, cfg.SecurityProfileDefault),
 			AllowRootUser:     *allowRootUser,
+			MaxAutoRisk:       strings.TrimSpace(*maxAutoRisk),
+			AllowReboot:       *allowReboot,
+			AllowDiskOps:      *allowDiskOps,
+			DenyPatterns:      splitCSV(*denyPatternsStr),
 			ToolPolicyVersion: 2,
 		}
 		if len(p.AuthPriority) == 0 {
 			p.AuthPriority = []string{"key", "password"}
 		}
+		applySecurityProfileDefaults(&p)
 		if err := store.Upsert(p); err != nil {
 			fatal(err)
 		}
@@ -275,7 +284,40 @@ func handleApproveReject(svc *app.Service, approve bool, args []string) {
 	fs := flag.NewFlagSet("approval", flag.ExitOnError)
 	actor := fs.String("by", os.Getenv("USER"), "operator")
 	reason := fs.String("reason", "", "reject reason")
+	autoYes := fs.Bool("y", false, "skip confirmation prompt")
 	_ = fs.Parse(args[1:])
+
+	// Fetch and display the approval request context
+	req, err := svc.Approvals().Get(id)
+	if err != nil {
+		fatal(err)
+	}
+	if req == nil {
+		fatal(fmt.Errorf("approval id not found"))
+	}
+
+	fmt.Fprintf(os.Stderr, "\n--- Approval Request ---\n")
+	fmt.Fprintf(os.Stderr, "  ID:         %s\n", req.ID)
+	fmt.Fprintf(os.Stderr, "  Host:       %s\n", req.Host)
+	fmt.Fprintf(os.Stderr, "  Username:   %s\n", req.Username)
+	fmt.Fprintf(os.Stderr, "  Command:    %s\n", req.Command)
+	fmt.Fprintf(os.Stderr, "  Risk Level: %s\n", req.RiskLevel)
+	fmt.Fprintf(os.Stderr, "  Deny Class: %s\n", req.DenyClass)
+	fmt.Fprintf(os.Stderr, "  Status:     %s\n", req.Status)
+	fmt.Fprintf(os.Stderr, "  Created:    %s\n", req.CreatedAt.Format(time.RFC3339))
+	fmt.Fprintf(os.Stderr, "------------------------\n\n")
+
+	if !*autoYes {
+		action := "Approve"
+		if !approve {
+			action = "Reject"
+		}
+		answer := readLine(fmt.Sprintf("%s? [y/N]: ", action))
+		if !strings.EqualFold(answer, "y") && !strings.EqualFold(answer, "yes") {
+			fmt.Fprintf(os.Stderr, "Cancelled.\n")
+			os.Exit(0)
+		}
+	}
 
 	status := model.ApprovalApproved
 	if !approve {
@@ -334,6 +376,14 @@ func handleMigrate(svc *app.Service, cfg model.Config, args []string) {
 		"profiles_updated": updated,
 		"warnings":         warnings,
 	})
+}
+
+// applySecurityProfileDefaults sets policy field defaults based on security_profile.
+// ops_strict defaults to MaxAutoRisk="L1" (every L2 command requires approval).
+func applySecurityProfileDefaults(p *model.Profile) {
+	if strings.EqualFold(p.SecurityProfile, "ops_strict") && strings.TrimSpace(p.MaxAutoRisk) == "" {
+		p.MaxAutoRisk = "L1"
+	}
 }
 
 func normalizeSecurityProfile(v, fallback string) string {

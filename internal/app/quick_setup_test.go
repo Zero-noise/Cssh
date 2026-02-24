@@ -50,8 +50,7 @@ func newTestService(t *testing.T) *Service {
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
 		ConnectRequireProfile:  true,
-		EasySafeApprovalTTLsec: 900,
-		SudoEnabled:            true,
+		SudoEnabled: true,
 	}
 	svc := NewService(cfg)
 	svc.secrets = newTestSecretStore()

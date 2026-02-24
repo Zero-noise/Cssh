@@ -146,6 +146,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	if profile.SecurityProfile == "" {
 		profile.SecurityProfile = "easy_safe"
 	}
+	applyProfileSecurityDefaults(&profile)
 	if err := s.profiles.Upsert(profile); err != nil {
 		return nil, err
 	}
@@ -374,6 +375,14 @@ func slugify(in string) string {
 		v = strings.ReplaceAll(v, "--", "-")
 	}
 	return v
+}
+
+// applyProfileSecurityDefaults sets policy field defaults based on security_profile.
+// ops_strict defaults to MaxAutoRisk="L1" (every L2 command requires approval).
+func applyProfileSecurityDefaults(p *model.Profile) {
+	if strings.EqualFold(p.SecurityProfile, "ops_strict") && strings.TrimSpace(p.MaxAutoRisk) == "" {
+		p.MaxAutoRisk = "L1"
+	}
 }
 
 func containsStr(slice []string, target string) bool {

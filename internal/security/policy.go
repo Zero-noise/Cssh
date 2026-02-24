@@ -19,6 +19,7 @@ var (
 
 type ExecPolicyDecision struct {
 	RiskLevel    model.RiskLevel
+	DenyClass    model.DenyClass
 	Capability   string
 	Reason       string
 	NeedsApprove bool
@@ -26,9 +27,19 @@ type ExecPolicyDecision struct {
 	TemplateHash string
 }
 
+// EvaluateExecPolicy evaluates command risk using default policy (backward compat).
 func EvaluateExecPolicy(command string) ExecPolicyDecision {
+	return EvaluateExecPolicyWithProfile(command, "L2", false, false, nil, nil)
+}
+
+// EvaluateExecPolicyWithProfile evaluates command risk considering profile policy fields.
+func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns, workspaceRoots []string) ExecPolicyDecision {
 	cmd := strings.TrimSpace(command)
-	risk, reason := ClassifyCommandRisk(cmd)
+	dc := ClassifyDenyClass(cmd, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+	risk := dc.RiskLevel
+	reason := dc.Reason
+	denyClass := dc.DenyClass
+
 	capability := "exec_read"
 	switch risk {
 	case model.RiskL1:
@@ -39,8 +50,6 @@ func EvaluateExecPolicy(command string) ExecPolicyDecision {
 
 	if LooksLikeSudo(cmd) {
 		capability = "sudo_exec"
-		// Sudo elevates privilege but is not always "critical destructive".
-		// Keep explicit approval for critical commands (risk L2), not all sudo.
 		if risk == model.RiskL0 {
 			risk = model.RiskL1
 			reason = "sudo command with elevated privileges"
@@ -49,16 +58,46 @@ func EvaluateExecPolicy(command string) ExecPolicyDecision {
 		}
 	}
 
+	// For L1/L2 write commands with DenyClass==DenyNone: check workspace roots
+	if denyClass == model.DenyNone && len(workspaceRoots) > 0 && (risk == model.RiskL1 || risk == model.RiskL2) {
+		paths := extractAbsolutePaths(cmd)
+		for _, p := range paths {
+			if !IsWithinRoots(p, workspaceRoots) {
+				denyClass = model.DenyNeedApprove
+				reason = "command targets path outside workspace_roots: " + p
+				break
+			}
+		}
+	}
+
 	needsApprove := risk == model.RiskL2
 	tpl := BuildCommandTemplate(cmd)
 	return ExecPolicyDecision{
 		RiskLevel:    risk,
+		DenyClass:    denyClass,
 		Capability:   capability,
 		Reason:       reason,
 		NeedsApprove: needsApprove,
 		Template:     tpl,
 		TemplateHash: HashCommandTemplate(tpl),
 	}
+}
+
+// extractAbsolutePaths is best-effort: uses pathRE to find /absolute/paths in the command.
+func extractAbsolutePaths(cmd string) []string {
+	matches := pathRE.FindAllStringSubmatch(cmd, -1)
+	var paths []string
+	seen := map[string]bool{}
+	for _, m := range matches {
+		if len(m) >= 3 {
+			p := strings.TrimSpace(m[2])
+			if p != "" && !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+	}
+	return paths
 }
 
 func BuildCommandTemplate(command string) string {
