@@ -131,6 +131,7 @@ type ApprovalRequest struct {
 	ApprovedBy   string         `json:"approved_by,omitempty"`
 	RejectReason string         `json:"reject_reason,omitempty"`
 	UsedAt       *time.Time     `json:"used_at,omitempty"`
+	Reusable     bool           `json:"reusable,omitempty"`
 }
 
 type PrivilegeGrantStatus string

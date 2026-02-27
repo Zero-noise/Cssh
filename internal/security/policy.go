@@ -25,6 +25,7 @@ type ExecPolicyDecision struct {
 	NeedsApprove bool
 	Template     string
 	TemplateHash string
+	Reusable     bool // true = grant caching allowed (policy upgrade only, not dangerous-pattern match)
 }
 
 // EvaluateExecPolicy evaluates command risk using default policy (backward compat).
@@ -58,6 +59,9 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 		}
 	}
 
+	// Track whether the DenyNeedApprove came from a policy upgrade (reusable grant).
+	reusable := dc.IsUpgrade
+
 	// For L1/L2 write commands with DenyClass==DenyNone: check workspace roots
 	if denyClass == model.DenyNone && len(workspaceRoots) > 0 && (risk == model.RiskL1 || risk == model.RiskL2) {
 		paths := extractAbsolutePaths(cmd)
@@ -65,6 +69,7 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 			if !IsWithinRoots(p, workspaceRoots) {
 				denyClass = model.DenyNeedApprove
 				reason = "command targets path outside workspace_roots: " + p
+				reusable = true
 				break
 			}
 		}
@@ -80,6 +85,7 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 		NeedsApprove: needsApprove,
 		Template:     tpl,
 		TemplateHash: HashCommandTemplate(tpl),
+		Reusable:     reusable,
 	}
 }
 

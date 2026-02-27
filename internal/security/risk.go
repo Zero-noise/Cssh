@@ -64,6 +64,7 @@ type DenyClassification struct {
 	DenyClass model.DenyClass
 	RiskLevel model.RiskLevel
 	Reason    string
+	IsUpgrade bool // true when DenyNeedApprove is set by maxAutoRisk policy, not by pattern match
 }
 
 var writePatterns = []*regexp.Regexp{
@@ -402,21 +403,25 @@ func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowD
 		if pat.MatchString(cmd) {
 			risk := model.RiskL2
 			dc := model.DenyNone
+			isUpgrade := false
 			// If maxAutoRisk="L1" and risk is L2 → upgrade to DenyNeedApprove
 			if strings.EqualFold(strings.TrimSpace(maxAutoRisk), "L1") {
 				dc = model.DenyNeedApprove
+				isUpgrade = true
 			}
-			return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: "matched high risk policy"}
+			return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: "matched high risk policy", IsUpgrade: isUpgrade}
 		}
 	}
 
 	// find -delete on non-critical paths → L1, DenyNone
 	if risk, reason, ok := classifyFindDeleteRisk(cmd); ok {
 		dc := model.DenyNone
+		isUpgrade := false
 		if strings.EqualFold(strings.TrimSpace(maxAutoRisk), "L1") && risk == model.RiskL2 {
 			dc = model.DenyNeedApprove
+			isUpgrade = true
 		}
-		return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: reason}
+		return DenyClassification{DenyClass: dc, RiskLevel: risk, Reason: reason, IsUpgrade: isUpgrade}
 	}
 
 	// Write patterns → L1

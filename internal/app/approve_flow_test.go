@@ -2,6 +2,7 @@ package app
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,7 @@ func TestApproveFlowEndToEnd(t *testing.T) {
 	// ── Phase 1: MCP server creates a pending approval ──
 	mcpStore := approvals.NewStore(storePath)
 	approvalID := "apr_test_flow_1"
+	tpl := security.BuildCommandTemplate("mkfs /dev/sdb")
 	req := model.ApprovalRequest{
 		ID:           approvalID,
 		CreatedAt:    time.Now().UTC(),
@@ -35,8 +37,8 @@ func TestApproveFlowEndToEnd(t *testing.T) {
 		RiskLevel:    model.RiskL2,
 		DenyClass:    model.DenyNeedApprove,
 		Capability:   "exec_high_risk",
-		CommandTpl:   "mkfs /PATH",
-		CommandHash:  "abc123",
+		CommandTpl:   tpl,
+		CommandHash:  security.HashCommandTemplate(tpl),
 		Reason:       "dangerous command requires approval",
 		RequestedBy:  "mcp",
 	}
@@ -269,6 +271,230 @@ func TestOpsStrictDefaultsUpgradeL2(t *testing.T) {
 	if conn2.MaxAutoRisk != "" {
 		t.Fatalf("easy_safe should not set MaxAutoRisk, got %q", conn2.MaxAutoRisk)
 	}
+}
+
+// TestTokenCollisionRejected verifies that an approval token for one command
+// cannot be reused for a different command that happens to produce the same
+// template hash (e.g., "mkfs /dev/sda" and "mkfs /dev/sdb" both normalize to
+// "mkfs /PATH"). The fix validates the full command, not just the hash.
+func TestTokenCollisionRejected(t *testing.T) {
+	tmp := t.TempDir()
+	svc := newApprovalTestService(t, tmp)
+
+	// Create an approval for "mkfs /dev/sda"
+	cmdA := "mkfs /dev/sda"
+	cmdB := "mkfs /dev/sdb"
+	tplA := security.BuildCommandTemplate(cmdA)
+	tplB := security.BuildCommandTemplate(cmdB)
+	hashA := security.HashCommandTemplate(tplA)
+	hashB := security.HashCommandTemplate(tplB)
+
+	// Confirm the templates collide (the bug scenario)
+	if hashA != hashB {
+		t.Fatalf("expected template hash collision between %q and %q", cmdA, cmdB)
+	}
+
+	// Create and approve a request for cmdA
+	approvalID := "apr_collision_1"
+	req := model.ApprovalRequest{
+		ID:           approvalID,
+		CreatedAt:    time.Now().UTC(),
+		Status:       model.ApprovalPending,
+		Command:      cmdA,
+		ConnectionID: "conn_1",
+		Host:         "10.0.0.5",
+		Username:     "deploy",
+		RiskLevel:    model.RiskL2,
+		DenyClass:    model.DenyNeedApprove,
+		Capability:   "exec_high_risk",
+		CommandTpl:   tplA,
+		CommandHash:  hashA,
+		Reason:       "dangerous command requires approval",
+		RequestedBy:  "mcp",
+	}
+	if err := svc.approvals.Create(req); err != nil {
+		t.Fatalf("create approval: %v", err)
+	}
+	if _, err := svc.approvals.Resolve(approvalID, model.ApprovalApproved, "operator", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Try to use the token with cmdB (different command, same hash) → should be rejected
+	_, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdB, tplB, hashB, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false)
+	if err == nil {
+		t.Fatalf("expected rejection when using token for %q with command %q", cmdA, cmdB)
+	}
+	if !strings.Contains(err.Error(), "does not match current command") {
+		t.Fatalf("expected command mismatch error, got: %v", err)
+	}
+
+	// Using the token with cmdA (same command) → should succeed
+	authz, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdA, tplA, hashA, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false)
+	if err != nil {
+		// Token was already consumed by the failed attempt reading it, recreate
+		// Actually the failed attempt above read the request but command didn't match,
+		// so MarkUsed was never called. Let's verify:
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !authz.Allowed {
+		t.Fatalf("expected allowed for matching command, got not allowed")
+	}
+}
+
+// TestReusableGrantCaching verifies that after approving a workspace_roots
+// violation command (Reusable=true), similar commands auto-approve via the
+// cached grant without requiring a new approval token.
+func TestReusableGrantCaching(t *testing.T) {
+	tmp := t.TempDir()
+	svc := newApprovalTestService(t, tmp)
+
+	// Simulate a workspace_roots policy upgrade command
+	cmd := "cp /home/user/a.txt /opt/app/"
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, []string{"/home/user"})
+	if policy.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for workspace_roots violation, got %s", policy.DenyClass)
+	}
+	if !policy.Reusable {
+		t.Fatalf("expected Reusable=true for workspace_roots upgrade")
+	}
+
+	// Create and approve
+	approvalID := "apr_reusable_1"
+	req := model.ApprovalRequest{
+		ID:           approvalID,
+		CreatedAt:    time.Now().UTC(),
+		Status:       model.ApprovalPending,
+		Command:      cmd,
+		ConnectionID: "conn_1",
+		Host:         "10.0.0.5",
+		Username:     "deploy",
+		RiskLevel:    policy.RiskLevel,
+		DenyClass:    policy.DenyClass,
+		Capability:   policy.Capability,
+		CommandTpl:   policy.Template,
+		CommandHash:  policy.TemplateHash,
+		Reason:       policy.Reason,
+		RequestedBy:  "mcp",
+		Reusable:     true,
+	}
+	if err := svc.approvals.Create(req); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.approvals.Resolve(approvalID, model.ApprovalApproved, "operator", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Use the token — this should also create a grant
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", true)
+	if err != nil {
+		t.Fatalf("authorize with token: %v", err)
+	}
+	if !authz.Allowed {
+		t.Fatalf("expected allowed")
+	}
+	if authz.GrantID == "" {
+		t.Fatalf("expected a grant to be created for reusable command")
+	}
+
+	// Now try a similar command (same template) WITHOUT a token — should auto-approve via grant
+	cmd2 := "cp /home/user/b.txt /opt/app/"
+	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, []string{"/home/user"})
+	if policy2.TemplateHash != policy.TemplateHash {
+		t.Fatalf("expected same template hash for similar commands")
+	}
+
+	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", true)
+	if err != nil {
+		t.Fatalf("authorize via grant cache: %v", err)
+	}
+	if !authz2.Allowed {
+		t.Fatalf("expected auto-approve via grant cache")
+	}
+	if authz2.ConfirmMode != "grant_cache" {
+		t.Fatalf("expected confirm_mode=grant_cache, got %q", authz2.ConfirmMode)
+	}
+}
+
+// TestNonReusableNoCache verifies that dangerous pattern-matched commands
+// (Reusable=false) never get grant caching — each execution requires a
+// fresh approval token even if the template hash matches.
+func TestNonReusableNoCache(t *testing.T) {
+	tmp := t.TempDir()
+	svc := newApprovalTestService(t, tmp)
+
+	cmd := "mkfs /dev/sda"
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, nil)
+	if policy.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove, got %s", policy.DenyClass)
+	}
+	if policy.Reusable {
+		t.Fatalf("expected Reusable=false for dangerous pattern match")
+	}
+
+	// Create and approve
+	approvalID := "apr_nonreuse_1"
+	req := model.ApprovalRequest{
+		ID:           approvalID,
+		CreatedAt:    time.Now().UTC(),
+		Status:       model.ApprovalPending,
+		Command:      cmd,
+		ConnectionID: "conn_1",
+		Host:         "10.0.0.5",
+		Username:     "deploy",
+		RiskLevel:    policy.RiskLevel,
+		DenyClass:    policy.DenyClass,
+		Capability:   policy.Capability,
+		CommandTpl:   policy.Template,
+		CommandHash:  policy.TemplateHash,
+		Reason:       policy.Reason,
+		RequestedBy:  "mcp",
+		Reusable:     false,
+	}
+	if err := svc.approvals.Create(req); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.approvals.Resolve(approvalID, model.ApprovalApproved, "operator", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Consume the token with reusable=false → should NOT create a grant
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", false)
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if !authz.Allowed {
+		t.Fatalf("expected allowed")
+	}
+	if authz.GrantID != "" {
+		t.Fatalf("expected no grant for non-reusable command, got %q", authz.GrantID)
+	}
+
+	// Try mkfs /dev/sdb without a token — should require new approval (no grant cache)
+	cmd2 := "mkfs /dev/sdb"
+	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, nil)
+	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", false)
+	if err != nil {
+		t.Fatalf("authorize2: %v", err)
+	}
+	if authz2.Allowed {
+		t.Fatalf("expected NOT allowed — non-reusable command should not auto-approve")
+	}
+	statusVal, ok := authz2.StatusResp["status"]
+	if !ok || statusVal != "approval_required" {
+		t.Fatalf("expected approval_required status, got %v", authz2.StatusResp)
+	}
+}
+
+// newApprovalTestService creates a minimal Service for testing authorizePrivilege.
+func newApprovalTestService(t *testing.T, tmp string) *Service {
+	t.Helper()
+	return NewService(model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	})
 }
 
 // helpers that call the security package without importing it directly

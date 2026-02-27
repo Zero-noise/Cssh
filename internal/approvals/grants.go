@@ -125,7 +125,8 @@ func (s *GrantStore) RevokeByConnection(connectionID string) error {
 	return s.saveAll(items)
 }
 
-// Deprecated: FindActive is no longer called from authorizePrivilege. Kept for inspecting existing grant data.
+// FindActive looks up an active grant matching the connection, capability, and command template hash.
+// Used by authorizePrivilege for reusable (policy-upgrade) commands to enable grant caching.
 func (s *GrantStore) FindActive(connectionID, capability, commandHash string, now time.Time) (*model.PrivilegeGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -48,12 +48,26 @@ type Manager struct {
 }
 
 func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
+	cleanupLegacyAskPassScripts(runtimeDir)
 	return &Manager{
 		runtimeDir:      runtimeDir,
 		defaultShell:    defaultShell,
 		defaultTimeoutS: defaultTimeout,
 		connections:     map[string]*model.Connection{},
 		sessions:        map[string]*model.Session{},
+	}
+}
+
+// cleanupLegacyAskPassScripts removes leftover askpass-*.sh files from older
+// versions that embedded plaintext passwords. These may linger on disk if the
+// process was killed before the defer cleanup ran.
+func cleanupLegacyAskPassScripts(runtimeDir string) {
+	matches, err := filepath.Glob(filepath.Join(runtimeDir, "askpass-*.sh"))
+	if err != nil {
+		return
+	}
+	for _, f := range matches {
+		_ = os.Remove(f)
 	}
 }
 
@@ -126,7 +140,6 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	cleanupAskPass := func() {}
 	if method == "password" || (method == "key" && conn.KeyPassphrase != "") {
 		secret := conn.Password
 		if method == "key" {
@@ -135,19 +148,17 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 		if secret == "" {
 			return errors.New("ssh askpass secret is empty")
 		}
-		scriptPath := filepath.Join(m.runtimeDir, "askpass-"+conn.ID+".sh")
-		body := "#!/bin/sh\nprintf '%s\\n' " + util.ShellQuote(secret) + "\n"
-		if err := os.WriteFile(scriptPath, []byte(body), 0o700); err != nil {
+		scriptPath, err := m.ensureAskPassScript()
+		if err != nil {
 			return err
 		}
-		cleanupAskPass = func() { _ = os.Remove(scriptPath) }
 		cmd.Env = append(os.Environ(),
+			"CSSH_SECRET="+secret,
 			"SSH_ASKPASS="+scriptPath,
 			"SSH_ASKPASS_REQUIRE=force",
 			"DISPLAY=cssh:0",
 		)
 	}
-	defer cleanupAskPass()
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("open ssh control socket failed: %w: %s", err, strings.TrimSpace(stderr.String()))
@@ -166,6 +177,45 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 		return fmt.Errorf("verify ssh connection failed: %w: %s", err, strings.TrimSpace(vStderr.String()))
 	}
 	return nil
+}
+
+const askPassBody = "#!/bin/sh\nprintf '%s\\n' \"$CSSH_SECRET\"\n"
+
+// ensureAskPassScript creates a static askpass script (containing no secrets)
+// in the runtime directory. The script reads the password from the CSSH_SECRET
+// environment variable, which is set per-connection and never touches disk.
+// On reuse it validates the file is a regular file with correct permissions
+// and expected content, rewriting it if anything looks wrong.
+func (m *Manager) ensureAskPassScript() (string, error) {
+	scriptPath := filepath.Join(m.runtimeDir, "askpass.sh")
+	if m.isValidAskPassScript(scriptPath) {
+		return scriptPath, nil
+	}
+	// Remove first so WriteFile creates with the exact permissions we want,
+	// rather than inheriting the mode of an existing corrupted/tampered file.
+	_ = os.Remove(scriptPath)
+	if err := os.WriteFile(scriptPath, []byte(askPassBody), 0o700); err != nil {
+		return "", err
+	}
+	return scriptPath, nil
+}
+
+func (m *Manager) isValidAskPassScript(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if !info.Mode().IsRegular() {
+		return false
+	}
+	if info.Mode().Perm() != 0o700 {
+		return false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return string(content) == askPassBody
 }
 
 func (m *Manager) closeMaster(conn model.Connection) error {

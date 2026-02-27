@@ -175,7 +175,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 
 	// DenyNeedApprove: requires out-of-band human approval via csshctl approve
 	if policy.DenyClass == model.DenyNeedApprove {
-		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken, conn.Host, conn.Username)
+		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken, conn.Host, conn.Username, policy.Reusable)
 		if err != nil {
 			return nil, err
 		}
@@ -235,6 +235,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		Capability:      policy.Capability,
 		CommandHash:     policy.TemplateHash,
 		ConfirmMode:     authz.ConfirmMode,
+		GrantID:         authz.GrantID,
 	})
 	return map[string]any{
 		"exit_code":   res.ExitCode,
@@ -418,6 +419,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			approvalToken,
 			conn.Host,
 			conn.Username,
+			false, // not reusable: explicit privilege escalation
 		)
 		if err != nil {
 			return nil, err
@@ -552,6 +554,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			approvalToken,
 			conn.Host,
 			conn.Username,
+			false, // not reusable: explicit privilege escalation
 		)
 		if err != nil {
 			return nil, err
@@ -1296,9 +1299,10 @@ type privilegeAuthz struct {
 	StatusResp  map[string]any
 	ConfirmMode string
 	ApprovedBy  string
+	GrantID     string
 }
 
-func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string) (privilegeAuthz, error) {
+func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string, reusable bool) (privilegeAuthz, error) {
 	now := time.Now().UTC()
 	statusResp := func(approvalID string, reqReason string) map[string]any {
 		return map[string]any{
@@ -1332,11 +1336,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		if req.ConnectionID != connectionID {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
 		}
-		if strings.TrimSpace(req.CommandHash) != "" {
-			if req.CommandHash != commandHash {
-				return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current operation")
-			}
-		} else if strings.TrimSpace(req.Command) != strings.TrimSpace(command) {
+		if strings.TrimSpace(req.Command) != strings.TrimSpace(sanitizeCommandForAudit(command)) {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current command")
 		}
 		if strings.TrimSpace(req.Capability) != "" && req.Capability != capability {
@@ -1351,11 +1351,44 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		if updated == nil {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token already consumed")
 		}
+		// For reusable commands (policy upgrades), create a cached grant so
+		// similar commands auto-approve without a fresh token.
+		grantID := ""
+		if reusable && commandHash != "" {
+			g := model.PrivilegeGrant{
+				ID:           util.NewID("grn"),
+				CreatedAt:    now,
+				ExpiresAt:    now.Add(15 * time.Minute),
+				Status:       model.PrivilegeGrantActive,
+				ConnectionID: connectionID,
+				Capability:   capability,
+				CommandHash:  commandHash,
+				RiskLevel:    risk,
+				ApprovedBy:   updated.ApprovedBy,
+				Source:       "approval:" + req.ID,
+			}
+			_ = s.grants.Create(g)
+			grantID = g.ID
+		}
 		return privilegeAuthz{
 			Allowed:     true,
 			ConfirmMode: "approval_token",
 			ApprovedBy:  updated.ApprovedBy,
+			GrantID:     grantID,
 		}, nil
+	}
+
+	// For reusable commands without a token, check for an active cached grant.
+	if reusable && commandHash != "" {
+		grant, err := s.grants.FindActive(connectionID, capability, commandHash, now)
+		if err == nil && grant != nil {
+			return privilegeAuthz{
+				Allowed:     true,
+				ConfirmMode: "grant_cache",
+				ApprovedBy:  grant.ApprovedBy,
+				GrantID:     grant.ID,
+			}, nil
+		}
 	}
 
 	req := model.ApprovalRequest{
@@ -1374,6 +1407,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		CommandHash:  commandHash,
 		Reason:       reason,
 		RequestedBy:  "mcp",
+		Reusable:     reusable,
 	}
 	if err := s.approvals.Create(req); err != nil {
 		return privilegeAuthz{}, err
