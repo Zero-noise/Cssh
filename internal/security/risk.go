@@ -21,6 +21,19 @@ var highRiskPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bchmod\s+777\b`),
 	regexp.MustCompile(`(?i)\bchown\s+-R\s+root\b`),
 	regexp.MustCompile(`:\(\)\s*\{\s*:\|:\s*&\s*\};:`),
+	// Broadcast process killing (pkill/killall)
+	regexp.MustCompile(`(?i)\b(pkill|killall)\b`),
+	// Crontab modification/deletion
+	regexp.MustCompile(`(?i)\bcrontab\s+(-r|-e)\b`),
+	// Firewall write operations (iptables -L/-S are read-only, NOT matched)
+	regexp.MustCompile(`(?i)\b(iptables|ip6tables)\s+-(A|D|I|R|F|X|P|N)\b`),
+	regexp.MustCompile(`(?i)\b(iptables|ip6tables)\s+--(flush|append|delete|insert|replace|policy|new-chain|delete-chain)\b`),
+	// ufw state changes
+	regexp.MustCompile(`(?i)\bufw\s+(allow|deny|delete|disable|enable|reset)\b`),
+	// firewall-cmd write operations (--list-all, --query-*, --get-* NOT matched)
+	regexp.MustCompile(`(?i)\bfirewall-cmd\s+.*(--add-|--remove-|--set-|--reload|--complete-reload)`),
+	// Container destructive ops
+	regexp.MustCompile(`(?i)\b(docker|podman)\s+(rm|stop|kill)\b`),
 }
 
 // denyAlwaysPatterns: fork bomb only (rm -rf / and critical find -delete are handled by dedicated functions).
@@ -44,6 +57,19 @@ var denyNoneHighRiskPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bsystemctl\s+(stop|disable|mask)\b`),
 	regexp.MustCompile(`(?i)\bchmod\s+777\b`),
 	regexp.MustCompile(`(?i)\bchown\s+-R\s+root\b`),
+	// Broadcast process killing (pkill/killall)
+	regexp.MustCompile(`(?i)\b(pkill|killall)\b`),
+	// Crontab modification/deletion
+	regexp.MustCompile(`(?i)\bcrontab\s+(-r|-e)\b`),
+	// Firewall write operations (iptables -L/-S are read-only, NOT matched)
+	regexp.MustCompile(`(?i)\b(iptables|ip6tables)\s+-(A|D|I|R|F|X|P|N)\b`),
+	regexp.MustCompile(`(?i)\b(iptables|ip6tables)\s+--(flush|append|delete|insert|replace|policy|new-chain|delete-chain)\b`),
+	// ufw state changes
+	regexp.MustCompile(`(?i)\bufw\s+(allow|deny|delete|disable|enable|reset)\b`),
+	// firewall-cmd write operations (--list-all, --query-*, --get-* NOT matched)
+	regexp.MustCompile(`(?i)\bfirewall-cmd\s+.*(--add-|--remove-|--set-|--reload|--complete-reload)`),
+	// Container destructive ops
+	regexp.MustCompile(`(?i)\b(docker|podman)\s+(rm|stop|kill)\b`),
 }
 
 // shutdown/reboot patterns used for AllowReboot override.
@@ -64,7 +90,7 @@ type DenyClassification struct {
 	DenyClass model.DenyClass
 	RiskLevel model.RiskLevel
 	Reason    string
-	IsUpgrade bool // true when DenyNeedApprove is set by maxAutoRisk policy, not by pattern match
+	IsUpgrade bool // true when DenyNeedApprove is policy-driven (maxAutoRisk upgrade or easy_safe profile), enabling reusable grant caching
 }
 
 var writePatterns = []*regexp.Regexp{
@@ -75,6 +101,15 @@ var writePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(cat|echo)\b.*(>|>>)\s*`),
 	regexp.MustCompile(`(?i)\bgit\s+(commit|push|rebase|reset|clean)\b`),
 	regexp.MustCompile(`(?i)\bpatch\b`),
+	// Package managers
+	regexp.MustCompile(`(?i)\b(apt-get|apt|yum|dnf|pacman|zypper)\s+(install|remove|purge|update|upgrade|autoremove)\b`),
+	regexp.MustCompile(`(?i)\b(pip|pip3)\s+(install|uninstall)\b`),
+	regexp.MustCompile(`(?i)\b(npm|yarn|pnpm)\s+(install|uninstall|remove|add)\b`),
+	regexp.MustCompile(`(?i)\bbrew\s+(install|uninstall|remove|upgrade)\b`),
+	// Process management (targeted kill only; pkill/killall are L2 — see highRiskPatterns)
+	regexp.MustCompile(`(?i)\bkill\b`),
+	// Service start/restart (stop/disable/mask already in denyNoneHighRiskPatterns)
+	regexp.MustCompile(`(?i)\bsystemctl\s+(start|restart|reload|enable)\b`),
 }
 
 var criticalFindDeleteRoots = []string{
@@ -328,7 +363,7 @@ func isCriticalFindDeletePath(p string) bool {
 }
 
 // ClassifyDenyClass determines the deny class of a command considering profile policy fields.
-func ClassifyDenyClass(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string) DenyClassification {
+func ClassifyDenyClass(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string, securityProfile string) DenyClassification {
 	normalized := strings.TrimSpace(cmd)
 	if normalized == "" {
 		return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL0, Reason: "empty command"}
@@ -336,12 +371,12 @@ func ClassifyDenyClass(cmd string, maxAutoRisk string, allowReboot, allowDiskOps
 
 	// Unwrap shell wrappers and classify all variants, taking highest severity.
 	variants := UnwrapShellWrappers(normalized)
-	best := classifyDenyClassSingle(normalized, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+	best := classifyDenyClassSingle(normalized, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns, securityProfile)
 	for _, v := range variants {
 		if v == normalized {
 			continue
 		}
-		c := classifyDenyClassSingle(v, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+		c := classifyDenyClassSingle(v, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns, securityProfile)
 		if denyClassSeverity(c.DenyClass) > denyClassSeverity(best.DenyClass) {
 			best = c
 		} else if denyClassSeverity(c.DenyClass) == denyClassSeverity(best.DenyClass) && riskSeverity(c.RiskLevel) > riskSeverity(best.RiskLevel) {
@@ -351,7 +386,7 @@ func ClassifyDenyClass(cmd string, maxAutoRisk string, allowReboot, allowDiskOps
 	return best
 }
 
-func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string) DenyClassification {
+func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns []string, securityProfile string) DenyClassification {
 	// DenyAlways: fork bomb
 	for _, pat := range denyAlwaysPatterns {
 		if pat.MatchString(cmd) {
@@ -372,13 +407,20 @@ func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowD
 		if !pat.MatchString(cmd) {
 			continue
 		}
-		// Check if this is a shutdown/reboot command and AllowReboot is true
-		if allowReboot && matchesAny(cmd, shutdownPatterns) {
+		// Shutdown/reboot: AllowReboot can override (existing behavior, unchanged for easy_safe)
+		if allowReboot && !strings.EqualFold(securityProfile, "ops_strict") && matchesAny(cmd, shutdownPatterns) {
 			return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL2, Reason: "shutdown/reboot allowed by profile"}
 		}
-		// Check if this is a disk ops command and AllowDiskOps is true
-		if allowDiskOps && matchesAny(cmd, diskOpsPatterns) {
-			return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL2, Reason: "disk operation allowed by profile"}
+		// Disk ops: AllowDiskOps checked FIRST (explicit config honored in easy_safe)
+		if matchesAny(cmd, diskOpsPatterns) {
+			if allowDiskOps && !strings.EqualFold(securityProfile, "ops_strict") {
+				return DenyClassification{DenyClass: model.DenyNone, RiskLevel: model.RiskL2, Reason: "disk operation allowed by profile"}
+			}
+			// easy_safe without AllowDiskOps: still DenyNeedApprove but reusable (grant caching)
+			if strings.EqualFold(securityProfile, "easy_safe") {
+				return DenyClassification{DenyClass: model.DenyNeedApprove, RiskLevel: model.RiskL2,
+					Reason: "disk operation requires approval", IsUpgrade: true}
+			}
 		}
 		return DenyClassification{DenyClass: model.DenyNeedApprove, RiskLevel: model.RiskL2, Reason: "dangerous command requires approval"}
 	}

@@ -379,7 +379,8 @@ func handleMigrate(svc *app.Service, cfg model.Config, args []string) {
 }
 
 // applySecurityProfileDefaults sets policy field defaults based on security_profile.
-// ops_strict defaults to MaxAutoRisk="L1" (every L2 command requires approval).
+// ops_strict defaults to MaxAutoRisk="L1", disables reusable grants, ignores
+// AllowReboot/AllowDiskOps overrides, and requires approval for all sudo commands.
 func applySecurityProfileDefaults(p *model.Profile) {
 	if strings.EqualFold(p.SecurityProfile, "ops_strict") && strings.TrimSpace(p.MaxAutoRisk) == "" {
 		p.MaxAutoRisk = "L1"

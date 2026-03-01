@@ -320,7 +320,7 @@ func TestTokenCollisionRejected(t *testing.T) {
 	}
 
 	// Try to use the token with cmdB (different command, same hash) → should be rejected
-	_, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdB, tplB, hashB, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false)
+	_, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdB, tplB, hashB, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false, 0)
 	if err == nil {
 		t.Fatalf("expected rejection when using token for %q with command %q", cmdA, cmdB)
 	}
@@ -329,7 +329,7 @@ func TestTokenCollisionRejected(t *testing.T) {
 	}
 
 	// Using the token with cmdA (same command) → should succeed
-	authz, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdA, tplA, hashA, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false)
+	authz, err := svc.authorizePrivilege("conn_1", "", "exec_high_risk", cmdA, tplA, hashA, model.RiskL2, "dangerous", approvalID, "10.0.0.5", "deploy", false, 0)
 	if err != nil {
 		// Token was already consumed by the failed attempt reading it, recreate
 		// Actually the failed attempt above read the request but command didn't match,
@@ -350,7 +350,7 @@ func TestReusableGrantCaching(t *testing.T) {
 
 	// Simulate a workspace_roots policy upgrade command
 	cmd := "cp /home/user/a.txt /opt/app/"
-	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, []string{"/home/user"})
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, []string{"/home/user"}, "")
 	if policy.DenyClass != model.DenyNeedApprove {
 		t.Fatalf("expected DenyNeedApprove for workspace_roots violation, got %s", policy.DenyClass)
 	}
@@ -385,7 +385,7 @@ func TestReusableGrantCaching(t *testing.T) {
 	}
 
 	// Use the token — this should also create a grant
-	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", true)
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", true, 0)
 	if err != nil {
 		t.Fatalf("authorize with token: %v", err)
 	}
@@ -396,14 +396,23 @@ func TestReusableGrantCaching(t *testing.T) {
 		t.Fatalf("expected a grant to be created for reusable command")
 	}
 
+	// Verify session-scoped grant has zero ExpiresAt
+	grants, _ := svc.grants.List("conn_1", true)
+	if len(grants) == 0 {
+		t.Fatalf("expected grant to exist")
+	}
+	if !grants[0].ExpiresAt.IsZero() {
+		t.Fatalf("session-scoped grant should have zero ExpiresAt, got %v", grants[0].ExpiresAt)
+	}
+
 	// Now try a similar command (same template) WITHOUT a token — should auto-approve via grant
 	cmd2 := "cp /home/user/b.txt /opt/app/"
-	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, []string{"/home/user"})
+	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, []string{"/home/user"}, "")
 	if policy2.TemplateHash != policy.TemplateHash {
 		t.Fatalf("expected same template hash for similar commands")
 	}
 
-	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", true)
+	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", true, 0)
 	if err != nil {
 		t.Fatalf("authorize via grant cache: %v", err)
 	}
@@ -423,7 +432,7 @@ func TestNonReusableNoCache(t *testing.T) {
 	svc := newApprovalTestService(t, tmp)
 
 	cmd := "mkfs /dev/sda"
-	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, nil)
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, nil, "")
 	if policy.DenyClass != model.DenyNeedApprove {
 		t.Fatalf("expected DenyNeedApprove, got %s", policy.DenyClass)
 	}
@@ -458,7 +467,7 @@ func TestNonReusableNoCache(t *testing.T) {
 	}
 
 	// Consume the token with reusable=false → should NOT create a grant
-	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", false)
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", false, 0)
 	if err != nil {
 		t.Fatalf("authorize: %v", err)
 	}
@@ -471,8 +480,8 @@ func TestNonReusableNoCache(t *testing.T) {
 
 	// Try mkfs /dev/sdb without a token — should require new approval (no grant cache)
 	cmd2 := "mkfs /dev/sdb"
-	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, nil)
-	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", false)
+	policy2 := security.EvaluateExecPolicyWithProfile(cmd2, "L2", false, false, nil, nil, "")
+	authz2, err := svc.authorizePrivilege("conn_1", "", policy2.Capability, cmd2, policy2.Template, policy2.TemplateHash, policy2.RiskLevel, policy2.Reason, "", "10.0.0.5", "deploy", false, 0)
 	if err != nil {
 		t.Fatalf("authorize2: %v", err)
 	}
@@ -501,11 +510,133 @@ func newApprovalTestService(t *testing.T, tmp string) *Service {
 // (we're in the app package, which already imports security)
 
 func classifyForTest(cmd string) model.DenyClass {
-	p := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, nil)
+	p := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, nil, "")
 	return p.DenyClass
 }
 
 func classifyForTestWithOverrides(cmd string, allowReboot, allowDiskOps bool) model.DenyClass {
-	p := security.EvaluateExecPolicyWithProfile(cmd, "L2", allowReboot, allowDiskOps, nil, nil)
+	p := security.EvaluateExecPolicyWithProfile(cmd, "L2", allowReboot, allowDiskOps, nil, nil, "")
 	return p.DenyClass
+}
+
+// TestGrantWithTTL verifies that a grant created with a positive TTL has a
+// non-zero ExpiresAt approximately TTL seconds in the future.
+func TestGrantWithTTL(t *testing.T) {
+	tmp := t.TempDir()
+	svc := newApprovalTestService(t, tmp)
+
+	cmd := "cp /home/user/a.txt /opt/app/"
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, []string{"/home/user"}, "")
+
+	approvalID := "apr_ttl_1"
+	req := model.ApprovalRequest{
+		ID:           approvalID,
+		CreatedAt:    time.Now().UTC(),
+		Status:       model.ApprovalPending,
+		Command:      cmd,
+		ConnectionID: "conn_1",
+		Host:         "10.0.0.5",
+		Username:     "deploy",
+		RiskLevel:    policy.RiskLevel,
+		DenyClass:    policy.DenyClass,
+		Capability:   policy.Capability,
+		CommandTpl:   policy.Template,
+		CommandHash:  policy.TemplateHash,
+		Reason:       policy.Reason,
+		RequestedBy:  "mcp",
+		Reusable:     true,
+	}
+	if err := svc.approvals.Create(req); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.approvals.Resolve(approvalID, model.ApprovalApproved, "operator", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	before := time.Now().UTC()
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", true, 300)
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if !authz.Allowed || authz.GrantID == "" {
+		t.Fatalf("expected allowed with grant")
+	}
+
+	grants, _ := svc.grants.List("conn_1", true)
+	if len(grants) == 0 {
+		t.Fatalf("expected grant to exist")
+	}
+	g := grants[0]
+	if g.ExpiresAt.IsZero() {
+		t.Fatalf("TTL grant should have non-zero ExpiresAt")
+	}
+	expectedMin := before.Add(300 * time.Second)
+	expectedMax := before.Add(301 * time.Second)
+	if g.ExpiresAt.Before(expectedMin) || g.ExpiresAt.After(expectedMax) {
+		t.Fatalf("ExpiresAt should be ~300s from now, got %v (expected between %v and %v)", g.ExpiresAt, expectedMin, expectedMax)
+	}
+}
+
+// TestSessionScopedGrantSurvivesLong verifies that a session-scoped grant
+// (TTL=0) does not expire by time — it only dies when the connection disconnects.
+func TestSessionScopedGrantSurvivesLong(t *testing.T) {
+	tmp := t.TempDir()
+	svc := newApprovalTestService(t, tmp)
+
+	cmd := "cp /home/user/a.txt /opt/app/"
+	policy := security.EvaluateExecPolicyWithProfile(cmd, "L2", false, false, nil, []string{"/home/user"}, "")
+
+	approvalID := "apr_session_1"
+	req := model.ApprovalRequest{
+		ID:           approvalID,
+		CreatedAt:    time.Now().UTC(),
+		Status:       model.ApprovalPending,
+		Command:      cmd,
+		ConnectionID: "conn_1",
+		Host:         "10.0.0.5",
+		Username:     "deploy",
+		RiskLevel:    policy.RiskLevel,
+		DenyClass:    policy.DenyClass,
+		Capability:   policy.Capability,
+		CommandTpl:   policy.Template,
+		CommandHash:  policy.TemplateHash,
+		Reason:       policy.Reason,
+		RequestedBy:  "mcp",
+		Reusable:     true,
+	}
+	if err := svc.approvals.Create(req); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := svc.approvals.Resolve(approvalID, model.ApprovalApproved, "operator", ""); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	// Create session-scoped grant (TTL=0)
+	authz, err := svc.authorizePrivilege("conn_1", "", policy.Capability, cmd, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalID, "10.0.0.5", "deploy", true, 0)
+	if err != nil {
+		t.Fatalf("authorize: %v", err)
+	}
+	if !authz.Allowed || authz.GrantID == "" {
+		t.Fatalf("expected allowed with grant")
+	}
+
+	// FindActive well past 15 minutes should still return the grant
+	futureTime := time.Now().UTC().Add(2 * time.Hour)
+	grant, err := svc.grants.FindActive("conn_1", policy.Capability, policy.TemplateHash, futureTime)
+	if err != nil {
+		t.Fatalf("FindActive: %v", err)
+	}
+	if grant == nil {
+		t.Fatalf("session-scoped grant should survive well past 15 minutes")
+	}
+
+	// RevokeByConnection should clean it up
+	svc.grants.RevokeByConnection("conn_1")
+	grant2, err := svc.grants.FindActive("conn_1", policy.Capability, policy.TemplateHash, futureTime)
+	if err != nil {
+		t.Fatalf("FindActive after revoke: %v", err)
+	}
+	if grant2 != nil {
+		t.Fatalf("grant should be revoked after RevokeByConnection")
+	}
 }

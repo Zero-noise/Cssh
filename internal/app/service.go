@@ -148,7 +148,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 	if err != nil {
 		return nil, err
 	}
-	policy := security.EvaluateExecPolicyWithProfile(command, conn.MaxAutoRisk, conn.AllowReboot, conn.AllowDiskOps, conn.DenyPatterns, conn.WorkspaceRoots)
+	policy := security.EvaluateExecPolicyWithProfile(command, conn.MaxAutoRisk, conn.AllowReboot, conn.AllowDiskOps, conn.DenyPatterns, conn.WorkspaceRoots, conn.SecurityProfile)
 	authz := privilegeAuthz{}
 
 	// DenyAlways: hard deny, no override possible
@@ -175,7 +175,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 
 	// DenyNeedApprove: requires out-of-band human approval via csshctl approve
 	if policy.DenyClass == model.DenyNeedApprove {
-		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken, conn.Host, conn.Username, policy.Reusable)
+		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken, conn.Host, conn.Username, policy.Reusable, conn.GrantTTLSec)
 		if err != nil {
 			return nil, err
 		}
@@ -345,7 +345,12 @@ func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[str
 			"risk_level":            g.RiskLevel,
 			"status":                g.Status,
 			"created_at":            g.CreatedAt.Format(time.RFC3339),
-			"expires_at":            g.ExpiresAt.Format(time.RFC3339),
+			"expires_at": func() string {
+				if g.ExpiresAt.IsZero() {
+					return "session"
+				}
+				return g.ExpiresAt.Format(time.RFC3339)
+			}(),
 			"approved_by":           g.ApprovedBy,
 			"source":                g.Source,
 		})
@@ -420,6 +425,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 			conn.Host,
 			conn.Username,
 			false, // not reusable: explicit privilege escalation
+			conn.GrantTTLSec,
 		)
 		if err != nil {
 			return nil, err
@@ -555,6 +561,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			conn.Host,
 			conn.Username,
 			false, // not reusable: explicit privilege escalation
+			conn.GrantTTLSec,
 		)
 		if err != nil {
 			return nil, err
@@ -1302,7 +1309,17 @@ type privilegeAuthz struct {
 	GrantID     string
 }
 
-func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string, reusable bool) (privilegeAuthz, error) {
+// grantExpiry returns the expiry time for a privilege grant.
+// ttlSec=0 → session-scoped (zero time, never expires by TTL; revoked on disconnect).
+// ttlSec>0 → now + ttlSec seconds.
+func grantExpiry(now time.Time, ttlSec int) time.Time {
+	if ttlSec <= 0 {
+		return time.Time{} // zero value = session-scoped
+	}
+	return now.Add(time.Duration(ttlSec) * time.Second)
+}
+
+func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string, reusable bool, grantTTLSec int) (privilegeAuthz, error) {
 	now := time.Now().UTC()
 	statusResp := func(approvalID string, reqReason string) map[string]any {
 		return map[string]any{
@@ -1358,7 +1375,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 			g := model.PrivilegeGrant{
 				ID:           util.NewID("grn"),
 				CreatedAt:    now,
-				ExpiresAt:    now.Add(15 * time.Minute),
+				ExpiresAt:    grantExpiry(now, grantTTLSec),
 				Status:       model.PrivilegeGrantActive,
 				ConnectionID: connectionID,
 				Capability:   capability,
@@ -1557,6 +1574,7 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 			AllowReboot:     p.AllowReboot,
 			AllowDiskOps:    p.AllowDiskOps,
 			DenyPatterns:    append([]string{}, p.DenyPatterns...),
+			GrantTTLSec:     p.GrantTTLSec,
 		}, nil
 	}
 

@@ -26,6 +26,7 @@ type Profile struct {
 	AllowReboot       bool     `json:"allow_reboot,omitempty"`
 	AllowDiskOps      bool     `json:"allow_disk_ops,omitempty"`
 	DenyPatterns      []string `json:"deny_patterns,omitempty"`
+	GrantTTLSec       int      `json:"grant_ttl_sec,omitempty"` // 0 = session-scoped (default), >0 = TTL in seconds
 }
 
 type Config struct {
@@ -75,6 +76,7 @@ type Connection struct {
 	AllowReboot     bool
 	AllowDiskOps    bool
 	DenyPatterns    []string
+	GrantTTLSec     int
 	ControlPath     string
 	CreatedAt       time.Time
 }

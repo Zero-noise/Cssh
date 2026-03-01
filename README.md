@@ -36,7 +36,7 @@ claude mcp remove cssh
 ## Security Model
 
 - **Profile-based access**: connections are restricted to pre-configured profiles. Public-host access follows OR precedence (`global allow_public_host` OR `profile allow_public_host`), and defaults to `true`.
-- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, every command requires explicit approval.
+- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, all high-risk commands, sudo commands, and profile override bypasses require explicit approval with no grant caching.
 - **Write protection**: remote file writes are restricted to directories listed in `workspace_roots`.
 - **Runtime narrowing**: `ssh_connect(limit_dir=...)` can narrow AI runtime access to one subdirectory within `workspace_roots`.
 - **Credential storage**: passwords and key passphrases are stored in the OS keychain (macOS Keychain / Linux Secret Service), never in config files.

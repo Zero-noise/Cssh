@@ -25,18 +25,18 @@ type ExecPolicyDecision struct {
 	NeedsApprove bool
 	Template     string
 	TemplateHash string
-	Reusable     bool // true = grant caching allowed (policy upgrade only, not dangerous-pattern match)
+	Reusable     bool // true = grant caching allowed (policy-driven: maxAutoRisk upgrade, easy_safe profile, or workspace_roots violation)
 }
 
 // EvaluateExecPolicy evaluates command risk using default policy (backward compat).
 func EvaluateExecPolicy(command string) ExecPolicyDecision {
-	return EvaluateExecPolicyWithProfile(command, "L2", false, false, nil, nil)
+	return EvaluateExecPolicyWithProfile(command, "L2", false, false, nil, nil, "")
 }
 
 // EvaluateExecPolicyWithProfile evaluates command risk considering profile policy fields.
-func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns, workspaceRoots []string) ExecPolicyDecision {
+func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowReboot, allowDiskOps bool, denyPatterns, workspaceRoots []string, securityProfile string) ExecPolicyDecision {
 	cmd := strings.TrimSpace(command)
-	dc := ClassifyDenyClass(cmd, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns)
+	dc := ClassifyDenyClass(cmd, maxAutoRisk, allowReboot, allowDiskOps, denyPatterns, securityProfile)
 	risk := dc.RiskLevel
 	reason := dc.Reason
 	denyClass := dc.DenyClass
@@ -59,11 +59,19 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 		}
 	}
 
+	// ops_strict: all sudo commands require approval regardless of underlying risk
+	if LooksLikeSudo(cmd) && strings.EqualFold(securityProfile, "ops_strict") && denyClass == model.DenyNone {
+		denyClass = model.DenyNeedApprove
+		reason = "sudo requires approval in ops_strict mode"
+	}
+
 	// Track whether the DenyNeedApprove came from a policy upgrade (reusable grant).
 	reusable := dc.IsUpgrade
 
 	// For L1/L2 write commands with DenyClass==DenyNone: check workspace roots
-	if denyClass == model.DenyNone && len(workspaceRoots) > 0 && (risk == model.RiskL1 || risk == model.RiskL2) {
+	// easy_safe skips workspace_roots enforcement on exec (file tools still enforce via resolveAndCheckPath)
+	if denyClass == model.DenyNone && len(workspaceRoots) > 0 && (risk == model.RiskL1 || risk == model.RiskL2) &&
+		!strings.EqualFold(securityProfile, "easy_safe") {
 		paths := extractAbsolutePaths(cmd)
 		for _, p := range paths {
 			if !IsWithinRoots(p, workspaceRoots) {
@@ -73,6 +81,18 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 				break
 			}
 		}
+		// Relative path traversal: ".." can escape workspace_roots without any absolute path.
+		// When workspace_roots is configured and not just ["/"], flag write commands containing "..".
+		if denyClass == model.DenyNone && !isRootOnly(workspaceRoots) && containsParentTraversal(cmd) {
+			denyClass = model.DenyNeedApprove
+			reason = "write command contains '..' with workspace_roots restriction"
+			reusable = true
+		}
+	}
+
+	// ops_strict: no reusable grants — every approval is one-shot
+	if strings.EqualFold(securityProfile, "ops_strict") {
+		reusable = false
 	}
 
 	needsApprove := risk == model.RiskL2
@@ -90,6 +110,8 @@ func EvaluateExecPolicyWithProfile(command string, maxAutoRisk string, allowRebo
 }
 
 // extractAbsolutePaths is best-effort: uses pathRE to find /absolute/paths in the command.
+// NOTE: This only detects absolute paths. Relative path traversal (e.g. "../../etc")
+// is handled separately by containsParentTraversal in the workspace_roots check.
 func extractAbsolutePaths(cmd string) []string {
 	matches := pathRE.FindAllStringSubmatch(cmd, -1)
 	var paths []string
@@ -124,4 +146,21 @@ func HashCommandTemplate(template string) string {
 func LooksLikeSudo(command string) bool {
 	cmd := strings.TrimSpace(command)
 	return strings.HasPrefix(cmd, "sudo ") || cmd == "sudo"
+}
+
+// parentTraversalRE matches ".." as a path component (boundary-aware).
+// Covers: .., ../, ../../, foo/../bar, "../escape", '../escape', etc.
+var parentTraversalRE = regexp.MustCompile(`(^|[\s/"'])\.\.([/\s;|&"']|$)`)
+
+// containsParentTraversal returns true if the command string contains ".." as a path component.
+func containsParentTraversal(cmd string) bool {
+	return parentTraversalRE.MatchString(cmd)
+}
+
+// isRootOnly returns true if workspace_roots is effectively ["/"].
+func isRootOnly(roots []string) bool {
+	if len(roots) != 1 {
+		return false
+	}
+	return strings.TrimSpace(roots[0]) == "/"
 }

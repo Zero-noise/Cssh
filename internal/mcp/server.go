@@ -376,6 +376,7 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
 			SecurityProfile: stringArg(args, "security_profile"),
 			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
+		GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
 		}
 		return s.svc.QuickSetupSave(in)
 	case "ssh_credentials_prompt":
@@ -734,7 +735,7 @@ func profileSchema() map[string]any {
 }
 
 func profileSetupSchema() map[string]any {
-	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user")
+	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user", "grant_ttl_sec")
 }
 
 func paramSchema(key string) map[string]any {
@@ -767,6 +768,8 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "enum": []string{"easy_safe", "ops_strict"}, "description": "Security profile for privilege approval behavior."}
 	case "allow_root_user":
 		return map[string]any{"type": "boolean", "description": "Allow root SSH user for this profile."}
+	case "grant_ttl_sec":
+		return map[string]any{"type": "integer", "description": "Reusable grant lifetime. 0 = valid for entire connection (default). >0 = expires after N seconds."}
 	case "delete_secrets":
 		return map[string]any{"type": "boolean", "description": "When deleting profile, also delete password/key passphrase/sudo password from keychain. Default true."}
 	case "confirm_token":
