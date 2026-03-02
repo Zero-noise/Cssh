@@ -3,34 +3,30 @@
 Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code / Codex).
 It lets AI agents securely connect, execute commands, transfer files, and manage remote servers over SSH — all through MCP tool calls.
 
-## Prerequisites
+## Installation
 
-- Go 1.22+ (for building from source)
-- macOS or Linux
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-
-## Quick Start
+### One-line install (recommended)
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/yourname/cssh.git
-cd cssh
-go build -o cssh-mcp ./cmd/cssh-mcp
-
-# 2. Register as MCP server in Claude Code
-claude mcp add --transport stdio --scope user cssh -- $(pwd)/cssh-mcp
-
-# 3. Verify
-claude mcp list
-# Expected: cssh: /path/to/cssh-mcp - ✓ Connected
+curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/install.sh | bash
 ```
 
-That's it. Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
-
-## Uninstall
+### Developer install
 
 ```bash
-claude mcp remove cssh
+git clone https://github.com/Zero-noise/Cssh.git && cd Cssh && ./scripts/install.sh
+```
+
+The installer will build binaries to `~/.csbridge/bin/`, add them to your PATH, and register the MCP server with Claude Code.
+
+Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
+
+### Uninstall
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/uninstall.sh | bash
+# or, from repo checkout:
+./scripts/uninstall.sh
 ```
 
 ## Security Model

@@ -208,7 +208,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 			"tool":            "ssh_credentials_prompt",
 			"arguments":       map[string]any{"profile_id": profileID, "fields": credentialFields},
 			"manual_commands": manualCmds,
-			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
+			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
 		}
 	}
 

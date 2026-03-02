@@ -33,10 +33,10 @@ func TestNormalizeCredentialFieldsSudoPassword(t *testing.T) {
 
 func TestManualCredentialInstructions(t *testing.T) {
 	msg := manualCredentialInstructions("dev-1", []string{"password", "key_passphrase"})
-	if !strings.Contains(msg, "csshctl secret set-password --profile dev-1") {
+	if !strings.Contains(msg, "secret set-password --profile dev-1") {
 		t.Fatalf("missing set-password command: %s", msg)
 	}
-	if !strings.Contains(msg, "csshctl secret set-key-passphrase --profile dev-1") {
+	if !strings.Contains(msg, "secret set-key-passphrase --profile dev-1") {
 		t.Fatalf("missing set-key-passphrase command: %s", msg)
 	}
 	if !strings.Contains(msg, "continue without restarting") {
@@ -45,11 +45,15 @@ func TestManualCredentialInstructions(t *testing.T) {
 	if !strings.Contains(msg, "resume this conversation") {
 		t.Fatalf("missing resume instruction: %s", msg)
 	}
+	// Should no longer contain the old "not in PATH" hint
+	if strings.Contains(msg, "not in PATH") {
+		t.Fatalf("should not contain 'not in PATH' hint: %s", msg)
+	}
 }
 
 func TestManualCredentialInstructionsSudoPassword(t *testing.T) {
 	msg := manualCredentialInstructions("dev-1", []string{"sudo_password"})
-	if !strings.Contains(msg, "csshctl secret set-sudo-password --profile dev-1") {
+	if !strings.Contains(msg, "secret set-sudo-password --profile dev-1") {
 		t.Fatalf("missing set-sudo-password command: %s", msg)
 	}
 }
@@ -60,8 +64,15 @@ func TestManualCredentialCommands(t *testing.T) {
 		t.Fatalf("unexpected command count: %d", len(cmds))
 	}
 	for _, cmd := range cmds {
-		if !strings.HasPrefix(cmd, "csshctl secret ") {
-			t.Fatalf("command should use local csshctl: %s", cmd)
+		if !strings.Contains(cmd, "secret set-") {
+			t.Fatalf("command should contain 'secret set-': %s", cmd)
+		}
+		if !strings.Contains(cmd, "--profile dev-1") {
+			t.Fatalf("command should contain profile flag: %s", cmd)
+		}
+		// Command should end with csshctl (bare or absolute path)
+		if !strings.Contains(cmd, "csshctl") {
+			t.Fatalf("command should reference csshctl: %s", cmd)
 		}
 	}
 }

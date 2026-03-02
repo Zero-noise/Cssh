@@ -77,10 +77,9 @@ Stored credential types:
 
 The `ssh_credentials_prompt` tool opens a **local web form** where the user enters credentials directly into the OS keychain. Credentials never pass through the AI model.
 
-If the web form is unavailable, the tool returns manual CLI commands:
+If the web form is unavailable, the tool returns manual CLI commands with the auto-resolved `csshctl` path:
 ```bash
 csshctl secret set-password --profile <profile_id>
 csshctl secret set-key-passphrase --profile <profile_id>
 csshctl secret set-sudo-password --profile <profile_id>
 ```
-If `csshctl` is not in `PATH`, use an absolute path.

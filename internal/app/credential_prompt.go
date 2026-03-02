@@ -18,6 +18,7 @@ import (
 
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/resolve"
 	"cssh/internal/util"
 )
 
@@ -175,21 +176,22 @@ func normalizeCredentialFields(fields []string) ([]string, []string) {
 func manualCredentialInstructions(profileID string, fields []string) string {
 	cmds := manualCredentialCommands(profileID, fields)
 	if len(cmds) == 0 {
-		return "Could not open browser. Use csshctl secret set-* manually. If csshctl is not in PATH, use an absolute path."
+		return "Could not open browser. Use " + resolve.QuotedPath() + " secret set-* manually."
 	}
-	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
+	return "Web credential prompt is unavailable. Run the command(s): " + strings.Join(cmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation."
 }
 
 func manualCredentialCommands(profileID string, fields []string) []string {
+	ctl := resolve.QuotedPath()
 	cmds := make([]string, 0, len(fields))
 	for _, f := range fields {
 		switch f {
 		case "password":
-			cmds = append(cmds, "csshctl secret set-password --profile "+profileID)
+			cmds = append(cmds, ctl+" secret set-password --profile "+profileID)
 		case "key_passphrase":
-			cmds = append(cmds, "csshctl secret set-key-passphrase --profile "+profileID)
+			cmds = append(cmds, ctl+" secret set-key-passphrase --profile "+profileID)
 		case "sudo_password":
-			cmds = append(cmds, "csshctl secret set-sudo-password --profile "+profileID)
+			cmds = append(cmds, ctl+" secret set-sudo-password --profile "+profileID)
 		}
 	}
 	return cmds

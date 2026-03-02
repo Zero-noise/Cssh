@@ -22,6 +22,7 @@ import (
 	"cssh/internal/config"
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/resolve"
 	"cssh/internal/security"
 	"cssh/internal/sshbridge"
 	"cssh/internal/store"
@@ -58,6 +59,9 @@ func NewService(cfg model.Config) *Service {
 		deleteTokens: map[string]profileDeleteConfirm{},
 	}
 }
+
+// Shutdown closes all SSH connections. Call on process exit.
+func (s *Service) Shutdown() { s.ssh.Shutdown() }
 
 func pathJoin(a, b string) string {
 	if strings.HasSuffix(a, "/") {
@@ -406,9 +410,6 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	if err != nil {
 		return nil, err
 	}
-	if err := s.ensureConnectionAlive(connectionID); err != nil {
-		return nil, err
-	}
 	authz := privilegeAuthz{}
 	if allowLocalAnywhere {
 		template := "ssh_transfer direction=upload allow_local_anywhere"
@@ -540,9 +541,6 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.ensureConnectionAlive(connectionID); err != nil {
 		return nil, err
 	}
 	authz := privilegeAuthz{}
@@ -889,7 +887,7 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 			"set -o pipefail",
 			"grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit),
 			"rc=$?",
-			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"if [ \"$rc\" -eq 1 ] || [ \"$rc\" -eq 141 ]; then exit 0; fi",
 			"exit \"$rc\"",
 		}, "; ")
 	} else {
@@ -897,7 +895,7 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 			"set -o pipefail",
 			"find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit),
 			"rc=$?",
-			"if [ \"$rc\" -eq 1 ]; then exit 0; fi",
+			"if [ \"$rc\" -eq 1 ] || [ \"$rc\" -eq 141 ]; then exit 0; fi",
 			"exit \"$rc\"",
 		}, "; ")
 	}
@@ -1039,19 +1037,6 @@ func ensureLocalPathAllowed(localPath string, allowLocalAnywhere bool) error {
 	return nil
 }
 
-func (s *Service) ensureConnectionAlive(connectionID string) error {
-	alive, _, msg, err := s.ssh.CheckConnection(connectionID, 5)
-	if err != nil {
-		return err
-	}
-	if !alive {
-		if strings.TrimSpace(msg) == "" {
-			msg = "ssh control connection is not alive"
-		}
-		return errorsx.New(errorsx.CodeInternal, msg)
-	}
-	return nil
-}
 
 func (s *Service) remotePathExists(connectionID, remotePath string) (bool, error) {
 	res, err := s.ssh.Exec(connectionID, "", "test -e "+util.ShellQuote(remotePath), "", 30)
@@ -1331,7 +1316,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 			"host":                 host,
 			"username":             username,
 			"deny_class":           string(model.DenyNeedApprove),
-			"approve_instructions": "csshctl approve " + approvalID,
+			"approve_instructions": resolve.QuotedPath() + " approve " + approvalID,
 		}
 	}
 

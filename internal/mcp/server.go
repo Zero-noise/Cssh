@@ -11,17 +11,19 @@ import (
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/resolve"
 )
 
 type Server struct {
-	svc *app.Service
+	svc     *app.Service
+	ctlPath string
 
 	seenInitialize    bool
 	clientInitialized bool
 }
 
 func NewServer(svc *app.Service) *Server {
-	return &Server{svc: svc}
+	return &Server{svc: svc, ctlPath: resolve.QuotedPath()}
 }
 
 type request struct {
@@ -94,7 +96,7 @@ func (s *Server) handle(req request, id any) response {
 	case "ping":
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{}}
 	case "tools/list":
-		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{"tools": toolDefs()}}
+		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{"tools": toolDefs(s.ctlPath)}}
 	case "tools/call":
 		if !s.clientInitialized {
 			return rpcError(id, -32002, "client not initialized; send notifications/initialized after initialize", nil)
@@ -532,6 +534,8 @@ func toRPCError(id any, err error) response {
 			code = -32005
 		case errorsx.CodeExecTimeout:
 			code = -32006
+		case errorsx.CodeConnectionDead:
+			code = -32010
 		case errorsx.CodeFileExists:
 			code = -32007
 		case errorsx.CodeChecksumMismatch:
@@ -580,7 +584,7 @@ func writeMessage(w io.Writer, payload response) error {
 	return err
 }
 
-func toolDefs() []map[string]any {
+func toolDefs(ctlPath string) []map[string]any {
 	return []map[string]any{
 		tool(
 			"ssh_connect",
@@ -594,7 +598,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_exec",
-			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. Catastrophic commands (rm -rf /, fork bombs) are hard-denied. Dangerous commands (mkfs, shutdown) return approval_required. When approval_required is returned, the user must run `csshctl approve <id>` in a separate terminal, then retry with approval_token.",
+			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. Catastrophic commands (rm -rf /, fork bombs) are hard-denied. Dangerous commands (mkfs, shutdown) return approval_required. When approval_required is returned, the user must run `"+ctlPath+" approve <id>` in a separate terminal, then retry with approval_token.",
 			reqSchema([]string{"connection_id", "command"}, "connection_id", "command", "session_id", "cwd", "timeout_sec", "approval_token"),
 		),
 		tool(
@@ -664,7 +668,7 @@ func toolDefs() []map[string]any {
 		),
 		tool(
 			"ssh_credentials_prompt",
-			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual csshctl secret set-* commands with profile_id. If csshctl is not in PATH, use an absolute path. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
+			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual `"+ctlPath+" secret set-*` commands with profile_id. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
 		),
 	}

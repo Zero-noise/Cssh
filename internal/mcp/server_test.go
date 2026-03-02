@@ -12,7 +12,7 @@ import (
 
 func findToolDef(t *testing.T, name string) map[string]any {
 	t.Helper()
-	for _, td := range toolDefs() {
+	for _, td := range toolDefs("csshctl") {
 		n, _ := td["name"].(string)
 		if n == name {
 			return td
@@ -226,7 +226,7 @@ func TestProfileToolsSchema(t *testing.T) {
 }
 
 func TestApproveRequestToolRemoved(t *testing.T) {
-	tools := toolDefs()
+	tools := toolDefs("csshctl")
 	for _, td := range tools {
 		name, _ := td["name"].(string)
 		if name == "ssh_approve_request" {
@@ -366,7 +366,7 @@ func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
 		"ssh_quick_setup_save",
 		"ssh_sudo_password_prompt",
 	}
-	tools := toolDefs()
+	tools := toolDefs("csshctl")
 	for _, alias := range legacy {
 		for _, td := range tools {
 			name, _ := td["name"].(string)

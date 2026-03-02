@@ -63,8 +63,8 @@ func TestCleanupLegacyAskPassScripts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Place a non-legacy file that should NOT be removed.
-	keep := filepath.Join(dir, "ctrl-conn_abc.sock")
+	// Place a non-legacy, non-socket file that should NOT be removed.
+	keep := filepath.Join(dir, "other-data.json")
 	if err := os.WriteFile(keep, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -156,5 +156,39 @@ func TestExecWithInputRejectsSessionFromOtherConnection(t *testing.T) {
 	ce, ok := err.(*errorsx.CsshError)
 	if !ok || ce.Code != errorsx.CodeInvalidParams {
 		t.Fatalf("expected invalid params error, got %#v", err)
+	}
+}
+
+func TestPreFlightCheck_DetectsDeadConnection(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+	m.connections["conn_dead"] = &model.Connection{
+		ID:          "conn_dead",
+		Host:        "localhost",
+		Port:        22,
+		Username:    "user",
+		ControlPath: filepath.Join(dir, "nonexistent.sock"),
+	}
+
+	// preFlightCheck should detect dead connection (no socket, ssh -O check fails).
+	err := m.PreFlightCheck("conn_dead")
+	if err == nil {
+		t.Fatal("expected error for dead connection")
+	}
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok || ce.Code != errorsx.CodeConnectionDead {
+		t.Fatalf("expected CONNECTION_DEAD error, got %#v", err)
+	}
+}
+
+func TestPreFlightCheck_ConnectionNotFound(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	err := m.PreFlightCheck("conn_nonexistent")
+	if err == nil {
+		t.Fatal("expected error for missing connection")
+	}
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok || ce.Code != errorsx.CodeConnectionMissing {
+		t.Fatalf("expected CONNECTION_NOT_FOUND error, got %#v", err)
 	}
 }

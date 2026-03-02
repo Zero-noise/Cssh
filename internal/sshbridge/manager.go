@@ -49,6 +49,7 @@ type Manager struct {
 
 func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
 	cleanupLegacyAskPassScripts(runtimeDir)
+	cleanupOrphanedMasters(runtimeDir)
 	return &Manager{
 		runtimeDir:      runtimeDir,
 		defaultShell:    defaultShell,
@@ -68,6 +69,24 @@ func cleanupLegacyAskPassScripts(runtimeDir string) {
 	}
 	for _, f := range matches {
 		_ = os.Remove(f)
+	}
+}
+
+// cleanupOrphanedMasters terminates SSH master processes left behind by a
+// previous crash. It finds ctrl-*.sock files in the runtime directory and
+// sends "exit" via the control socket. This prevents resource leaks when
+// ControlPersist keeps masters alive after the managing process is gone.
+func cleanupOrphanedMasters(runtimeDir string) {
+	matches, err := filepath.Glob(filepath.Join(runtimeDir, "ctrl-*.sock"))
+	if err != nil {
+		return
+	}
+	for _, sock := range matches {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, "ssh", "-S", sock, "-O", "exit", "dummy")
+		_ = cmd.Run()
+		cancel()
+		_ = os.Remove(sock)
 	}
 }
 
@@ -118,9 +137,12 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	args := []string{
 		"-MNf",
 		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=600",
+		"-o", "ControlPersist=3600",
 		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
+		"-o", "TCPKeepAlive=yes",
+		"-o", "ConnectTimeout=15",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 	}
@@ -164,7 +186,9 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 		return fmt.Errorf("open ssh control socket failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	verify := exec.Command("ssh",
+	vCtx, vCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer vCancel()
+	verify := exec.CommandContext(vCtx, "ssh",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 		target,
@@ -219,16 +243,19 @@ func (m *Manager) isValidAskPassScript(path string) bool {
 }
 
 func (m *Manager) closeMaster(conn model.Connection) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
-	cmd := exec.Command("ssh",
+	cmd := exec.CommandContext(ctx, "ssh",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 		"-O", "exit",
 		target,
 	)
-	_ = cmd.Run()
+	err := cmd.Run()
+	// Always try to remove the socket file regardless of ssh exit result.
 	_ = os.Remove(conn.ControlPath)
-	return nil
+	return err
 }
 
 func (m *Manager) GetConnection(id string) (*model.Connection, error) {
@@ -299,6 +326,26 @@ func (m *Manager) GetSession(id string) (*model.Session, error) {
 	return &cp, nil
 }
 
+// PreFlightCheck performs a fast ssh -O check before command execution,
+// returning a CONNECTION_DEAD error immediately if the connection is no longer
+// alive. The check uses the SSH control socket and completes in <10ms for
+// healthy connections, so the overhead is negligible compared to the benefit
+// of avoiding a full timeout wait on dead connections.
+func (m *Manager) PreFlightCheck(connectionID string) error {
+	alive, _, msg, err := m.CheckConnection(connectionID, 3)
+	if err != nil {
+		return err
+	}
+	if !alive {
+		if strings.TrimSpace(msg) == "" {
+			msg = "ssh control connection is not alive"
+		}
+		return errorsx.New(errorsx.CodeConnectionDead,
+			msg+"; please use ssh_disconnect and ssh_connect to re-establish the connection")
+	}
+	return nil
+}
+
 func (m *Manager) Exec(connectionID, sessionID, command, cwd string, timeoutSec int) (ExecResult, error) {
 	return m.ExecWithInput(connectionID, sessionID, command, cwd, timeoutSec, "")
 }
@@ -327,6 +374,13 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	}
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
+	}
+
+	// Fast-fail: verify the SSH control connection is still alive before
+	// spending time on the actual command. ssh -O check is <10ms for
+	// healthy connections and returns immediately for dead ones.
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return ExecResult{}, err
 	}
 
 	remoteCmd := command
@@ -387,6 +441,9 @@ func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeout
 	if err != nil {
 		return TransferResult{}, err
 	}
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return TransferResult{}, err
+	}
 	target := scpRemoteSpec(conn.Username, conn.Host, remotePath)
 	return m.runSCP(conn, timeoutSec, localPath, target)
 }
@@ -397,6 +454,9 @@ func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeo
 	}
 	conn, err := m.GetConnection(connectionID)
 	if err != nil {
+		return TransferResult{}, err
+	}
+	if err := m.PreFlightCheck(connectionID); err != nil {
 		return TransferResult{}, err
 	}
 	source := scpRemoteSpec(conn.Username, conn.Host, remotePath)
@@ -606,6 +666,23 @@ func shouldRetryLegacySCP(stderr string) bool {
 	return false
 }
 
+// Shutdown closes all active SSH master connections. It should be called
+// when the process is exiting to prevent orphaned ssh master processes.
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, conn := range m.connections {
+		if err := m.closeMaster(*conn); err != nil {
+			fmt.Fprintf(os.Stderr, "cssh: shutdown: failed to close connection %s (%s@%s): %v\n",
+				id, conn.Username, conn.Host, err)
+		}
+		delete(m.connections, id)
+	}
+	for id := range m.sessions {
+		delete(m.sessions, id)
+	}
+}
+
 func (m *Manager) Disconnect(connectionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -613,14 +690,16 @@ func (m *Manager) Disconnect(connectionID string) error {
 	if conn == nil {
 		return errorsx.New(errorsx.CodeConnectionMissing, "connection_id not found")
 	}
-	if err := m.closeMaster(*conn); err != nil {
-		return err
-	}
+	closeErr := m.closeMaster(*conn) // best-effort; connection may already be dead
 	delete(m.connections, connectionID)
 	for id, s := range m.sessions {
 		if s.ConnectionID == connectionID {
 			delete(m.sessions, id)
 		}
+	}
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "cssh: disconnect: closeMaster %s (%s@%s): %v\n",
+			connectionID, conn.Username, conn.Host, closeErr)
 	}
 	return nil
 }
