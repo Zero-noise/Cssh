@@ -1,6 +1,6 @@
 # Cssh
 
-Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code / Codex).
+Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code, Codex, Cursor, VS Code, Windsurf, and more).
 It lets AI agents securely connect, execute commands, transfer files, and manage remote servers over SSH — all through MCP tool calls.
 
 ## Installation
@@ -28,6 +28,90 @@ curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/uninsta
 # or, from repo checkout:
 ./scripts/uninstall.sh
 ```
+
+### Verify installation
+
+```bash
+csshctl --help          # CLI tool works
+claude mcp list         # cssh is registered (Claude Code)
+```
+
+If `claude mcp list` does not show cssh, register manually:
+
+```bash
+claude mcp add --transport stdio --scope user cssh -- ~/.csbridge/bin/cssh-mcp
+```
+
+## Other MCP Clients
+
+The install script registers cssh with **Claude Code** automatically. For other clients, add the config manually.
+
+Default binary path after install: `~/.csbridge/bin/cssh-mcp`
+
+> If your client does not expand `~`, use the full absolute path (e.g. `/home/you/.csbridge/bin/cssh-mcp`).
+
+### Cursor
+
+`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
+
+```json
+{
+  "mcpServers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+### VS Code / GitHub Copilot
+
+`.vscode/mcp.json` (workspace) or via command palette → **MCP: Open User Configuration**:
+
+```json
+{
+  "servers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+> **Note:** VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+
+### Windsurf
+
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+### Codex CLI
+
+`~/.codex/config.toml` (global) or `.codex/config.toml` (project):
+
+```toml
+[mcp_servers.cssh]
+command = "~/.csbridge/bin/cssh-mcp"
+```
+
+Or via CLI:
+
+```bash
+codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
+```
+
+### JetBrains IDEs
+
+**Settings** → **Tools** → **AI Assistant** → **Model Context Protocol (MCP)** → **+** → add stdio server with command `~/.csbridge/bin/cssh-mcp`.
 
 ## Security Model
 

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cssh/internal/errorsx"
@@ -395,6 +396,31 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	defer cancel()
 
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
+
+	// Parallel connection probe: run "true" over the multiplexed connection
+	// with a short timeout. On a healthy connection this completes in <200ms
+	// (just a network round-trip) and adds zero blocking latency because it
+	// runs concurrently with the real command. If the network path is broken
+	// the probe fails in ≤5s and cancels the main command immediately,
+	// avoiding the full timeout wait.
+	var probeDead atomic.Bool
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer probeCancel()
+	go func() {
+		probeCmd := exec.CommandContext(probeCtx, "ssh",
+			"-S", conn.ControlPath,
+			"-p", strconv.Itoa(conn.Port),
+			target, "true",
+		)
+		if err := probeCmd.Run(); err != nil {
+			if probeCtx.Err() == context.Canceled {
+				return // probe cancelled because main command finished; ignore
+			}
+			probeDead.Store(true)
+			cancel() // cancel the main command immediately
+		}
+	}()
+
 	args := []string{
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
@@ -418,7 +444,17 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		Stderr:     stderr.String(),
 		DurationMS: d.Milliseconds(),
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
+		if probeDead.Load() {
+			return res, errorsx.New(errorsx.CodeConnectionDead,
+				"connection probe failed; please use ssh_disconnect and ssh_connect to re-establish the connection")
+		}
+		// Probe didn't fire, but command timed out. Double-check connection.
+		alive, _, _, _ := m.CheckConnection(connectionID, 3)
+		if !alive {
+			return res, errorsx.New(errorsx.CodeConnectionDead,
+				"command timed out and connection is no longer alive; please use ssh_disconnect and ssh_connect to re-establish the connection")
+		}
 		return res, errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 	}
 	if err == nil {
@@ -445,7 +481,7 @@ func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeout
 		return TransferResult{}, err
 	}
 	target := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, timeoutSec, localPath, target)
+	return m.runSCP(conn, connectionID, timeoutSec, localPath, target)
 }
 
 func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int) (TransferResult, error) {
@@ -460,7 +496,7 @@ func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeo
 		return TransferResult{}, err
 	}
 	source := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, timeoutSec, source, localPath)
+	return m.runSCP(conn, connectionID, timeoutSec, source, localPath)
 }
 
 func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bool, string, error) {
@@ -513,7 +549,7 @@ func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bo
 	return false, socketExists, msg, nil
 }
 
-func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target string) (TransferResult, error) {
+func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec int, source, target string) (TransferResult, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
 	}
@@ -530,7 +566,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 		return TransferResult{
 			DurationMS: time.Since(start).Milliseconds(),
 			Protocol:   transferProtocolSFTP,
-		}, firstErr
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	if !shouldRetryLegacySCP(firstStderr) {
 		return TransferResult{
@@ -546,7 +582,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 			Protocol:       transferProtocolSCPLegacy,
 			FallbackUsed:   true,
 			FallbackReason: fallbackReason,
-		}, errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	secondStderr, secondErr := m.runSCPOnce(conn, remaining, true, source, target)
 	if secondErr == nil {
@@ -563,7 +599,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 			Protocol:       transferProtocolSCPLegacy,
 			FallbackUsed:   true,
 			FallbackReason: fallbackReason,
-		}, secondErr
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	msg := "scp sftp attempt failed: " + formatSCPAttemptError(firstStderr, firstErr) +
 		"; scp legacy retry failed: " + formatSCPAttemptError(secondStderr, secondErr)
@@ -604,6 +640,19 @@ func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, lega
 		return stderr.String(), nil
 	}
 	return stderr.String(), err
+}
+
+// timeoutOrDeadError is called after a transfer times out. It performs a fast
+// ssh -O check to determine whether the timeout was caused by a dead
+// connection, returning CONNECTION_DEAD instead of EXEC_TIMEOUT when
+// appropriate so the AI can reconnect immediately.
+func (m *Manager) timeoutOrDeadError(connectionID string) error {
+	alive, _, _, _ := m.CheckConnection(connectionID, 3)
+	if !alive {
+		return errorsx.New(errorsx.CodeConnectionDead,
+			"transfer timed out and connection is no longer alive; please use ssh_disconnect and ssh_connect to re-establish the connection")
+	}
+	return errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 }
 
 func isExecTimeoutError(err error) bool {
