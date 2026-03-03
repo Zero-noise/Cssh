@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"path"
 	"regexp"
 	"strings"
@@ -26,6 +27,7 @@ type QuickSetupInput struct {
 	AllowPublicHost bool
 	SecurityProfile string
 	AllowRootUser   bool
+	GrantTTLSec     int
 }
 
 func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[string]any, error) {
@@ -44,6 +46,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		"key_path":          "~/.ssh/id_ed25519",
 		"security_profile":  normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault),
 		"allow_root_user":   false,
+		"grant_ttl_sec":     0,
 	}
 
 	fields := []map[string]any{
@@ -59,6 +62,8 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": true},
 		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)},
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
+		{"name": "grant_ttl_sec", "label": "Grant TTL (seconds)", "type": "integer", "required": false, "default": 0,
+			"description": "Reusable grant lifetime. 0 = valid for entire connection (default). >0 = expires after N seconds."},
 	}
 
 	resp := map[string]any{
@@ -138,6 +143,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		AllowPublicHost:   in.AllowPublicHost,
 		SecurityProfile:   normalizeSecurityProfileDefault(in.SecurityProfile),
 		AllowRootUser:     in.AllowRootUser,
+		GrantTTLSec:       in.GrantTTLSec,
 		ToolPolicyVersion: 2,
 	}
 	if profile.SecurityProfile == "" {
@@ -145,6 +151,16 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	}
 	if profile.SecurityProfile == "" {
 		profile.SecurityProfile = "easy_safe"
+	}
+	applyProfileSecurityDefaults(&profile)
+	if in.ProfileID == "" {
+		if existing, _ := s.profiles.Get(profileID); existing != nil {
+			if existing.Host != profile.Host || existing.Username != profile.Username {
+				return nil, errorsx.New(errorsx.CodeProfileConflict,
+					fmt.Sprintf("auto-generated profile_id %q already exists for %s@%s; specify a unique profile_id explicitly",
+						profileID, existing.Username, existing.Host))
+			}
+		}
 	}
 	if err := s.profiles.Upsert(profile); err != nil {
 		return nil, err
@@ -192,7 +208,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 			"tool":            "ssh_credentials_prompt",
 			"arguments":       map[string]any{"profile_id": profileID, "fields": credentialFields},
 			"manual_commands": manualCmds,
-			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". If csshctl is not in PATH, use an absolute path. Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
+			"message":         "Default flow: use ssh_credentials_prompt (web) with profile_id " + profileID + ". If web is unavailable, run: " + strings.Join(manualCmds, " ; ") + ". Run them in another terminal tab/window to continue without restarting; or run them after closing this session, then restart Claude Code/Codex and resume this conversation.",
 		}
 	}
 
@@ -233,6 +249,7 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			"allow_public_host": p.AllowPublicHost,
 			"security_profile":  p.SecurityProfile,
 			"allow_root_user":   p.AllowRootUser,
+			"grant_ttl_sec":     p.GrantTTLSec,
 		})
 	}
 	resp := map[string]any{"profiles": out}
@@ -374,6 +391,15 @@ func slugify(in string) string {
 		v = strings.ReplaceAll(v, "--", "-")
 	}
 	return v
+}
+
+// applyProfileSecurityDefaults sets policy field defaults based on security_profile.
+// ops_strict defaults to MaxAutoRisk="L1", disables reusable grants, ignores
+// AllowReboot/AllowDiskOps overrides, and requires approval for all sudo commands.
+func applyProfileSecurityDefaults(p *model.Profile) {
+	if strings.EqualFold(p.SecurityProfile, "ops_strict") && strings.TrimSpace(p.MaxAutoRisk) == "" {
+		p.MaxAutoRisk = "L1"
+	}
 }
 
 func containsStr(slice []string, target string) bool {

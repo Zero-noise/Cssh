@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
@@ -13,7 +12,7 @@ import (
 
 func findToolDef(t *testing.T, name string) map[string]any {
 	t.Helper()
-	for _, td := range toolDefs() {
+	for _, td := range toolDefs("csshctl") {
 		n, _ := td["name"].(string)
 		if n == name {
 			return td
@@ -201,7 +200,7 @@ func TestPrivilegeToolsSchema(t *testing.T) {
 	}
 }
 
-func TestProfileAndApprovalToolsSchema(t *testing.T) {
+func TestProfileToolsSchema(t *testing.T) {
 	profileTool := findToolDef(t, "ssh_profile")
 	profileSchema, ok := profileTool["inputSchema"].(map[string]any)
 	if !ok {
@@ -224,25 +223,15 @@ func TestProfileAndApprovalToolsSchema(t *testing.T) {
 			t.Fatalf("ssh_profile should include %s", k)
 		}
 	}
+}
 
-	approveTool := findToolDef(t, "ssh_approve_request")
-	approveSchema, ok := approveTool["inputSchema"].(map[string]any)
-	if !ok {
-		t.Fatalf("inputSchema missing")
-	}
-	approveReq := requiredAsAny(t, approveSchema)
-	if !containsString(approveReq, "approval_id") {
-		t.Fatalf("ssh_approve_request should require approval_id")
-	}
-	approveProps, ok := approveSchema["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("properties missing")
-	}
-	if _, exists := approveProps["decision"]; !exists {
-		t.Fatalf("ssh_approve_request should include decision")
-	}
-	if _, exists := approveProps["approved_by"]; !exists {
-		t.Fatalf("ssh_approve_request should include approved_by")
+func TestApproveRequestToolRemoved(t *testing.T) {
+	tools := toolDefs("csshctl")
+	for _, td := range tools {
+		name, _ := td["name"].(string)
+		if name == "ssh_approve_request" {
+			t.Fatalf("ssh_approve_request should not be in toolDefs")
+		}
 	}
 }
 
@@ -367,43 +356,6 @@ func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 	}
 }
 
-func TestApproveRequestToolCall(t *testing.T) {
-	tmp := t.TempDir()
-	svc := app.NewService(model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		RuntimeDir:        filepath.Join(tmp, "runtime"),
-		LogsDir:           filepath.Join(tmp, "logs"),
-		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
-	})
-	req := model.ApprovalRequest{
-		ID:          "apr_tool_1",
-		CreatedAt:   time.Now().UTC(),
-		Status:      model.ApprovalPending,
-		Command:     "cat /etc/hosts",
-		RiskLevel:   model.RiskL0,
-		RequestedBy: "mcp",
-	}
-	if err := svc.Approvals().Create(req); err != nil {
-		t.Fatalf("create approval: %v", err)
-	}
-	s := NewServer(svc)
-	out, err := s.callTool("ssh_approve_request", map[string]any{
-		"approval_id": req.ID,
-		"decision":    "approve",
-		"approved_by": "alice",
-	})
-	if err != nil {
-		t.Fatalf("ssh_approve_request call failed: %v", err)
-	}
-	if out["status"] != model.ApprovalApproved {
-		t.Fatalf("unexpected status: %#v", out["status"])
-	}
-	if out["approval_token"] != req.ID {
-		t.Fatalf("unexpected approval_token: %#v", out["approval_token"])
-	}
-}
-
 func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
 	legacy := []string{
 		"ssh_upload_file",
@@ -414,7 +366,7 @@ func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
 		"ssh_quick_setup_save",
 		"ssh_sudo_password_prompt",
 	}
-	tools := toolDefs()
+	tools := toolDefs("csshctl")
 	for _, alias := range legacy {
 		for _, td := range tools {
 			name, _ := td["name"].(string)

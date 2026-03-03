@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cssh/internal/errorsx"
@@ -48,12 +49,45 @@ type Manager struct {
 }
 
 func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
+	cleanupLegacyAskPassScripts(runtimeDir)
+	cleanupOrphanedMasters(runtimeDir)
 	return &Manager{
 		runtimeDir:      runtimeDir,
 		defaultShell:    defaultShell,
 		defaultTimeoutS: defaultTimeout,
 		connections:     map[string]*model.Connection{},
 		sessions:        map[string]*model.Session{},
+	}
+}
+
+// cleanupLegacyAskPassScripts removes leftover askpass-*.sh files from older
+// versions that embedded plaintext passwords. These may linger on disk if the
+// process was killed before the defer cleanup ran.
+func cleanupLegacyAskPassScripts(runtimeDir string) {
+	matches, err := filepath.Glob(filepath.Join(runtimeDir, "askpass-*.sh"))
+	if err != nil {
+		return
+	}
+	for _, f := range matches {
+		_ = os.Remove(f)
+	}
+}
+
+// cleanupOrphanedMasters terminates SSH master processes left behind by a
+// previous crash. It finds ctrl-*.sock files in the runtime directory and
+// sends "exit" via the control socket. This prevents resource leaks when
+// ControlPersist keeps masters alive after the managing process is gone.
+func cleanupOrphanedMasters(runtimeDir string) {
+	matches, err := filepath.Glob(filepath.Join(runtimeDir, "ctrl-*.sock"))
+	if err != nil {
+		return
+	}
+	for _, sock := range matches {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, "ssh", "-S", sock, "-O", "exit", "dummy")
+		_ = cmd.Run()
+		cancel()
+		_ = os.Remove(sock)
 	}
 }
 
@@ -104,9 +138,12 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	args := []string{
 		"-MNf",
 		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=600",
+		"-o", "ControlPersist=3600",
 		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ServerAliveInterval=30",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
+		"-o", "TCPKeepAlive=yes",
+		"-o", "ConnectTimeout=15",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 	}
@@ -126,7 +163,6 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	cleanupAskPass := func() {}
 	if method == "password" || (method == "key" && conn.KeyPassphrase != "") {
 		secret := conn.Password
 		if method == "key" {
@@ -135,25 +171,25 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 		if secret == "" {
 			return errors.New("ssh askpass secret is empty")
 		}
-		scriptPath := filepath.Join(m.runtimeDir, "askpass-"+conn.ID+".sh")
-		body := "#!/bin/sh\nprintf '%s\\n' " + util.ShellQuote(secret) + "\n"
-		if err := os.WriteFile(scriptPath, []byte(body), 0o700); err != nil {
+		scriptPath, err := m.ensureAskPassScript()
+		if err != nil {
 			return err
 		}
-		cleanupAskPass = func() { _ = os.Remove(scriptPath) }
 		cmd.Env = append(os.Environ(),
+			"CSSH_SECRET="+secret,
 			"SSH_ASKPASS="+scriptPath,
 			"SSH_ASKPASS_REQUIRE=force",
 			"DISPLAY=cssh:0",
 		)
 	}
-	defer cleanupAskPass()
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("open ssh control socket failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
-	verify := exec.Command("ssh",
+	vCtx, vCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer vCancel()
+	verify := exec.CommandContext(vCtx, "ssh",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 		target,
@@ -168,17 +204,59 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	return nil
 }
 
+const askPassBody = "#!/bin/sh\nprintf '%s\\n' \"$CSSH_SECRET\"\n"
+
+// ensureAskPassScript creates a static askpass script (containing no secrets)
+// in the runtime directory. The script reads the password from the CSSH_SECRET
+// environment variable, which is set per-connection and never touches disk.
+// On reuse it validates the file is a regular file with correct permissions
+// and expected content, rewriting it if anything looks wrong.
+func (m *Manager) ensureAskPassScript() (string, error) {
+	scriptPath := filepath.Join(m.runtimeDir, "askpass.sh")
+	if m.isValidAskPassScript(scriptPath) {
+		return scriptPath, nil
+	}
+	// Remove first so WriteFile creates with the exact permissions we want,
+	// rather than inheriting the mode of an existing corrupted/tampered file.
+	_ = os.Remove(scriptPath)
+	if err := os.WriteFile(scriptPath, []byte(askPassBody), 0o700); err != nil {
+		return "", err
+	}
+	return scriptPath, nil
+}
+
+func (m *Manager) isValidAskPassScript(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	if !info.Mode().IsRegular() {
+		return false
+	}
+	if info.Mode().Perm() != 0o700 {
+		return false
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return string(content) == askPassBody
+}
+
 func (m *Manager) closeMaster(conn model.Connection) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
-	cmd := exec.Command("ssh",
+	cmd := exec.CommandContext(ctx, "ssh",
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
 		"-O", "exit",
 		target,
 	)
-	_ = cmd.Run()
+	err := cmd.Run()
+	// Always try to remove the socket file regardless of ssh exit result.
 	_ = os.Remove(conn.ControlPath)
-	return nil
+	return err
 }
 
 func (m *Manager) GetConnection(id string) (*model.Connection, error) {
@@ -249,6 +327,26 @@ func (m *Manager) GetSession(id string) (*model.Session, error) {
 	return &cp, nil
 }
 
+// PreFlightCheck performs a fast ssh -O check before command execution,
+// returning a CONNECTION_DEAD error immediately if the connection is no longer
+// alive. The check uses the SSH control socket and completes in <10ms for
+// healthy connections, so the overhead is negligible compared to the benefit
+// of avoiding a full timeout wait on dead connections.
+func (m *Manager) PreFlightCheck(connectionID string) error {
+	alive, _, msg, err := m.CheckConnection(connectionID, 3)
+	if err != nil {
+		return err
+	}
+	if !alive {
+		if strings.TrimSpace(msg) == "" {
+			msg = "ssh control connection is not alive"
+		}
+		return errorsx.New(errorsx.CodeConnectionDead,
+			msg+"; please use ssh_disconnect and ssh_connect to re-establish the connection")
+	}
+	return nil
+}
+
 func (m *Manager) Exec(connectionID, sessionID, command, cwd string, timeoutSec int) (ExecResult, error) {
 	return m.ExecWithInput(connectionID, sessionID, command, cwd, timeoutSec, "")
 }
@@ -279,6 +377,13 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		timeoutSec = m.defaultTimeoutS
 	}
 
+	// Fast-fail: verify the SSH control connection is still alive before
+	// spending time on the actual command. ssh -O check is <10ms for
+	// healthy connections and returns immediately for dead ones.
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return ExecResult{}, err
+	}
+
 	remoteCmd := command
 	if cwd != "" {
 		remoteCmd = "cd " + util.ShellQuote(cwd) + " && " + remoteCmd
@@ -291,6 +396,31 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	defer cancel()
 
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
+
+	// Parallel connection probe: run "true" over the multiplexed connection
+	// with a short timeout. On a healthy connection this completes in <200ms
+	// (just a network round-trip) and adds zero blocking latency because it
+	// runs concurrently with the real command. If the network path is broken
+	// the probe fails in ≤5s and cancels the main command immediately,
+	// avoiding the full timeout wait.
+	var probeDead atomic.Bool
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer probeCancel()
+	go func() {
+		probeCmd := exec.CommandContext(probeCtx, "ssh",
+			"-S", conn.ControlPath,
+			"-p", strconv.Itoa(conn.Port),
+			target, "true",
+		)
+		if err := probeCmd.Run(); err != nil {
+			if probeCtx.Err() == context.Canceled {
+				return // probe cancelled because main command finished; ignore
+			}
+			probeDead.Store(true)
+			cancel() // cancel the main command immediately
+		}
+	}()
+
 	args := []string{
 		"-S", conn.ControlPath,
 		"-p", strconv.Itoa(conn.Port),
@@ -314,7 +444,17 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		Stderr:     stderr.String(),
 		DurationMS: d.Milliseconds(),
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	if ctx.Err() != nil {
+		if probeDead.Load() {
+			return res, errorsx.New(errorsx.CodeConnectionDead,
+				"connection probe failed; please use ssh_disconnect and ssh_connect to re-establish the connection")
+		}
+		// Probe didn't fire, but command timed out. Double-check connection.
+		alive, _, _, _ := m.CheckConnection(connectionID, 3)
+		if !alive {
+			return res, errorsx.New(errorsx.CodeConnectionDead,
+				"command timed out and connection is no longer alive; please use ssh_disconnect and ssh_connect to re-establish the connection")
+		}
 		return res, errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 	}
 	if err == nil {
@@ -337,8 +477,11 @@ func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeout
 	if err != nil {
 		return TransferResult{}, err
 	}
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return TransferResult{}, err
+	}
 	target := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, timeoutSec, localPath, target)
+	return m.runSCP(conn, connectionID, timeoutSec, localPath, target)
 }
 
 func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int) (TransferResult, error) {
@@ -349,8 +492,11 @@ func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeo
 	if err != nil {
 		return TransferResult{}, err
 	}
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return TransferResult{}, err
+	}
 	source := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, timeoutSec, source, localPath)
+	return m.runSCP(conn, connectionID, timeoutSec, source, localPath)
 }
 
 func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bool, string, error) {
@@ -403,7 +549,7 @@ func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bo
 	return false, socketExists, msg, nil
 }
 
-func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target string) (TransferResult, error) {
+func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec int, source, target string) (TransferResult, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
 	}
@@ -420,7 +566,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 		return TransferResult{
 			DurationMS: time.Since(start).Milliseconds(),
 			Protocol:   transferProtocolSFTP,
-		}, firstErr
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	if !shouldRetryLegacySCP(firstStderr) {
 		return TransferResult{
@@ -436,7 +582,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 			Protocol:       transferProtocolSCPLegacy,
 			FallbackUsed:   true,
 			FallbackReason: fallbackReason,
-		}, errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	secondStderr, secondErr := m.runSCPOnce(conn, remaining, true, source, target)
 	if secondErr == nil {
@@ -453,7 +599,7 @@ func (m *Manager) runSCP(conn *model.Connection, timeoutSec int, source, target 
 			Protocol:       transferProtocolSCPLegacy,
 			FallbackUsed:   true,
 			FallbackReason: fallbackReason,
-		}, secondErr
+		}, m.timeoutOrDeadError(connectionID)
 	}
 	msg := "scp sftp attempt failed: " + formatSCPAttemptError(firstStderr, firstErr) +
 		"; scp legacy retry failed: " + formatSCPAttemptError(secondStderr, secondErr)
@@ -494,6 +640,19 @@ func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, lega
 		return stderr.String(), nil
 	}
 	return stderr.String(), err
+}
+
+// timeoutOrDeadError is called after a transfer times out. It performs a fast
+// ssh -O check to determine whether the timeout was caused by a dead
+// connection, returning CONNECTION_DEAD instead of EXEC_TIMEOUT when
+// appropriate so the AI can reconnect immediately.
+func (m *Manager) timeoutOrDeadError(connectionID string) error {
+	alive, _, _, _ := m.CheckConnection(connectionID, 3)
+	if !alive {
+		return errorsx.New(errorsx.CodeConnectionDead,
+			"transfer timed out and connection is no longer alive; please use ssh_disconnect and ssh_connect to re-establish the connection")
+	}
+	return errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 }
 
 func isExecTimeoutError(err error) bool {
@@ -556,6 +715,23 @@ func shouldRetryLegacySCP(stderr string) bool {
 	return false
 }
 
+// Shutdown closes all active SSH master connections. It should be called
+// when the process is exiting to prevent orphaned ssh master processes.
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for id, conn := range m.connections {
+		if err := m.closeMaster(*conn); err != nil {
+			fmt.Fprintf(os.Stderr, "cssh: shutdown: failed to close connection %s (%s@%s): %v\n",
+				id, conn.Username, conn.Host, err)
+		}
+		delete(m.connections, id)
+	}
+	for id := range m.sessions {
+		delete(m.sessions, id)
+	}
+}
+
 func (m *Manager) Disconnect(connectionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -563,14 +739,16 @@ func (m *Manager) Disconnect(connectionID string) error {
 	if conn == nil {
 		return errorsx.New(errorsx.CodeConnectionMissing, "connection_id not found")
 	}
-	if err := m.closeMaster(*conn); err != nil {
-		return err
-	}
+	closeErr := m.closeMaster(*conn) // best-effort; connection may already be dead
 	delete(m.connections, connectionID)
 	for id, s := range m.sessions {
 		if s.ConnectionID == connectionID {
 			delete(m.sessions, id)
 		}
+	}
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "cssh: disconnect: closeMaster %s (%s@%s): %v\n",
+			connectionID, conn.Username, conn.Host, closeErr)
 	}
 	return nil
 }

@@ -4,26 +4,54 @@
 
 Two built-in security profiles control command approval behavior:
 
-### `easy_safe` (default)
+### `easy_safe` (default) — Development Environment
 
-Only critical destructive commands (L2) require approval. Examples:
-- `rm -rf /`
-- `reboot`, `shutdown`
-- `mkfs`
+Trusts the AI. Maximizes convenience. Only irreversible operations gate execution.
 
-Approved commands generate a **reusable privilege grant** scoped by command template. The grant remains valid for `easy_safe_approval_ttl_sec` seconds (default `900`). Set to `0` to disable reuse.
+**DenyAlways** (hard deny, no override):
+- `rm -rf /`, fork bombs, `find -delete` on critical system paths
 
-All other commands execute immediately without approval.
+**DenyNeedApprove**:
+- Shutdown/reboot: `shutdown`, `reboot`, `poweroff`, `halt`, `init 0/6`
+  (override: `AllowReboot=true` → auto-execute)
+- Disk formatting: `mkfs`, `dd of=/dev/`, `wipefs`, `fdisk`, `sfdisk`, `parted`
+  (override: `AllowDiskOps=true` → auto-execute)
+  (disk ops grants are reusable — approve once, valid for the connection session; configurable via `grant_ttl_sec`)
 
-### `ops_strict`
+**Everything else auto-executes**:
+- `workspace_roots` enforcement is **skipped on command execution**
+  (file tools like `ssh_write_file` still enforce it)
+- User deny patterns are still honored
 
-Every command requires explicit approval. No reusable grants by default.
+### `ops_strict` — Production Environment
+
+Strict security. Every high-risk action requires individual human approval.
+
+- All high-risk (L2) commands require explicit approval (MaxAutoRisk=L1)
+- L2 coverage includes: user management, `systemctl stop/disable/mask`, `chmod 777`,
+  `chown -R root`, `pkill`/`killall`, `crontab -r/-e`, firewall write ops
+  (`iptables -A/-D/-F/...`, `ufw`, `firewall-cmd`), `docker/podman rm/stop/kill`
+- `AllowReboot`/`AllowDiskOps` overrides are ignored
+- All `sudo` commands require approval
+- `workspace_roots` violations require approval (including `..` traversal)
+- No reusable grants — every execution requires fresh approval
 
 ## Approval Flow
 
 Approval is MCP-first via `ssh_approve_request` tool call. This avoids `/dev/tty` prompt deadlocks in Claude Code / Codex sessions.
 
 Fallback: `csshctl approve <approval_id> --by <name>` from a local terminal.
+
+## Grant Caching
+
+Reusable grants (policy-driven approvals like workspace_roots violations or easy_safe disk ops) are cached per-connection. Once approved, similar commands (same template hash) auto-execute without re-approval.
+
+| Setting | Behavior |
+|---------|----------|
+| `grant_ttl_sec=0` (default) | Session-scoped: grant valid until connection disconnects |
+| `grant_ttl_sec=N` (N>0) | TTL: grant expires after N seconds |
+
+Grants are always revoked on disconnect via `RevokeByConnection`. In `ops_strict` mode, grants are never reusable regardless of TTL setting.
 
 ## Access Controls
 
@@ -49,10 +77,9 @@ Stored credential types:
 
 The `ssh_credentials_prompt` tool opens a **local web form** where the user enters credentials directly into the OS keychain. Credentials never pass through the AI model.
 
-If the web form is unavailable, the tool returns manual CLI commands:
+If the web form is unavailable, the tool returns manual CLI commands with the auto-resolved `csshctl` path:
 ```bash
 csshctl secret set-password --profile <profile_id>
 csshctl secret set-key-passphrase --profile <profile_id>
 csshctl secret set-sudo-password --profile <profile_id>
 ```
-If `csshctl` is not in `PATH`, use an absolute path.

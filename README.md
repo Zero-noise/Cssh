@@ -1,42 +1,122 @@
 # Cssh
 
-Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code / Codex).
+Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code, Codex, Cursor, VS Code, Windsurf, and more).
 It lets AI agents securely connect, execute commands, transfer files, and manage remote servers over SSH — all through MCP tool calls.
 
-## Prerequisites
+## Installation
 
-- Go 1.22+ (for building from source)
-- macOS or Linux
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-
-## Quick Start
+### One-line install (recommended)
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/yourname/cssh.git
-cd cssh
-go build -o cssh-mcp ./cmd/cssh-mcp
-
-# 2. Register as MCP server in Claude Code
-claude mcp add --transport stdio --scope user cssh -- $(pwd)/cssh-mcp
-
-# 3. Verify
-claude mcp list
-# Expected: cssh: /path/to/cssh-mcp - ✓ Connected
+curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/install.sh | bash
 ```
 
-That's it. Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
-
-## Uninstall
+### Developer install
 
 ```bash
-claude mcp remove cssh
+git clone https://github.com/Zero-noise/Cssh.git && cd Cssh && ./scripts/install.sh
 ```
+
+The installer will build binaries to `~/.csbridge/bin/`, add them to your PATH, and register the MCP server with Claude Code.
+
+Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
+
+### Uninstall
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/uninstall.sh | bash
+# or, from repo checkout:
+./scripts/uninstall.sh
+```
+
+### Verify installation
+
+```bash
+csshctl --help          # CLI tool works
+claude mcp list         # cssh is registered (Claude Code)
+```
+
+If `claude mcp list` does not show cssh, register manually:
+
+```bash
+claude mcp add --transport stdio --scope user cssh -- ~/.csbridge/bin/cssh-mcp
+```
+
+## Other MCP Clients
+
+The install script registers cssh with **Claude Code** automatically. For other clients, add the config manually.
+
+Default binary path after install: `~/.csbridge/bin/cssh-mcp`
+
+> If your client does not expand `~`, use the full absolute path (e.g. `/home/you/.csbridge/bin/cssh-mcp`).
+
+### Cursor
+
+`~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
+
+```json
+{
+  "mcpServers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+### VS Code / GitHub Copilot
+
+`.vscode/mcp.json` (workspace) or via command palette → **MCP: Open User Configuration**:
+
+```json
+{
+  "servers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+> **Note:** VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+
+### Windsurf
+
+`~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+### Codex CLI
+
+`~/.codex/config.toml` (global) or `.codex/config.toml` (project):
+
+```toml
+[mcp_servers.cssh]
+command = "~/.csbridge/bin/cssh-mcp"
+```
+
+Or via CLI:
+
+```bash
+codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
+```
+
+### JetBrains IDEs
+
+**Settings** → **Tools** → **AI Assistant** → **Model Context Protocol (MCP)** → **+** → add stdio server with command `~/.csbridge/bin/cssh-mcp`.
 
 ## Security Model
 
 - **Profile-based access**: connections are restricted to pre-configured profiles. Public-host access follows OR precedence (`global allow_public_host` OR `profile allow_public_host`), and defaults to `true`.
-- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, every command requires explicit approval.
+- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, all high-risk commands, sudo commands, and profile override bypasses require explicit approval with no grant caching.
 - **Write protection**: remote file writes are restricted to directories listed in `workspace_roots`.
 - **Runtime narrowing**: `ssh_connect(limit_dir=...)` can narrow AI runtime access to one subdirectory within `workspace_roots`.
 - **Credential storage**: passwords and key passphrases are stored in the OS keychain (macOS Keychain / Linux Secret Service), never in config files.

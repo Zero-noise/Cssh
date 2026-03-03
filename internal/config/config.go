@@ -19,8 +19,6 @@ default_timeout_sec = 120
 allow_public_host = true
 security_profile_default = "easy_safe"
 connect_require_profile = true
-easy_safe_approval_ttl_sec = 900
-non_easy_safe_approval_ttl_sec = 0
 sudo_enabled = true
 allow_root_login = false
 `
@@ -68,10 +66,8 @@ func Load(configPath string) (model.Config, error) {
 		LogsDir:                filepath.Join(base, "logs"),
 		ProfilesFile:           filepath.Join(base, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
-		ConnectRequireProfile:  true,
-		EasySafeApprovalTTLsec: 900,
-		NonEasyApprovalTTLsec:  0,
-		SudoEnabled:            true,
+		ConnectRequireProfile: true,
+		SudoEnabled:           true,
 		AllowRootLogin:         false,
 	}
 
@@ -122,16 +118,6 @@ func Load(configPath string) (model.Config, error) {
 			}
 		case "connect_require_profile":
 			cfg.ConnectRequireProfile = strings.EqualFold(val, "true")
-		case "easy_safe_approval_ttl_sec":
-			n, err := strconv.Atoi(val)
-			if err == nil && n >= 0 {
-				cfg.EasySafeApprovalTTLsec = n
-			}
-		case "non_easy_safe_approval_ttl_sec":
-			n, err := strconv.Atoi(val)
-			if err == nil && n >= 0 {
-				cfg.NonEasyApprovalTTLsec = n
-			}
 		case "sudo_enabled":
 			cfg.SudoEnabled = strings.EqualFold(val, "true")
 		case "allow_root_login":

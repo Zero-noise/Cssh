@@ -16,7 +16,7 @@ func TestRunSCPReportsSFTPProtocolOnFirstSuccess(t *testing.T) {
 	m := NewManager(t.TempDir(), "bash -lc", 15)
 	conn := &model.Connection{Port: 22, ControlPath: filepath.Join(t.TempDir(), "ctrl.sock")}
 
-	res, err := m.runSCP(conn, 5, "src.txt", "dst.txt")
+	res, err := m.runSCP(conn, "", 5, "src.txt", "dst.txt")
 	if err != nil {
 		t.Fatalf("runSCP unexpected error: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestRunSCPReportsLegacyProtocolAfterFallback(t *testing.T) {
 	m := NewManager(t.TempDir(), "bash -lc", 15)
 	conn := &model.Connection{Port: 22, ControlPath: filepath.Join(t.TempDir(), "ctrl.sock")}
 
-	res, err := m.runSCP(conn, 5, "src.txt", "dst.txt")
+	res, err := m.runSCP(conn, "", 5, "src.txt", "dst.txt")
 	if err != nil {
 		t.Fatalf("runSCP unexpected error: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestRunSCPDoesNotFallbackForNonSFTPErrors(t *testing.T) {
 	m := NewManager(t.TempDir(), "bash -lc", 15)
 	conn := &model.Connection{Port: 22, ControlPath: filepath.Join(t.TempDir(), "ctrl.sock")}
 
-	res, err := m.runSCP(conn, 5, "src.txt", "dst.txt")
+	res, err := m.runSCP(conn, "", 5, "src.txt", "dst.txt")
 	if err == nil {
 		t.Fatalf("runSCP should fail for non-retryable errors")
 	}

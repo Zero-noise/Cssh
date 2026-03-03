@@ -27,5 +27,7 @@ const (
 	CodeFileExists          = "FILE_EXISTS"
 	CodeChecksumMismatch    = "CHECKSUM_MISMATCH"
 	CodeChecksumUnavailable = "CHECKSUM_UNAVAILABLE"
+	CodeProfileConflict     = "PROFILE_CONFLICT"
+	CodeConnectionDead      = "CONNECTION_DEAD"
 	CodeInternal            = "INTERNAL"
 )
