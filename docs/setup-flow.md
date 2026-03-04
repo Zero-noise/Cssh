@@ -13,7 +13,7 @@ When a user says "I want to connect to this SSH host to do X", the AI agent shou
 
 If an operation returns `status=approval_required` (for example from `ssh_exec` or `ssh_transfer` with privileged options):
 
-1. Call `ssh_approve_request(approval_id=..., decision=approve|reject)`.
+1. Run `csshctl approve <approval_id>` from a separate terminal.
 2. Retry the original tool call with `approval_token=<approval_id>`.
 
 Do not switch to legacy alias tools (`ssh_upload_file`, `ssh_profile_delete`, etc.); they remain backward-compatible but are deprecated.

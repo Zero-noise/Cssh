@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"cssh/internal/filelock"
 	"cssh/internal/model"
 )
 
@@ -55,12 +56,17 @@ func (s *GrantStore) saveAll(items []model.PrivilegeGrant) error {
 		return err
 	}
 	b = append(b, '\n')
-	return os.WriteFile(s.path, b, 0o600)
+	return filelock.AtomicWrite(s.path, b, 0o600)
 }
 
 func (s *GrantStore) Create(g model.PrivilegeGrant) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return err
@@ -72,6 +78,11 @@ func (s *GrantStore) Create(g model.PrivilegeGrant) error {
 func (s *GrantStore) Revoke(id string) (*model.PrivilegeGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -105,6 +116,11 @@ func (s *GrantStore) Revoke(id string) (*model.PrivilegeGrant, error) {
 func (s *GrantStore) RevokeByConnection(connectionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return err
@@ -130,6 +146,11 @@ func (s *GrantStore) RevokeByConnection(connectionID string) error {
 func (s *GrantStore) FindActive(connectionID, capability, commandHash string, now time.Time) (*model.PrivilegeGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -165,6 +186,11 @@ func (s *GrantStore) FindActive(connectionID, capability, commandHash string, no
 func (s *GrantStore) List(connectionID string, activeOnly bool) ([]model.PrivilegeGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err

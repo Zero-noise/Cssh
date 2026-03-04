@@ -38,9 +38,7 @@ Strict security. Every high-risk action requires individual human approval.
 
 ## Approval Flow
 
-Approval is MCP-first via `ssh_approve_request` tool call. This avoids `/dev/tty` prompt deadlocks in Claude Code / Codex sessions.
-
-Fallback: `csshctl approve <approval_id> --by <name>` from a local terminal.
+Approval is done via `csshctl approve <approval_id>` from a local terminal. The original tool call is then retried with `approval_token=<approval_id>`. This avoids `/dev/tty` prompt deadlocks in Claude Code / Codex sessions.
 
 ## Grant Caching
 

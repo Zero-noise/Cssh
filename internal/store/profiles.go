@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"cssh/internal/filelock"
 	"cssh/internal/model"
 )
 
@@ -53,18 +54,28 @@ func (s *ProfileStore) saveAll(items []model.Profile) error {
 		return err
 	}
 	b = append(b, '\n')
-	return os.WriteFile(s.path, b, 0o600)
+	return filelock.AtomicWrite(s.path, b, 0o600)
 }
 
 func (s *ProfileStore) List() ([]model.Profile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	return s.loadAll()
 }
 
 func (s *ProfileStore) Get(id string) (*model.Profile, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -81,6 +92,11 @@ func (s *ProfileStore) Get(id string) (*model.Profile, error) {
 func (s *ProfileStore) Upsert(p model.Profile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return err
@@ -102,6 +118,11 @@ func (s *ProfileStore) Upsert(p model.Profile) error {
 func (s *ProfileStore) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return err

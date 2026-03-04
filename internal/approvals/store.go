@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"cssh/internal/filelock"
 	"cssh/internal/model"
 )
 
@@ -64,23 +65,26 @@ func (s *Store) rewriteAll(items []model.ApprovalRequest) error {
 	if err := s.ensure(); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
+	var buf []byte
 	for _, it := range items {
-		if err := enc.Encode(it); err != nil {
+		line, err := json.Marshal(it)
+		if err != nil {
 			return err
 		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
 	}
-	return nil
+	return filelock.AtomicWrite(s.path, buf, 0o600)
 }
 
 func (s *Store) Create(req model.ApprovalRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := s.ensure(); err != nil {
 		return err
 	}
@@ -95,6 +99,11 @@ func (s *Store) Create(req model.ApprovalRequest) error {
 func (s *Store) Get(id string) (*model.ApprovalRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -111,6 +120,11 @@ func (s *Store) Get(id string) (*model.ApprovalRequest, error) {
 func (s *Store) List(status string) ([]model.ApprovalRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -133,6 +147,11 @@ func (s *Store) List(status string) ([]model.ApprovalRequest, error) {
 func (s *Store) Resolve(id string, status model.ApprovalStatus, actor, reason string) (*model.ApprovalRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err
@@ -175,6 +194,11 @@ func (s *Store) Resolve(id string, status model.ApprovalStatus, actor, reason st
 func (s *Store) MarkUsed(id string) (*model.ApprovalRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := filelock.Lock(s.path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	items, err := s.loadAll()
 	if err != nil {
 		return nil, err

@@ -143,7 +143,6 @@ codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
 | `ssh_credentials_prompt` | Securely store credentials via local web form |
 | `ssh_privilege_status` | List active privilege grants |
 | `ssh_privilege_revoke` | Revoke a privilege grant |
-| `ssh_approve_request` | Approve or reject a pending command |
 
 ## Build
 
@@ -196,7 +195,7 @@ Use canonical tools only (legacy aliases remain compatible but deprecated):
 2. `ssh_credentials_prompt(profile_id=...)` (if auth requires credentials)
 3. `ssh_connect(profile_id=...)`
 4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
-5. `ssh_approve_request` only when a call returns `approval_required`
+5. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
 
 ```json
 {

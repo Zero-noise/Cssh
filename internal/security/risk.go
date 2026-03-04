@@ -126,6 +126,20 @@ var criticalFindDeleteRoots = []string{
 	"/root",
 }
 
+// protectedRmRfDirs: system directories where rm -rf requires approval (DenyNeedApprove).
+// /tmp, /home, /root, /srv, /run are intentionally excluded.
+var protectedRmRfDirs = []string{
+	"/bin",
+	"/sbin",
+	"/etc",
+	"/usr",
+	"/lib",
+	"/lib64",
+	"/boot",
+	"/var",
+	"/opt",
+}
+
 func ClassifyCommandRisk(cmd string) (model.RiskLevel, string) {
 	normalized := strings.TrimSpace(cmd)
 	if normalized == "" {
@@ -133,6 +147,9 @@ func ClassifyCommandRisk(cmd string) (model.RiskLevel, string) {
 	}
 	if isCriticalRmRoot(normalized) {
 		return model.RiskL2, "matched high risk policy"
+	}
+	if isSystemDirRmRf(normalized) {
+		return model.RiskL2, "rm -rf targets protected system directory"
 	}
 	if risk, reason, ok := classifyFindDeleteRisk(normalized); ok {
 		return risk, reason
@@ -150,20 +167,17 @@ func ClassifyCommandRisk(cmd string) (model.RiskLevel, string) {
 	return model.RiskL0, "read-only command"
 }
 
-func isCriticalRmRoot(command string) bool {
-	tokens := strings.Fields(strings.ToLower(strings.TrimSpace(command)))
+// parseRmRfTargets extracts target paths from an "rm -rf" command.
+// Returns nil if the command is not "rm" with both -r and -f flags.
+// Uses skipSudoPrefix to correctly handle "sudo -u root", "sudo -H", etc.
+func parseRmRfTargets(command string) []string {
+	tokens := strings.Fields(strings.TrimSpace(command))
 	if len(tokens) < 2 {
-		return false
+		return nil
 	}
-	i := 0
-	if tokens[i] == "sudo" {
-		i++
-		if i >= len(tokens) {
-			return false
-		}
-	}
-	if path.Base(tokens[i]) != "rm" {
-		return false
+	i := skipSudoPrefix(tokens)
+	if i >= len(tokens) || !strings.EqualFold(path.Base(strings.Trim(tokens[i], `"'`)), "rm") {
+		return nil
 	}
 	i++
 	hasRecursive := false
@@ -175,7 +189,7 @@ func isCriticalRmRoot(command string) bool {
 			break
 		}
 		if strings.HasPrefix(tok, "--") {
-			switch tok {
+			switch strings.ToLower(tok) {
 			case "--recursive":
 				hasRecursive = true
 			case "--force":
@@ -189,7 +203,7 @@ func isCriticalRmRoot(command string) bool {
 				if ch == 'r' || ch == 'R' {
 					hasRecursive = true
 				}
-				if ch == 'f' {
+				if ch == 'f' || ch == 'F' {
 					hasForce = true
 				}
 			}
@@ -199,16 +213,37 @@ func isCriticalRmRoot(command string) bool {
 		break
 	}
 	if !hasRecursive || !hasForce {
-		return false
+		return nil
 	}
+	var targets []string
 	for ; i < len(tokens); i++ {
-		target := strings.Trim(tokens[i], `"'`)
+		targets = append(targets, strings.Trim(tokens[i], `"'`))
+	}
+	return targets
+}
+
+func isCriticalRmRoot(command string) bool {
+	for _, target := range parseRmRfTargets(command) {
 		switch target {
 		case "/", "/*", "/.", "/..":
 			return true
 		}
 		if strings.HasPrefix(target, "/*") {
 			return true
+		}
+	}
+	return false
+}
+
+// isSystemDirRmRf returns true when "rm -rf" targets a protected system directory.
+// Paths like /var/something, /usr/local, /etc/nginx all match.
+// Paths like /tmp/work, /home/user do not.
+func isSystemDirRmRf(command string) bool {
+	for _, target := range parseRmRfTargets(command) {
+		for _, dir := range protectedRmRfDirs {
+			if target == dir || strings.HasPrefix(target, dir+"/") {
+				return true
+			}
 		}
 	}
 	return false
@@ -275,8 +310,15 @@ func skipSudoPrefix(tokens []string) int {
 }
 
 func tokenNeedsValue(tok string) bool {
+	if strings.Contains(tok, "=") {
+		return false
+	}
+	switch tok {
+	case "-u", "-g", "-h", "-r", "-t", "-p", "-C", "-R", "-D":
+		return true
+	}
 	switch strings.ToLower(tok) {
-	case "-u", "-g", "-h", "-r", "-t", "-p", "-c":
+	case "--user", "--group", "--host", "--role", "--type", "--prompt", "--close-from", "--chroot", "--chdir", "--command-timeout":
 		return true
 	default:
 		return false
@@ -400,6 +442,10 @@ func classifyDenyClassSingle(cmd string, maxAutoRisk string, allowReboot, allowD
 	// DenyAlways: critical find -delete on system paths
 	if risk, reason, ok := classifyFindDeleteRisk(cmd); ok && risk == model.RiskL2 {
 		return DenyClassification{DenyClass: model.DenyAlways, RiskLevel: model.RiskL2, Reason: reason}
+	}
+	// DenyNeedApprove: rm -rf on protected system directories
+	if isSystemDirRmRf(cmd) {
+		return DenyClassification{DenyClass: model.DenyNeedApprove, RiskLevel: model.RiskL2, Reason: "rm -rf targets protected system directory"}
 	}
 
 	// DenyNeedApprove patterns (with profile overrides)

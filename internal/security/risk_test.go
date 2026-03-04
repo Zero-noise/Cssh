@@ -16,11 +16,17 @@ func TestClassifyCommandRisk(t *testing.T) {
 		{"rm -rf /", model.RiskL2},
 		{"sudo rm -rf /", model.RiskL2},
 		{"sudo /bin/rm -fr -- /", model.RiskL2},
+		{"sudo -H rm -rf /", model.RiskL2},
+		{"sudo -u root rm -rf /", model.RiskL2},
 		{"rm -rf /*", model.RiskL2},
+		{"sudo -H rm -rf /var/cuda-repo", model.RiskL2},
+		{"sudo -u root rm -rf /var/cuda-repo", model.RiskL2},
 		{"sudo reboot", model.RiskL2},
 		{"init 0", model.RiskL2},
 		{"find / -delete", model.RiskL2},
 		{"sudo find / -delete", model.RiskL2},
+		{"sudo -H find / -delete", model.RiskL2},
+		{"sudo -u root find /etc -delete", model.RiskL2},
 		{"find /etc -delete", model.RiskL2},
 		{"find / -name '*.tmp' -delete", model.RiskL2},
 		{"find -L /etc -delete", model.RiskL2},
@@ -29,6 +35,14 @@ func TestClassifyCommandRisk(t *testing.T) {
 		{"find . -delete", model.RiskL1},
 		{":(){ :|:& };:", model.RiskL2},
 		{"rm -rf /tmp/work", model.RiskL1},
+		// rm -rf on protected system directories → L2
+		{"rm -rf /var/cuda-repo", model.RiskL2},
+		{"sudo rm -rf /var/cuda-repo", model.RiskL2},
+		{"rm -rf /etc/nginx", model.RiskL2},
+		{"rm -rf /usr/local/bin/old", model.RiskL2},
+		// rm -rf on non-protected directories → L1
+		{"rm -rf /home/user/old", model.RiskL1},
+		{"rm -rf /root/.cache", model.RiskL1},
 	}
 	for _, tc := range cases {
 		got, _ := ClassifyCommandRisk(tc.cmd)
@@ -40,18 +54,22 @@ func TestClassifyCommandRisk(t *testing.T) {
 
 func TestClassifyDenyClass(t *testing.T) {
 	cases := []struct {
-		cmd       string
-		wantDC    model.DenyClass
-		wantRisk  model.RiskLevel
+		cmd      string
+		wantDC   model.DenyClass
+		wantRisk model.RiskLevel
 	}{
 		// DenyAlways: fork bomb
 		{":(){ :|:& };:", model.DenyAlways, model.RiskL2},
 		// DenyAlways: rm -rf /
 		{"rm -rf /", model.DenyAlways, model.RiskL2},
 		{"sudo rm -rf /", model.DenyAlways, model.RiskL2},
+		{"sudo -H rm -rf /", model.DenyAlways, model.RiskL2},
+		{"sudo -u root rm -rf /", model.DenyAlways, model.RiskL2},
 		// DenyAlways: find -delete on critical paths
 		{"find / -delete", model.DenyAlways, model.RiskL2},
 		{"find /etc -delete", model.DenyAlways, model.RiskL2},
+		{"sudo -H find / -delete", model.DenyAlways, model.RiskL2},
+		{"sudo -u root find /etc -delete", model.DenyAlways, model.RiskL2},
 		// DenyNeedApprove: dangerous disk ops
 		{"mkfs /dev/sdb", model.DenyNeedApprove, model.RiskL2},
 		{"dd of=/dev/sda bs=512 count=1", model.DenyNeedApprove, model.RiskL2},
@@ -75,9 +93,22 @@ func TestClassifyDenyClass(t *testing.T) {
 		{"chmod 777 /tmp/file", model.DenyNone, model.RiskL2},
 		{"chown -R root /opt", model.DenyNone, model.RiskL2},
 		{"dd if=/dev/zero of=/tmp/test bs=1M count=100", model.DenyNone, model.RiskL2},
+		// DenyNeedApprove: rm -rf on protected system directories
+		{"rm -rf /var/cuda-repo", model.DenyNeedApprove, model.RiskL2},
+		{"sudo rm -rf /var/cuda-repo", model.DenyNeedApprove, model.RiskL2},
+		{"sudo -H rm -rf /var/cuda-repo", model.DenyNeedApprove, model.RiskL2},
+		{"sudo -u root rm -rf /var/cuda-repo", model.DenyNeedApprove, model.RiskL2},
+		{"rm -rf /etc/nginx", model.DenyNeedApprove, model.RiskL2},
+		{"rm -rf /usr/local/bin/old", model.DenyNeedApprove, model.RiskL2},
+		{"rm -rf /opt/nvidia", model.DenyNeedApprove, model.RiskL2},
+		{"rm -rf /boot/old-kernel", model.DenyNeedApprove, model.RiskL2},
+		{"sudo rm -rf /var/l4t-cuda-tegra-repo-ubuntu2204-12-6-local /var/cudnn-local-tegra-repo-ubuntu2204-9.3.0", model.DenyNeedApprove, model.RiskL2},
+		// DenyNone: rm -rf on non-protected directories
+		{"rm -rf /tmp/work", model.DenyNone, model.RiskL1},
+		{"rm -rf /home/user/old", model.DenyNone, model.RiskL1},
+		{"rm -rf /root/.cache", model.DenyNone, model.RiskL1},
 		// DenyNone (L1): write ops
 		{"echo hi > file.txt", model.DenyNone, model.RiskL1},
-		{"rm -rf /tmp/work", model.DenyNone, model.RiskL1},
 		{"find /tmp -delete", model.DenyNone, model.RiskL1},
 		// New L1 write patterns: package managers, kill, systemctl start/restart
 		{"apt-get install nginx", model.DenyNone, model.RiskL1},
@@ -137,6 +168,8 @@ func TestClassifyDenyClassWrapperBypass(t *testing.T) {
 		{`eval "reboot"`, model.DenyNeedApprove},
 		{`echo "mkfs /dev/sdb" | bash`, model.DenyNeedApprove},
 		{`bash -c 'ls -la'`, model.DenyNone},
+		{`bash -c 'rm -rf /var/cuda-repo'`, model.DenyNeedApprove},
+		{`sh -c "sudo rm -rf /etc/nginx"`, model.DenyNeedApprove},
 	}
 	for _, tc := range cases {
 		dc := ClassifyDenyClass(tc.cmd, "L2", false, false, nil, "")
@@ -226,6 +259,12 @@ func TestClassifyDenyClassEasySafe(t *testing.T) {
 	dc = ClassifyDenyClass("shutdown -h now", "L2", true, false, nil, "easy_safe")
 	if dc.DenyClass != model.DenyNone {
 		t.Errorf("shutdown easy_safe+AllowReboot: DenyClass got %s want %s", dc.DenyClass, model.DenyNone)
+	}
+
+	// rm -rf /var/... with easy_safe → DenyNeedApprove (system dir protected)
+	dc = ClassifyDenyClass("sudo rm -rf /var/cuda-repo", "L2", false, false, nil, "easy_safe")
+	if dc.DenyClass != model.DenyNeedApprove {
+		t.Errorf("rm -rf /var easy_safe: DenyClass got %s want %s", dc.DenyClass, model.DenyNeedApprove)
 	}
 
 	// rm -rf / with easy_safe → DenyAlways (catastrophic still blocked)
