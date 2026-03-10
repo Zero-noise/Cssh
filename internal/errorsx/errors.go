@@ -29,5 +29,7 @@ const (
 	CodeChecksumUnavailable = "CHECKSUM_UNAVAILABLE"
 	CodeProfileConflict     = "PROFILE_CONFLICT"
 	CodeConnectionDead      = "CONNECTION_DEAD"
+	CodeReconnectFailed     = "RECONNECT_FAILED"
+	CodeCancelled           = "CANCELLED"
 	CodeInternal            = "INTERNAL"
 )

@@ -38,6 +38,36 @@ const (
 	transferProtocolSCPLegacy = "scp_legacy"
 )
 
+// masterHandle holds a reference to a managed SSH master process.
+type masterHandle struct {
+	cmd         *exec.Cmd
+	stderr      bytes.Buffer
+	done        chan struct{} // closed when cmd.Wait() returns
+	exitErr     error
+	intentional atomic.Bool // true = disconnect/shutdown, don't reconnect
+}
+
+type reconnectPhase int
+
+const (
+	reconnectIdle reconnectPhase = iota
+	reconnectInProgress
+	reconnectSucceeded
+	reconnectFailed
+)
+
+type reconnectState struct {
+	mu          sync.Mutex // always acquired AFTER m.mu if both needed
+	phase       reconnectPhase
+	attempts    int
+	maxAttempts int
+	lastAttempt time.Time
+	cooldown    time.Duration
+	failReason  string
+	succeeded   bool   // consumed once by ReconnectInfo
+	reason      string // human-readable death reason
+}
+
 type Manager struct {
 	runtimeDir      string
 	defaultShell    string
@@ -46,6 +76,10 @@ type Manager struct {
 	mu          sync.RWMutex
 	connections map[string]*model.Connection
 	sessions    map[string]*model.Session
+	masters     map[string]*masterHandle
+	reconState  map[string]*reconnectState
+	onReconnect func(connectionID, reason string)
+	wg          sync.WaitGroup
 }
 
 func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
@@ -57,7 +91,15 @@ func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
 		defaultTimeoutS: defaultTimeout,
 		connections:     map[string]*model.Connection{},
 		sessions:        map[string]*model.Session{},
+		masters:         map[string]*masterHandle{},
+		reconState:      map[string]*reconnectState{},
 	}
+}
+
+// SetOnReconnect registers a callback invoked after a successful auto-reconnect.
+// Called by the service layer to wire grant revocation and audit logging.
+func (m *Manager) SetOnReconnect(fn func(connectionID, reason string)) {
+	m.onReconnect = fn
 }
 
 // cleanupLegacyAskPassScripts removes leftover askpass-*.sh files from older
@@ -76,7 +118,7 @@ func cleanupLegacyAskPassScripts(runtimeDir string) {
 // cleanupOrphanedMasters terminates SSH master processes left behind by a
 // previous crash. It finds ctrl-*.sock files in the runtime directory and
 // sends "exit" via the control socket. This prevents resource leaks when
-// ControlPersist keeps masters alive after the managing process is gone.
+// the managing process is gone.
 func cleanupOrphanedMasters(runtimeDir string) {
 	matches, err := filepath.Glob(filepath.Join(runtimeDir, "ctrl-*.sock"))
 	if err != nil {
@@ -115,13 +157,24 @@ func (m *Manager) Connect(input model.Connection) (*model.Connection, error) {
 		if method != "key" && method != "password" {
 			continue
 		}
-		if err := m.startMaster(conn, method); err != nil {
+		mh, err := m.startMaster(conn, method)
+		if err != nil {
 			lastErr = err
 			continue
 		}
+		conn.AuthMethod = method
+		conn.Generation = 0
+		rs := &reconnectState{
+			maxAttempts: 1,
+			cooldown:    30 * time.Second,
+		}
 		m.mu.Lock()
 		m.connections[conn.ID] = &conn
+		m.masters[conn.ID] = mh
+		m.reconState[conn.ID] = rs
+		m.wg.Add(1) // must be inside lock so Shutdown's wg.Wait() can't race
 		m.mu.Unlock()
+		go m.watchMaster(conn.ID)
 		return &conn, nil
 	}
 	if lastErr == nil {
@@ -130,15 +183,15 @@ func (m *Manager) Connect(input model.Connection) (*model.Connection, error) {
 	return nil, errorsx.New(errorsx.CodeAuthFailed, lastErr.Error())
 }
 
-func (m *Manager) startMaster(conn model.Connection, method string) error {
+func (m *Manager) startMaster(conn model.Connection, method string) (*masterHandle, error) {
 	if err := os.MkdirAll(m.runtimeDir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
 	args := []string{
-		"-MNf",
+		"-MN",
 		"-o", "ControlMaster=yes",
-		"-o", "ControlPersist=3600",
+		"-o", "ControlPersist=no",
 		"-o", "StrictHostKeyChecking=accept-new",
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=4",
@@ -160,8 +213,11 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 	}
 	args = append(args, target)
 	cmd := exec.Command("ssh", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	mh := &masterHandle{
+		cmd:  cmd,
+		done: make(chan struct{}),
+	}
+	cmd.Stderr = &mh.stderr
 
 	if method == "password" || (method == "key" && conn.KeyPassphrase != "") {
 		secret := conn.Password
@@ -169,11 +225,11 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 			secret = conn.KeyPassphrase
 		}
 		if secret == "" {
-			return errors.New("ssh askpass secret is empty")
+			return nil, errors.New("ssh askpass secret is empty")
 		}
 		scriptPath, err := m.ensureAskPassScript()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		cmd.Env = append(os.Environ(),
 			"CSSH_SECRET="+secret,
@@ -183,25 +239,181 @@ func (m *Manager) startMaster(conn model.Connection, method string) error {
 		)
 	}
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("open ssh control socket failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("ssh master start failed: %w", err)
 	}
 
-	vCtx, vCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer vCancel()
-	verify := exec.CommandContext(vCtx, "ssh",
-		"-S", conn.ControlPath,
-		"-p", strconv.Itoa(conn.Port),
-		target,
-		"true",
-	)
-	var vStderr bytes.Buffer
-	verify.Stderr = &vStderr
-	if err := verify.Run(); err != nil {
-		_ = m.closeMaster(conn)
-		return fmt.Errorf("verify ssh connection failed: %w: %s", err, strings.TrimSpace(vStderr.String()))
+	// Goroutine to capture process exit.
+	go func() {
+		mh.exitErr = cmd.Wait()
+		close(mh.done)
+	}()
+
+	// Poll for socket file OR early process exit OR timeout.
+	deadline := time.After(20 * time.Second)
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-mh.done:
+			// Process exited before socket appeared (auth failure, etc.)
+			_ = os.Remove(conn.ControlPath) // clean up partial socket if any
+			errMsg := strings.TrimSpace(mh.stderr.String())
+			if mh.exitErr != nil {
+				return nil, fmt.Errorf("open ssh control socket failed: %w: %s", mh.exitErr, errMsg)
+			}
+			return nil, fmt.Errorf("ssh master exited unexpectedly: %s", errMsg)
+		case <-deadline:
+			// Timeout — kill the process and clean up.
+			_ = cmd.Process.Kill()
+			<-mh.done
+			_ = os.Remove(conn.ControlPath)
+			return nil, fmt.Errorf("ssh master did not create control socket within 20s: %s",
+				strings.TrimSpace(mh.stderr.String()))
+		case <-tick.C:
+			if _, err := os.Stat(conn.ControlPath); err == nil {
+				// Socket appeared — verify the connection works.
+				vCtx, vCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				verify := exec.CommandContext(vCtx, "ssh",
+					"-S", conn.ControlPath,
+					"-p", strconv.Itoa(conn.Port),
+					target,
+					"true",
+				)
+				var vStderr bytes.Buffer
+				verify.Stderr = &vStderr
+				if err := verify.Run(); err != nil {
+					vCancel()
+					mh.intentional.Store(true)
+					_ = cmd.Process.Kill()
+					<-mh.done
+					_ = os.Remove(conn.ControlPath)
+					return nil, fmt.Errorf("verify ssh connection failed: %w: %s", err, strings.TrimSpace(vStderr.String()))
+				}
+				vCancel()
+				return mh, nil
+			}
+		}
 	}
-	return nil
+}
+
+// watchMaster blocks until the master process dies, then triggers auto-reconnect
+// if the death was unexpected.
+func (m *Manager) watchMaster(connectionID string) {
+	defer m.wg.Done()
+	m.mu.RLock()
+	mh := m.masters[connectionID]
+	m.mu.RUnlock()
+	if mh == nil {
+		return
+	}
+
+	<-mh.done // block until master dies
+	if mh.intentional.Load() {
+		return // disconnect/shutdown, don't reconnect
+	}
+	reason := "master process exited"
+	if mh.exitErr != nil {
+		reason = mh.exitErr.Error()
+	}
+	if errText := strings.TrimSpace(mh.stderr.String()); errText != "" {
+		reason += ": " + errText
+	}
+	fmt.Fprintf(os.Stderr, "cssh: connection %s master died: %s\n", connectionID, reason)
+	m.handleMasterDeath(connectionID, reason)
+}
+
+// handleMasterDeath attempts a single auto-reconnect after the master dies.
+// Lock ordering: always m.mu first, then rs.mu.
+func (m *Manager) handleMasterDeath(connectionID, reason string) {
+	// Phase 1: check eligibility (brief lock)
+	m.mu.RLock()
+	rs := m.reconState[connectionID]
+	conn := m.connections[connectionID]
+	m.mu.RUnlock()
+	if conn == nil || rs == nil {
+		return
+	}
+
+	rs.mu.Lock()
+	if rs.attempts >= rs.maxAttempts {
+		rs.phase = reconnectFailed
+		rs.failReason = "auto-reconnect exhausted; please use ssh_disconnect and ssh_connect to re-establish the connection"
+		rs.reason = reason
+		rs.mu.Unlock()
+		return
+	}
+	if rs.cooldown > 0 && !rs.lastAttempt.IsZero() && time.Since(rs.lastAttempt) < rs.cooldown {
+		rs.phase = reconnectFailed
+		rs.failReason = "cooldown period not elapsed"
+		rs.reason = reason
+		rs.mu.Unlock()
+		return
+	}
+	rs.phase = reconnectInProgress
+	rs.attempts++
+	rs.lastAttempt = time.Now()
+	rs.reason = reason
+	rs.mu.Unlock() // RELEASE before startMaster
+
+	// Phase 2: reconnect attempt (no lock held)
+	_ = os.Remove(conn.ControlPath) // clean old socket
+	connCopy := *conn
+	mh, err := m.startMaster(connCopy, connCopy.AuthMethod)
+
+	// Phase 3: write result
+	rs.mu.Lock()
+	if err != nil {
+		rs.phase = reconnectFailed
+		rs.failReason = "reconnect failed: " + err.Error() +
+			"; please use ssh_disconnect and ssh_connect to re-establish the connection"
+		rs.mu.Unlock()
+		return
+	}
+
+	// Success
+	rs.phase = reconnectSucceeded
+	rs.succeeded = true
+	rs.attempts = 0 // RESET: allow future auto-reconnects
+	rs.mu.Unlock()
+
+	m.mu.Lock()
+	if m.connections[connectionID] == nil {
+		// Disconnected while reconnecting — kill new master
+		m.mu.Unlock()
+		mh.intentional.Store(true)
+		_ = mh.cmd.Process.Kill()
+		<-mh.done
+		return
+	}
+	m.masters[connectionID] = mh
+	conn.Generation++ // invalidates pending approval tokens
+	m.wg.Add(1)       // must be inside lock so Shutdown's wg.Wait() can't race
+	m.mu.Unlock()
+
+	if m.onReconnect != nil {
+		m.onReconnect(connectionID, reason)
+	}
+
+	go m.watchMaster(connectionID) // watch the new master
+}
+
+// ReconnectInfo returns whether an auto-reconnect succeeded (consume-once).
+func (m *Manager) ReconnectInfo(connectionID string) (reconnected bool, reason string) {
+	m.mu.RLock()
+	rs := m.reconState[connectionID]
+	m.mu.RUnlock()
+	if rs == nil {
+		return false, ""
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.succeeded {
+		rs.succeeded = false
+		return true, rs.reason
+	}
+	return false, ""
 }
 
 const askPassBody = "#!/bin/sh\nprintf '%s\\n' \"$CSSH_SECRET\"\n"
@@ -327,12 +539,43 @@ func (m *Manager) GetSession(id string) (*model.Session, error) {
 	return &cp, nil
 }
 
-// PreFlightCheck performs a fast ssh -O check before command execution,
-// returning a CONNECTION_DEAD error immediately if the connection is no longer
-// alive. The check uses the SSH control socket and completes in <10ms for
-// healthy connections, so the overhead is negligible compared to the benefit
-// of avoiding a full timeout wait on dead connections.
+// PreFlightCheck performs a fast check before command execution.
+// It first consults reconnect state, then falls back to ssh -O check.
 func (m *Manager) PreFlightCheck(connectionID string) error {
+	// Check reconnect state first.
+	m.mu.RLock()
+	rs := m.reconState[connectionID]
+	m.mu.RUnlock()
+
+	if rs != nil {
+		rs.mu.Lock()
+		phase := rs.phase
+		failReason := rs.failReason
+		rs.mu.Unlock()
+
+		switch phase {
+		case reconnectFailed:
+			return errorsx.New(errorsx.CodeReconnectFailed, failReason)
+		case reconnectInProgress:
+			// Poll up to 3s waiting for phase change.
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				time.Sleep(200 * time.Millisecond)
+				rs.mu.Lock()
+				p := rs.phase
+				fr := rs.failReason
+				rs.mu.Unlock()
+				if p == reconnectFailed {
+					return errorsx.New(errorsx.CodeReconnectFailed, fr)
+				}
+				if p == reconnectSucceeded || p == reconnectIdle {
+					break
+				}
+			}
+		}
+	}
+
+	// Proceed to existing ssh -O check.
 	alive, _, msg, err := m.CheckConnection(connectionID, 3)
 	if err != nil {
 		return err
@@ -352,6 +595,10 @@ func (m *Manager) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 }
 
 func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, timeoutSec int, stdin string) (ExecResult, error) {
+	return m.ExecWithInputCtx(context.Background(), connectionID, sessionID, command, cwd, timeoutSec, stdin)
+}
+
+func (m *Manager) ExecWithInputCtx(parent context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, stdin string) (ExecResult, error) {
 	if command == "" {
 		return ExecResult{}, errorsx.New(errorsx.CodeInvalidParams, "command is required")
 	}
@@ -392,7 +639,7 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		remoteCmd = shell + " " + util.ShellQuote(remoteCmd)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	target := fmt.Sprintf("%s@%s", conn.Username, conn.Host)
@@ -404,7 +651,7 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	// the probe fails in ≤5s and cancels the main command immediately,
 	// avoiding the full timeout wait.
 	var probeDead atomic.Bool
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(parent, 5*time.Second)
 	defer probeCancel()
 	go func() {
 		probeCmd := exec.CommandContext(probeCtx, "ssh",
@@ -445,6 +692,10 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 		DurationMS: d.Milliseconds(),
 	}
 	if ctx.Err() != nil {
+		// Parent context cancelled (MCP request cancellation) — return fast
+		if parent.Err() != nil && !probeDead.Load() {
+			return res, errorsx.New(errorsx.CodeCancelled, "request cancelled")
+		}
 		if probeDead.Load() {
 			return res, errorsx.New(errorsx.CodeConnectionDead,
 				"connection probe failed; please use ssh_disconnect and ssh_connect to re-establish the connection")
@@ -464,6 +715,14 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		res.ExitCode = exitErr.ExitCode()
+		// SSH returns 255 for its own errors (connection lost, auth failure, etc.)
+		if exitErr.ExitCode() == 255 {
+			alive, _, _, _ := m.CheckConnection(connectionID, 3)
+			if !alive {
+				return res, errorsx.New(errorsx.CodeConnectionDead,
+					"ssh exited with code 255 and connection is dead; please use ssh_disconnect and ssh_connect to re-establish the connection")
+			}
+		}
 		return res, nil
 	}
 	return res, errorsx.New(errorsx.CodeInternal, err.Error())
@@ -719,33 +978,65 @@ func shouldRetryLegacySCP(stderr string) bool {
 // when the process is exiting to prevent orphaned ssh master processes.
 func (m *Manager) Shutdown() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for id, conn := range m.connections {
-		if err := m.closeMaster(*conn); err != nil {
-			fmt.Fprintf(os.Stderr, "cssh: shutdown: failed to close connection %s (%s@%s): %v\n",
-				id, conn.Username, conn.Host, err)
+	for id, mh := range m.masters {
+		mh.intentional.Store(true)
+		conn := m.connections[id]
+		if conn != nil {
+			_ = m.closeMaster(*conn)
 		}
+		// If process is still running, kill it.
+		if mh.cmd != nil && mh.cmd.Process != nil {
+			_ = mh.cmd.Process.Kill()
+		}
+	}
+	for id := range m.connections {
 		delete(m.connections, id)
 	}
 	for id := range m.sessions {
 		delete(m.sessions, id)
 	}
+	for id := range m.masters {
+		delete(m.masters, id)
+	}
+	for id := range m.reconState {
+		delete(m.reconState, id)
+	}
+	m.mu.Unlock()
+	m.wg.Wait()
 }
 
 func (m *Manager) Disconnect(connectionID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	conn := m.connections[connectionID]
 	if conn == nil {
+		m.mu.Unlock()
 		return errorsx.New(errorsx.CodeConnectionMissing, "connection_id not found")
 	}
-	closeErr := m.closeMaster(*conn) // best-effort; connection may already be dead
+	mh := m.masters[connectionID]
+	if mh != nil {
+		mh.intentional.Store(true) // set before unlock so watchMaster sees it
+	}
 	delete(m.connections, connectionID)
+	delete(m.masters, connectionID)
+	delete(m.reconState, connectionID)
 	for id, s := range m.sessions {
 		if s.ConnectionID == connectionID {
 			delete(m.sessions, id)
 		}
 	}
+	m.mu.Unlock()
+
+	closeErr := m.closeMaster(*conn) // best-effort; connection may already be dead
+
+	// If process is still running, kill it and wait.
+	if mh != nil && mh.cmd != nil && mh.cmd.Process != nil {
+		_ = mh.cmd.Process.Kill()
+		select {
+		case <-mh.done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+
 	if closeErr != nil {
 		fmt.Fprintf(os.Stderr, "cssh: disconnect: closeMaster %s (%s@%s): %v\n",
 			connectionID, conn.Username, conn.Host, closeErr)

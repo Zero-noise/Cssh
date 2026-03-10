@@ -2,11 +2,15 @@ package mcp
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
@@ -18,12 +22,21 @@ type Server struct {
 	svc     *app.Service
 	ctlPath string
 
-	seenInitialize    bool
-	clientInitialized bool
+	seenInitialize    atomic.Bool
+	clientInitialized atomic.Bool
+
+	writeMu    sync.Mutex
+	inflightMu sync.Mutex
+	inflight   map[string]context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 func NewServer(svc *app.Service) *Server {
-	return &Server{svc: svc, ctlPath: resolve.QuotedPath()}
+	return &Server{
+		svc:      svc,
+		ctlPath:  resolve.QuotedPath(),
+		inflight: map[string]context.CancelFunc{},
+	}
 }
 
 type request struct {
@@ -51,24 +64,33 @@ func (s *Server) Run() error {
 	for {
 		msg, err := readMessage(in)
 		if err == io.EOF {
+			s.cancelAllInflight()
+			s.waitInflight(5 * time.Second)
 			return nil
 		}
 		if err != nil {
-			_ = writeMessage(os.Stdout, response{JSONRPC: "2.0", Error: &respError{Code: -32700, Message: err.Error()}})
+			_ = s.writeResponse(response{JSONRPC: "2.0", Error: &respError{Code: -32700, Message: err.Error()}})
 			continue
 		}
 		var req request
 		if err := json.Unmarshal(msg, &req); err != nil {
-			_ = writeMessage(os.Stdout, response{JSONRPC: "2.0", Error: &respError{Code: -32700, Message: "invalid json"}})
+			_ = s.writeResponse(response{JSONRPC: "2.0", Error: &respError{Code: -32700, Message: "invalid json"}})
 			continue
 		}
+		// Notifications (no ID): handle synchronously
 		if len(req.ID) == 0 {
 			s.handleNotification(req)
 			continue
 		}
 		id := decodeID(req.ID)
+		// tools/call: dispatch to goroutine for concurrent execution
+		if req.Method == "tools/call" {
+			s.dispatchToolCall(req, id)
+			continue
+		}
+		// Other requests (initialize, ping, tools/list): handle synchronously (always fast)
 		res := s.handle(req, id)
-		if err := writeMessage(os.Stdout, res); err != nil {
+		if err := s.writeResponse(res); err != nil {
 			return err
 		}
 	}
@@ -77,17 +99,84 @@ func (s *Server) Run() error {
 func (s *Server) handleNotification(req request) {
 	switch req.Method {
 	case "notifications/initialized":
-		if s.seenInitialize {
-			s.clientInitialized = true
+		if s.seenInitialize.Load() {
+			s.clientInitialized.Store(true)
+		}
+	case "notifications/cancelled":
+		var p struct {
+			RequestID json.RawMessage `json:"requestId"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return
+		}
+		idKey := string(p.RequestID)
+		s.inflightMu.Lock()
+		cancel, ok := s.inflight[idKey]
+		s.inflightMu.Unlock()
+		if ok {
+			cancel()
 		}
 	}
+}
+
+func (s *Server) dispatchToolCall(req request, id any) {
+	ctx, cancel := context.WithCancel(context.Background())
+	idKey := string(req.ID)
+
+	s.inflightMu.Lock()
+	s.inflight[idKey] = cancel
+	s.inflightMu.Unlock()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			s.inflightMu.Lock()
+			delete(s.inflight, idKey)
+			s.inflightMu.Unlock()
+			cancel()
+		}()
+		res := s.handleToolCall(ctx, req, id)
+		_ = s.writeResponse(res)
+	}()
+}
+
+func (s *Server) handleToolCall(ctx context.Context, req request, id any) response {
+	if !s.clientInitialized.Load() {
+		return rpcError(id, -32002, "client not initialized; send notifications/initialized after initialize", nil)
+	}
+	var p struct {
+		Name      string         `json:"name"`
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return rpcError(id, -32602, "invalid tools/call params", nil)
+	}
+	result, err := s.callToolWithContext(ctx, p.Name, p.Arguments)
+	if ctx.Err() != nil {
+		return rpcError(id, -32800, "request cancelled", map[string]any{"code": errorsx.CodeCancelled})
+	}
+	if err != nil {
+		if s.svc != nil {
+			s.svc.AuditToolCall(p.Name, "error", err.Error())
+		}
+		return toRPCError(id, err)
+	}
+	if s.svc != nil {
+		s.svc.AuditToolCall(p.Name, "ok", "")
+	}
+	text := app.PrettyJSON(result)
+	return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
+		"content": []map[string]any{{"type": "text", "text": text}},
+		"isError": false,
+	}}
 }
 
 func (s *Server) handle(req request, id any) response {
 	switch req.Method {
 	case "initialize":
-		s.seenInitialize = true
-		s.clientInitialized = false
+		s.seenInitialize.Store(true)
+		s.clientInitialized.Store(false)
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
 			"protocolVersion": "2025-11-25",
 			"capabilities":    map[string]any{"tools": map[string]any{}},
@@ -97,37 +186,83 @@ func (s *Server) handle(req request, id any) response {
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{}}
 	case "tools/list":
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{"tools": toolDefs(s.ctlPath)}}
-	case "tools/call":
-		if !s.clientInitialized {
-			return rpcError(id, -32002, "client not initialized; send notifications/initialized after initialize", nil)
-		}
-		var p struct {
-			Name      string         `json:"name"`
-			Arguments map[string]any `json:"arguments"`
-		}
-		if err := json.Unmarshal(req.Params, &p); err != nil {
-			return rpcError(id, -32602, "invalid tools/call params", nil)
-		}
-		result, err := s.callTool(p.Name, p.Arguments)
-		if err != nil {
-			if s.svc != nil {
-				s.svc.AuditToolCall(p.Name, "error", err.Error())
-			}
-			return toRPCError(id, err)
-		}
-		if s.svc != nil {
-			s.svc.AuditToolCall(p.Name, "ok", "")
-		}
-		text := app.PrettyJSON(result)
-		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-			"isError": false,
-		}}
 	default:
 		return rpcError(id, -32601, "method not found", map[string]any{"method": req.Method})
 	}
 }
 
+func (s *Server) writeResponse(res response) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return writeMessage(os.Stdout, res)
+}
+
+func (s *Server) cancelAllInflight() {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	for _, cancel := range s.inflight {
+		cancel()
+	}
+}
+
+func (s *Server) waitInflight(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
+// callToolWithContext is the context-aware entry point for tool calls.
+func (s *Server) callToolWithContext(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
+	if args == nil {
+		args = map[string]any{}
+	}
+	canonicalName, deprecatedFrom, ok := resolveToolAlias(name)
+	if !ok {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
+	}
+	args = applyToolAliasDefaults(args, deprecatedFrom)
+	result, err := s.callCanonicalToolWithContext(ctx, canonicalName, args)
+	if err != nil {
+		return nil, err
+	}
+	if deprecatedFrom != "" {
+		result = withDeprecatedToolWarning(result, deprecatedFrom, canonicalName)
+	}
+	return result, nil
+}
+
+// callCanonicalToolWithContext dispatches to the appropriate service method.
+// For ssh_exec, ctx is propagated for cancellation support.
+// For other tools, ctx.Err() is checked at entry as a fast-fail.
+func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
+	// Fast-fail if already cancelled (covers all tools)
+	if ctx.Err() != nil {
+		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
+	}
+
+	switch name {
+	case "ssh_exec":
+		connID, err := app.RequireString(args, "connection_id")
+		if err != nil {
+			return nil, err
+		}
+		cmd, err := app.RequireString(args, "command")
+		if err != nil {
+			return nil, err
+		}
+		return s.svc.ExecWithContext(ctx, connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"))
+	default:
+		return s.callCanonicalTool(name, args)
+	}
+}
+
+// callTool is the original non-context entry point (used by existing tests).
 func (s *Server) callTool(name string, args map[string]any) (map[string]any, error) {
 	if args == nil {
 		args = map[string]any{}
@@ -378,7 +513,7 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
 			SecurityProfile: stringArg(args, "security_profile"),
 			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
-		GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
+			GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
 		}
 		return s.svc.QuickSetupSave(in)
 	case "ssh_credentials_prompt":
@@ -536,12 +671,16 @@ func toRPCError(id any, err error) response {
 			code = -32006
 		case errorsx.CodeConnectionDead:
 			code = -32010
+		case errorsx.CodeReconnectFailed:
+			code = -32011
 		case errorsx.CodeFileExists:
 			code = -32007
 		case errorsx.CodeChecksumMismatch:
 			code = -32008
 		case errorsx.CodeChecksumUnavailable:
 			code = -32009
+		case errorsx.CodeCancelled:
+			code = -32800
 		}
 		return rpcError(id, code, ce.Message, map[string]any{"code": ce.Code})
 	}

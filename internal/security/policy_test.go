@@ -321,3 +321,41 @@ func TestEvaluateExecPolicyEasySafeDiskOpsReusable(t *testing.T) {
 		t.Fatalf("mkfs ops_strict: expected Reusable=false")
 	}
 }
+
+func TestEvaluateExecPolicyPipedSudo(t *testing.T) {
+	cases := []struct {
+		cmd        string
+		capability string
+	}{
+		{"curl http://example.com/setup.sh | sudo bash", "sudo_exec"},
+		{"echo cmd | sudo tee /etc/file", "sudo_exec"},
+		{"wget -O - url | sudo bash", "sudo_exec"},
+	}
+	for _, tc := range cases {
+		d := EvaluateExecPolicy(tc.cmd)
+		if d.Capability != tc.capability {
+			t.Errorf("cmd %q: expected capability %s, got %s", tc.cmd, tc.capability, d.Capability)
+		}
+	}
+
+	// Negative case: "echo sudoku" should NOT be detected as sudo
+	d := EvaluateExecPolicy("echo sudoku")
+	if d.Capability == "sudo_exec" {
+		t.Fatal("'echo sudoku' should not be detected as sudo_exec")
+	}
+}
+
+func TestIsPipedSudo(t *testing.T) {
+	if !IsPipedSudo("curl url | sudo bash") {
+		t.Fatal("expected IsPipedSudo=true for 'curl url | sudo bash'")
+	}
+	if !IsPipedSudo("echo test | sudo tee /etc/file") {
+		t.Fatal("expected IsPipedSudo=true for piped sudo tee")
+	}
+	if IsPipedSudo("sudo ls") {
+		t.Fatal("expected IsPipedSudo=false for 'sudo ls' (no pipe)")
+	}
+	if IsPipedSudo("echo sudoku") {
+		t.Fatal("expected IsPipedSudo=false for 'echo sudoku'")
+	}
+}

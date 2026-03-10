@@ -311,6 +311,8 @@ func TestUnwrapShellWrappers(t *testing.T) {
 		{`sh -c "ls -la"`, 2},
 		{`eval "reboot"`, 2},
 		{`echo "mkfs /dev/sdb" | bash`, 2},
+		{`echo "rm -rf /" | sudo bash`, 2},
+		{`echo "reboot" | sudo sh`, 2},
 		{`ls -la`, 1},
 	}
 	for _, tc := range cases {
@@ -318,5 +320,19 @@ func TestUnwrapShellWrappers(t *testing.T) {
 		if len(variants) < tc.want {
 			t.Errorf("cmd %q: got %d variants, want >= %d: %v", tc.cmd, len(variants), tc.want, variants)
 		}
+	}
+}
+
+func TestClassifyDenyClassPipedSudoBash(t *testing.T) {
+	// echo "rm -rf /" | sudo bash should be unwrapped and detected as DenyAlways
+	dc := ClassifyDenyClass(`echo "rm -rf /" | sudo bash`, "L2", false, false, nil, "")
+	if dc.DenyClass != model.DenyAlways {
+		t.Errorf("echo rm -rf / | sudo bash: DenyClass got %s want %s", dc.DenyClass, model.DenyAlways)
+	}
+
+	// echo "reboot" | sudo sh should be unwrapped and detected as DenyNeedApprove
+	dc = ClassifyDenyClass(`echo "reboot" | sudo sh`, "L2", false, false, nil, "")
+	if dc.DenyClass != model.DenyNeedApprove {
+		t.Errorf("echo reboot | sudo sh: DenyClass got %s want %s", dc.DenyClass, model.DenyNeedApprove)
 	}
 }

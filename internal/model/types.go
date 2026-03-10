@@ -78,6 +78,8 @@ type Connection struct {
 	DenyPatterns    []string
 	GrantTTLSec     int
 	ControlPath     string
+	AuthMethod      string
+	Generation      uint64
 	CreatedAt       time.Time
 }
 
@@ -134,6 +136,7 @@ type ApprovalRequest struct {
 	RejectReason string         `json:"reject_reason,omitempty"`
 	UsedAt       *time.Time     `json:"used_at,omitempty"`
 	Reusable     bool           `json:"reusable,omitempty"`
+	Generation   uint64         `json:"generation,omitempty"`
 }
 
 type PrivilegeGrantStatus string

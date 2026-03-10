@@ -143,9 +143,19 @@ func HashCommandTemplate(template string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+var pipedSudoRE = regexp.MustCompile(`\|\s*sudo(\s|$)`)
+
 func LooksLikeSudo(command string) bool {
 	cmd := strings.TrimSpace(command)
-	return strings.HasPrefix(cmd, "sudo ") || cmd == "sudo"
+	if strings.HasPrefix(cmd, "sudo ") || cmd == "sudo" {
+		return true
+	}
+	return pipedSudoRE.MatchString(cmd)
+}
+
+// IsPipedSudo returns true when sudo appears after a pipe (e.g. "curl | sudo bash").
+func IsPipedSudo(command string) bool {
+	return pipedSudoRE.MatchString(strings.TrimSpace(command))
 }
 
 // parentTraversalRE matches ".." as a path component (boundary-aware).

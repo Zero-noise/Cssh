@@ -1,9 +1,13 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
@@ -279,14 +283,15 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 func TestInitializedNotificationGate(t *testing.T) {
 	s := NewServer(nil)
 
-	res := s.handle(request{Method: "tools/call", Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`)}, 1)
+	req := request{Method: "tools/call", Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`)}
+	res := s.handleToolCall(context.Background(), req, 1)
 	if res.Error == nil || res.Error.Code != -32002 {
 		t.Fatalf("expected not-initialized error, got: %#v", res)
 	}
 
 	_ = s.handle(request{Method: "initialize"}, 1)
 	s.handleNotification(request{Method: "notifications/initialized"})
-	if !s.clientInitialized {
+	if !s.clientInitialized.Load() {
 		t.Fatalf("client should be initialized after notification")
 	}
 }
@@ -413,5 +418,96 @@ func TestApplyToolAliasDefaultsForSudoPrompt(t *testing.T) {
 	}
 	if out["prompt_mode"] != "web" {
 		t.Fatalf("prompt_mode should default to web, got: %#v", out["prompt_mode"])
+	}
+}
+
+func TestCancelledNotification(t *testing.T) {
+	s := NewServer(nil)
+	_ = s.handle(request{Method: "initialize"}, 1)
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	// Simulate an inflight request
+	ctx, cancel := context.WithCancel(context.Background())
+	reqID := json.RawMessage(`42`)
+	idKey := string(reqID)
+	s.inflightMu.Lock()
+	s.inflight[idKey] = cancel
+	s.inflightMu.Unlock()
+
+	// Send notifications/cancelled
+	params, _ := json.Marshal(map[string]any{"requestId": 42})
+	s.handleNotification(request{
+		Method: "notifications/cancelled",
+		Params: params,
+	})
+
+	// Verify the context was cancelled
+	select {
+	case <-ctx.Done():
+		// expected
+	default:
+		t.Fatal("expected context to be cancelled")
+	}
+}
+
+func TestCancelledUnknownId(t *testing.T) {
+	s := NewServer(nil)
+	// Should not panic on unknown request ID
+	params, _ := json.Marshal(map[string]any{"requestId": 999})
+	s.handleNotification(request{
+		Method: "notifications/cancelled",
+		Params: params,
+	})
+}
+
+func TestConcurrentToolCalls(t *testing.T) {
+	tmp := t.TempDir()
+	svc := app.NewService(model.Config{
+		DefaultShell:      "bash -lc",
+		DefaultTimeoutSec: 120,
+		RuntimeDir:        filepath.Join(tmp, "runtime"),
+		LogsDir:           filepath.Join(tmp, "logs"),
+		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
+	})
+	s := NewServer(svc)
+	_ = s.handle(request{Method: "initialize"}, 1)
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	var wg sync.WaitGroup
+	results := make([]response, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			req := request{
+				Method: "tools/call",
+				Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`),
+			}
+			results[idx] = s.handleToolCall(context.Background(), req, idx+1)
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent tool calls did not complete in time")
+	}
+
+	for i, res := range results {
+		if res.Error != nil {
+			t.Fatalf("tool call %d returned error: %#v", i, res.Error)
+		}
+	}
+}
+
+func TestToRPCErrorCancelledMapping(t *testing.T) {
+	res := toRPCError(1, errorsx.New(errorsx.CodeCancelled, "cancelled"))
+	if res.Error == nil || res.Error.Code != -32800 {
+		t.Fatalf("expected -32800, got: %#v", res.Error)
 	}
 }

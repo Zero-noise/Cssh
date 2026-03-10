@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -48,7 +49,7 @@ type profileDeleteConfirm struct {
 }
 
 func NewService(cfg model.Config) *Service {
-	return &Service{
+	svc := &Service{
 		cfg:          cfg,
 		profiles:     store.NewProfileStore(cfg.ProfilesFile),
 		secrets:      store.NewSecretStore(),
@@ -58,10 +59,32 @@ func NewService(cfg model.Config) *Service {
 		ssh:          sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
 		deleteTokens: map[string]profileDeleteConfirm{},
 	}
+	svc.ssh.SetOnReconnect(func(connectionID, reason string) {
+		_ = svc.grants.RevokeByConnection(connectionID)
+		_ = svc.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      util.NewID("trace"),
+			Type:         "ssh_auto_reconnect",
+			ConnectionID: connectionID,
+			Status:       "ok",
+			Detail:       reason,
+		})
+	})
+	return svc
 }
 
 // Shutdown closes all SSH connections. Call on process exit.
 func (s *Service) Shutdown() { s.ssh.Shutdown() }
+
+// enrichWithReconnectInfo adds reconnect metadata to a response if the
+// connection was auto-reconnected since the last call.
+func (s *Service) enrichWithReconnectInfo(resp map[string]any, connectionID string) {
+	reconnected, reason := s.ssh.ReconnectInfo(connectionID)
+	if reconnected {
+		resp["reconnected"] = true
+		resp["reconnect_reason"] = reason
+	}
+}
 
 func pathJoin(a, b string) string {
 	if strings.HasSuffix(a, "/") {
@@ -146,6 +169,13 @@ func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, 
 }
 
 func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string) (map[string]any, error) {
+	return s.ExecWithContext(context.Background(), connectionID, sessionID, command, cwd, timeoutSec, approvalToken)
+}
+
+func (s *Service) ExecWithContext(ctx context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string) (map[string]any, error) {
+	if ctx.Err() != nil {
+		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
+	}
 	traceID := util.NewID("trace")
 	auditCommand := sanitizeCommandForAudit(command)
 	conn, err := s.ssh.GetConnection(connectionID)
@@ -215,7 +245,7 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		}
 	}
 
-	res, err := s.ssh.ExecWithInput(connectionID, sessionID, runCommand, cwd, timeoutSec, runInput)
+	res, err := s.ssh.ExecWithInputCtx(ctx, connectionID, sessionID, runCommand, cwd, timeoutSec, runInput)
 	if err != nil {
 		return nil, err
 	}
@@ -241,12 +271,14 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 		ConfirmMode:     authz.ConfirmMode,
 		GrantID:         authz.GrantID,
 	})
-	return map[string]any{
+	resp := map[string]any{
 		"exit_code":   res.ExitCode,
 		"stdout":      res.Stdout,
 		"stderr":      res.Stderr,
 		"duration_ms": res.DurationMS,
-	}, nil
+	}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) ConnectionStatus(connectionID string, timeoutSec int) (map[string]any, error) {
@@ -528,6 +560,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
 		resp["fallback_reason"] = transferRes.FallbackReason
 	}
+	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
 }
 
@@ -675,6 +708,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
 		resp["fallback_reason"] = transferRes.FallbackReason
 	}
+	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
 }
 
@@ -724,7 +758,9 @@ func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd stri
 		FilePath:     resolved,
 		Status:       "ok",
 	})
-	return map[string]any{"content": res.Stdout, "truncated": truncated}, nil
+	resp := map[string]any{"content": res.Stdout, "truncated": truncated}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (map[string]any, error) {
@@ -773,7 +809,9 @@ func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (
 		RiskLevel:    string(model.RiskL1),
 		Status:       "ok",
 	})
-	return map[string]any{"bytes_written": len(content)}, nil
+	resp := map[string]any{"bytes_written": len(content)}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[string]any, error) {
@@ -828,7 +866,9 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[st
 		RiskLevel:    string(model.RiskL1),
 		Status:       "ok",
 	})
-	return map[string]any{"files_changed": filesChanged, "hunks_applied": hunksApplied, "rejects": rejects}, nil
+	resp := map[string]any{"files_changed": filesChanged, "hunks_applied": hunksApplied, "rejects": rejects}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[string]any, error) {
@@ -865,7 +905,9 @@ func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[
 		FilePath:     resolved,
 		Status:       "ok",
 	})
-	return map[string]any{"entries": entries}, nil
+	resp := map[string]any{"entries": entries}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit int, cwd string) (map[string]any, error) {
@@ -931,7 +973,9 @@ func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit
 		FilePath:     resolved,
 		Status:       "ok",
 	})
-	return map[string]any{"matches": matches}, nil
+	resp := map[string]any{"matches": matches}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) (map[string]any, error) {
@@ -963,7 +1007,9 @@ func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) 
 		FilePath:     resolved,
 		Status:       "ok",
 	})
-	return map[string]any{"content": res.Stdout}, nil
+	resp := map[string]any{"content": res.Stdout}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
 }
 
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
@@ -1344,6 +1390,10 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		if strings.TrimSpace(req.Capability) != "" && req.Capability != capability {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current capability")
 		}
+		// Reject tokens from before a reconnect (generation mismatch).
+		if conn, err := s.ssh.GetConnection(connectionID); err == nil && req.Generation != conn.Generation {
+			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token invalidated by connection reconnect")
+		}
 		// Atomically mark as used. MarkUsed returns nil if already consumed
 		// or not approved, preventing concurrent double-use.
 		updated, err := s.approvals.MarkUsed(req.ID)
@@ -1393,6 +1443,10 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		}
 	}
 
+	var connGeneration uint64
+	if conn, err := s.ssh.GetConnection(connectionID); err == nil {
+		connGeneration = conn.Generation
+	}
 	req := model.ApprovalRequest{
 		ID:           util.NewID("apr"),
 		CreatedAt:    now,
@@ -1410,6 +1464,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		Reason:       reason,
 		RequestedBy:  "mcp",
 		Reusable:     reusable,
+		Generation:   connGeneration,
 	}
 	if err := s.approvals.Create(req); err != nil {
 		return privilegeAuthz{}, err
@@ -1458,6 +1513,11 @@ func (s *Service) validateAndConsumeProfileDeleteToken(profileID, token string) 
 func (s *Service) prepareSudoCommand(conn model.Connection, command string) (string, string, map[string]any, error) {
 	if !security.LooksLikeSudo(command) {
 		return command, "", nil, nil
+	}
+	if security.IsPipedSudo(command) {
+		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams,
+			"piped sudo (e.g. 'curl | sudo bash') cannot receive password via stdin; "+
+				"split into separate commands: download the file first, then run 'sudo bash <file>'")
 	}
 	if !s.cfg.SudoEnabled {
 		return "", "", nil, errorsx.New(errorsx.CodeInvalidParams, "sudo execution is disabled by policy")

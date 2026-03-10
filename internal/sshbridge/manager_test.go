@@ -3,7 +3,9 @@ package sshbridge
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
@@ -190,5 +192,275 @@ func TestPreFlightCheck_ConnectionNotFound(t *testing.T) {
 	ce, ok := err.(*errorsx.CsshError)
 	if !ok || ce.Code != errorsx.CodeConnectionMissing {
 		t.Fatalf("expected CONNECTION_NOT_FOUND error, got %#v", err)
+	}
+}
+
+func TestReconnectState_FailedPhaseBlocksPreFlight(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "localhost",
+		Port:        22,
+		Username:    "user",
+		ControlPath: filepath.Join(dir, "ctrl-conn_1.sock"),
+	}
+	m.reconState["conn_1"] = &reconnectState{
+		phase:      reconnectFailed,
+		failReason: "auto-reconnect exhausted; please use ssh_disconnect and ssh_connect to re-establish the connection",
+	}
+
+	err := m.PreFlightCheck("conn_1")
+	if err == nil {
+		t.Fatal("expected error for failed reconnect")
+	}
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok || ce.Code != errorsx.CodeReconnectFailed {
+		t.Fatalf("expected RECONNECT_FAILED error, got %#v", err)
+	}
+}
+
+func TestReconnectState_InProgressWaitsAndResolves(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+	sockPath := filepath.Join(dir, "ctrl-conn_1.sock")
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "localhost",
+		Port:        22,
+		Username:    "user",
+		ControlPath: sockPath,
+	}
+	rs := &reconnectState{
+		phase: reconnectInProgress,
+	}
+	m.reconState["conn_1"] = rs
+
+	// Simulate reconnect completing after 500ms.
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		rs.mu.Lock()
+		rs.phase = reconnectSucceeded
+		rs.succeeded = true
+		rs.mu.Unlock()
+	}()
+
+	// PreFlightCheck will poll and find phase changed, then fall through
+	// to ssh -O check (which will fail since there's no real connection).
+	// The important thing is it doesn't return RECONNECT_FAILED.
+	err := m.PreFlightCheck("conn_1")
+	if err == nil {
+		t.Fatal("expected dead connection error (no real socket)")
+	}
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok {
+		t.Fatalf("expected CsshError, got %T", err)
+	}
+	// Should be CONNECTION_DEAD (no real socket), NOT RECONNECT_FAILED
+	if ce.Code == errorsx.CodeReconnectFailed {
+		t.Fatal("should not have returned RECONNECT_FAILED after phase resolved to succeeded")
+	}
+}
+
+func TestReconnectInfo_ConsumeOnce(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	m.reconState["conn_1"] = &reconnectState{
+		succeeded: true,
+		reason:    "network timeout",
+	}
+
+	reconnected, reason := m.ReconnectInfo("conn_1")
+	if !reconnected {
+		t.Fatal("expected reconnected=true")
+	}
+	if reason != "network timeout" {
+		t.Fatalf("expected reason 'network timeout', got %q", reason)
+	}
+
+	// Second call should return false (consumed).
+	reconnected2, _ := m.ReconnectInfo("conn_1")
+	if reconnected2 {
+		t.Fatal("expected reconnected=false on second call")
+	}
+}
+
+func TestReconnectInfo_NoState(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	reconnected, _ := m.ReconnectInfo("conn_nonexistent")
+	if reconnected {
+		t.Fatal("expected reconnected=false for nonexistent connection")
+	}
+}
+
+func TestHandleMasterDeath_ExhaustsAttempts(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "invalid.example.invalid",
+		Port:        22,
+		Username:    "user",
+		AuthMethod:  "key",
+		ControlPath: filepath.Join(dir, "ctrl-conn_1.sock"),
+	}
+	m.reconState["conn_1"] = &reconnectState{
+		maxAttempts: 1,
+		cooldown:    0,
+		attempts:    1, // already exhausted
+	}
+
+	m.handleMasterDeath("conn_1", "test death")
+
+	rs := m.reconState["conn_1"]
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.phase != reconnectFailed {
+		t.Fatalf("expected reconnectFailed, got %v", rs.phase)
+	}
+	if rs.failReason == "" {
+		t.Fatal("expected failReason to be set")
+	}
+}
+
+func TestHandleMasterDeath_CooldownNotElapsed(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "invalid.example.invalid",
+		Port:        22,
+		Username:    "user",
+		AuthMethod:  "key",
+		ControlPath: filepath.Join(dir, "ctrl-conn_1.sock"),
+	}
+	m.reconState["conn_1"] = &reconnectState{
+		maxAttempts: 1,
+		cooldown:    30 * time.Second,
+		attempts:    0,
+		lastAttempt: time.Now(), // just attempted
+	}
+
+	m.handleMasterDeath("conn_1", "test death")
+
+	rs := m.reconState["conn_1"]
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if rs.phase != reconnectFailed {
+		t.Fatalf("expected reconnectFailed due to cooldown, got %v", rs.phase)
+	}
+}
+
+func TestHandleMasterDeath_NoConnection(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	// Should not panic when connection doesn't exist.
+	m.handleMasterDeath("conn_nonexistent", "some reason")
+}
+
+func TestSetOnReconnect(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	var mu sync.Mutex
+	var called bool
+	var capturedID, capturedReason string
+	m.SetOnReconnect(func(connectionID, reason string) {
+		mu.Lock()
+		called = true
+		capturedID = connectionID
+		capturedReason = reason
+		mu.Unlock()
+	})
+
+	// Directly invoke the callback to verify it's wired.
+	if m.onReconnect != nil {
+		m.onReconnect("conn_test", "test reason")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !called {
+		t.Fatal("onReconnect callback was not called")
+	}
+	if capturedID != "conn_test" {
+		t.Fatalf("unexpected connectionID: %q", capturedID)
+	}
+	if capturedReason != "test reason" {
+		t.Fatalf("unexpected reason: %q", capturedReason)
+	}
+}
+
+func TestDisconnect_CleansUpAllMaps(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+
+	mh := &masterHandle{
+		cmd:  nil,
+		done: make(chan struct{}),
+	}
+	close(mh.done) // already exited
+
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "localhost",
+		Port:        22,
+		Username:    "user",
+		ControlPath: filepath.Join(dir, "ctrl-conn_1.sock"),
+	}
+	m.masters["conn_1"] = mh
+	m.reconState["conn_1"] = &reconnectState{}
+	m.sessions["sess_1"] = &model.Session{ID: "sess_1", ConnectionID: "conn_1"}
+
+	err := m.Disconnect("conn_1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.connections["conn_1"] != nil {
+		t.Fatal("connection not removed")
+	}
+	if m.masters["conn_1"] != nil {
+		t.Fatal("master not removed")
+	}
+	if m.reconState["conn_1"] != nil {
+		t.Fatal("reconState not removed")
+	}
+	if m.sessions["sess_1"] != nil {
+		t.Fatal("session not removed")
+	}
+}
+
+func TestShutdown_SetsIntentionalFlag(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManager(dir, "bash -lc", 30)
+
+	mh := &masterHandle{
+		cmd:  nil,
+		done: make(chan struct{}),
+	}
+	close(mh.done)
+
+	m.connections["conn_1"] = &model.Connection{
+		ID:          "conn_1",
+		Host:        "localhost",
+		Port:        22,
+		Username:    "user",
+		ControlPath: filepath.Join(dir, "ctrl-conn_1.sock"),
+	}
+	m.masters["conn_1"] = mh
+	m.reconState["conn_1"] = &reconnectState{}
+
+	m.Shutdown()
+
+	if !mh.intentional.Load() {
+		t.Fatal("intentional flag should be set after shutdown")
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.connections) != 0 {
+		t.Fatal("connections should be empty after shutdown")
+	}
+	if len(m.masters) != 0 {
+		t.Fatal("masters should be empty after shutdown")
 	}
 }

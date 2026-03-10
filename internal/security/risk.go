@@ -550,7 +550,7 @@ func UnwrapShellWrappers(cmd string) []string {
 var (
 	bashCRE = regexp.MustCompile(`(?:^|\s)(?:bash|sh)\s+-c\s+`)
 	evalRE  = regexp.MustCompile(`(?:^|\s)eval\s+`)
-	pipeSH  = regexp.MustCompile(`\|\s*(?:bash|sh)\s*$`)
+	pipeSH  = regexp.MustCompile(`\|\s*(?:sudo\s+)?(?:bash|sh)\s*$`)
 )
 
 func unwrapOnce(cmd string) []string {
