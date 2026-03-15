@@ -16,14 +16,40 @@ import (
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
 	"cssh/internal/resolve"
+	"cssh/internal/sshbridge"
 )
+
+const mcpInstructions = `Cssh provides secure SSH access to remote hosts via saved profiles.
+
+## Cnote — per-profile memory
+Each profile has a persistent Cnote (connection note). When you connect to a profile, the current Cnote content is returned automatically in the ssh_connect response (cnote / cnote_present fields).
+
+**When to read Cnote:** You do NOT need to call ssh_cnote(action=get) after connecting — the content is already in the connect response. Only call get if you want to re-check mid-session.
+
+**When to write Cnote:** Use ssh_cnote(action=append) to record useful information discovered during the session, such as:
+- User preferences or recurring instructions for this host (e.g. "user prefers apt over snap", "always check systemd logs first")
+- Environment quirks or notable configuration (e.g. "runs PostgreSQL 15 on non-standard port 5433", "custom deploy script at /opt/deploy/run.sh")
+- Operational context that future sessions should know (e.g. "last migration was v42, next is v43")
+
+Keep notes concise and factual. Do not duplicate information already in the profile metadata. Use append for incremental additions; use set only when a full rewrite is warranted.
+
+**When to follow Cnote:** If the Cnote contains instructions or preferences, treat them as standing guidance for the current session unless the user overrides them.
+
+## Filesystem operations
+Use ssh_exec with standard shell commands for filesystem exploration:
+- List directories: ls -la, find, tree
+- Search text: grep -rn, find ... -exec grep
+- Tail logs: tail -n, tail -f (with timeout_sec)
+- Check disk usage: df -h, du -sh`
 
 type Server struct {
 	svc     *app.Service
 	ctlPath string
+	out     io.Writer
 
 	seenInitialize    atomic.Bool
 	clientInitialized atomic.Bool
+	minLogLevel       atomic.Int32
 
 	writeMu    sync.Mutex
 	inflightMu sync.Mutex
@@ -32,11 +58,14 @@ type Server struct {
 }
 
 func NewServer(svc *app.Service) *Server {
-	return &Server{
+	s := &Server{
 		svc:      svc,
 		ctlPath:  resolve.QuotedPath(),
+		out:      os.Stdout,
 		inflight: map[string]context.CancelFunc{},
 	}
+	s.minLogLevel.Store(int32(loggingLevelInfo))
+	return s
 }
 
 type request struct {
@@ -58,6 +87,40 @@ type respError struct {
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
+
+type progressReporter struct {
+	server            *Server
+	token             any
+	flushInterval     time.Duration
+	heartbeatInterval time.Duration
+	started           time.Time
+
+	mu       sync.Mutex
+	pending  strings.Builder
+	lastSent time.Time
+	seq      int64
+	closed   bool
+}
+
+const (
+	progressFlushInterval     = 400 * time.Millisecond
+	progressHeartbeatInterval = 5 * time.Second
+	progressMaxMessageRunes   = 1600
+	progressTickInterval      = 250 * time.Millisecond
+)
+
+type loggingLevel int
+
+const (
+	loggingLevelDebug loggingLevel = iota
+	loggingLevelInfo
+	loggingLevelNotice
+	loggingLevelWarning
+	loggingLevelError
+	loggingLevelCritical
+	loggingLevelAlert
+	loggingLevelEmergency
+)
 
 func (s *Server) Run() error {
 	in := bufio.NewReader(os.Stdin)
@@ -148,12 +211,25 @@ func (s *Server) handleToolCall(ctx context.Context, req request, id any) respon
 	var p struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
+		Meta      map[string]any `json:"_meta"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
 		return rpcError(id, -32602, "invalid tools/call params", nil)
 	}
-	result, err := s.callToolWithContext(ctx, p.Name, p.Arguments)
+	reporter := newProgressReporter(s, p.Name, progressTokenFromParams(p.Meta, p.Arguments))
+	if reporter != nil {
+		reporter.Start(ctx)
+		defer reporter.Close()
+	}
+	var onProgress sshbridge.ExecProgressFn
+	if reporter != nil {
+		onProgress = reporter.OnProgress
+	}
+	result, err := s.callToolWithContext(ctx, p.Name, p.Arguments, onProgress)
 	if ctx.Err() != nil {
+		if reporter != nil {
+			reporter.Discard()
+		}
 		return rpcError(id, -32800, "request cancelled", map[string]any{"code": errorsx.CodeCancelled})
 	}
 	if err != nil {
@@ -179,9 +255,23 @@ func (s *Server) handle(req request, id any) response {
 		s.clientInitialized.Store(false)
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
 			"protocolVersion": "2025-11-25",
-			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"capabilities":    map[string]any{"tools": map[string]any{}, "logging": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "cssh-mcp", "version": "0.1.0"},
+			"instructions":    mcpInstructions,
 		}}
+	case "logging/setLevel":
+		var p struct {
+			Level string `json:"level"`
+		}
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return rpcError(id, -32602, "invalid logging/setLevel params", nil)
+		}
+		level, ok := parseLoggingLevel(p.Level)
+		if !ok {
+			return rpcError(id, -32602, "invalid logging/setLevel params", map[string]any{"level": p.Level})
+		}
+		s.minLogLevel.Store(int32(level))
+		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{}}
 	case "ping":
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{}}
 	case "tools/list":
@@ -194,7 +284,7 @@ func (s *Server) handle(req request, id any) response {
 func (s *Server) writeResponse(res response) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return writeMessage(os.Stdout, res)
+	return writeMessage(s.out, res)
 }
 
 func (s *Server) cancelAllInflight() {
@@ -218,7 +308,7 @@ func (s *Server) waitInflight(timeout time.Duration) {
 }
 
 // callToolWithContext is the context-aware entry point for tool calls.
-func (s *Server) callToolWithContext(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
+func (s *Server) callToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -227,7 +317,7 @@ func (s *Server) callToolWithContext(ctx context.Context, name string, args map[
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
 	args = applyToolAliasDefaults(args, deprecatedFrom)
-	result, err := s.callCanonicalToolWithContext(ctx, canonicalName, args)
+	result, err := s.callCanonicalToolWithContext(ctx, canonicalName, args, onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +330,7 @@ func (s *Server) callToolWithContext(ctx context.Context, name string, args map[
 // callCanonicalToolWithContext dispatches to the appropriate service method.
 // For ssh_exec, ctx is propagated for cancellation support.
 // For other tools, ctx.Err() is checked at entry as a fast-fail.
-func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, args map[string]any) (map[string]any, error) {
+func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	// Fast-fail if already cancelled (covers all tools)
 	if ctx.Err() != nil {
 		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
@@ -256,7 +346,7 @@ func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, 
 		if err != nil {
 			return nil, err
 		}
-		return s.svc.ExecWithContext(ctx, connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"))
+		return s.svc.ExecWithProgress(ctx, connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"), onProgress)
 	default:
 		return s.callCanonicalTool(name, args)
 	}
@@ -320,14 +410,23 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		return s.svc.Exec(connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"))
 	case "ssh_connection_status":
 		return s.svc.ConnectionStatus(stringArg(args, "connection_id"), app.ParseIntAny(args["timeout_sec"], 5))
-	case "ssh_privilege_status":
-		return s.svc.PrivilegeStatus(stringArg(args, "connection_id"), app.ParseBoolAny(args["active_only"], true))
-	case "ssh_privilege_revoke":
-		grantID, err := app.RequireString(args, "grant_id")
-		if err != nil {
-			return nil, err
+	case "ssh_privilege":
+		action := strings.ToLower(stringArg(args, "action"))
+		if action == "" {
+			action = "status"
 		}
-		return s.svc.RevokePrivilege(grantID)
+		switch action {
+		case "status":
+			return s.svc.PrivilegeStatus(stringArg(args, "connection_id"), app.ParseBoolAny(args["active_only"], true))
+		case "revoke":
+			grantID, err := app.RequireString(args, "grant_id")
+			if err != nil {
+				return nil, err
+			}
+			return s.svc.RevokePrivilege(grantID)
+		default:
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "action must be one of: status, revoke")
+		}
 	case "ssh_transfer":
 		direction := stringArg(args, "direction")
 		if direction == "" {
@@ -413,40 +512,6 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			baseDir = "/"
 		}
 		return s.svc.ApplyPatch(connID, patch, baseDir)
-	case "ssh_list_dir":
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		p, err := app.RequireString(args, "path")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.ListDir(connID, p, app.ParseIntAny(args["depth"], 1), stringArg(args, "cwd"))
-	case "ssh_search_text":
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		p, err := app.RequireString(args, "path")
-		if err != nil {
-			return nil, err
-		}
-		pattern, err := app.RequireString(args, "pattern")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.SearchText(connID, p, pattern, stringArg(args, "glob"), app.ParseIntAny(args["limit"], 50), stringArg(args, "cwd"))
-	case "ssh_tail_log":
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		p, err := app.RequireString(args, "path")
-		if err != nil {
-			return nil, err
-		}
-		return s.svc.TailLog(connID, p, app.ParseIntAny(args["lines"], 200), stringArg(args, "cwd"))
 	case "ssh_disconnect":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -470,6 +535,13 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "action must be one of: list, delete")
 		}
+	case "ssh_cnote":
+		return s.svc.Cnote(
+			stringArg(args, "action"),
+			stringArg(args, "profile_id"),
+			stringArg(args, "profile_name"),
+			stringArg(args, "content"),
+		)
 	case "ssh_profile_setup":
 		step := strings.ToLower(stringArg(args, "step"))
 		if step == "" {
@@ -537,17 +609,14 @@ var canonicalToolNames = map[string]struct{}{
 	"ssh_open_session":       {},
 	"ssh_exec":               {},
 	"ssh_connection_status":  {},
-	"ssh_privilege_status":   {},
-	"ssh_privilege_revoke":   {},
+	"ssh_privilege":          {},
 	"ssh_transfer":           {},
 	"ssh_read_file":          {},
 	"ssh_write_file":         {},
 	"ssh_apply_patch":        {},
-	"ssh_list_dir":           {},
-	"ssh_search_text":        {},
-	"ssh_tail_log":           {},
-	"ssh_disconnect":         {},
+"ssh_disconnect":         {},
 	"ssh_profile":            {},
+	"ssh_cnote":              {},
 	"ssh_profile_setup":      {},
 	"ssh_credentials_prompt": {},
 }
@@ -560,6 +629,8 @@ var toolAliases = map[string]string{
 	"ssh_quick_setup_template": "ssh_profile_setup",
 	"ssh_quick_setup_save":     "ssh_profile_setup",
 	"ssh_sudo_password_prompt": "ssh_credentials_prompt",
+	"ssh_privilege_status":     "ssh_privilege",
+	"ssh_privilege_revoke":     "ssh_privilege",
 }
 
 func resolveToolAlias(name string) (canonicalName, deprecatedFrom string, ok bool) {
@@ -611,6 +682,14 @@ func applyToolAliasDefaults(args map[string]any, deprecatedFrom string) map[stri
 		}
 		if stringArg(out, "prompt_mode") == "" {
 			out["prompt_mode"] = "web"
+		}
+	case "ssh_privilege_status":
+		if stringArg(out, "action") == "" {
+			out["action"] = "status"
+		}
+	case "ssh_privilege_revoke":
+		if stringArg(out, "action") == "" {
+			out["action"] = "revoke"
 		}
 	}
 	return out
@@ -713,7 +792,7 @@ func readMessage(r *bufio.Reader) ([]byte, error) {
 	}
 }
 
-func writeMessage(w io.Writer, payload response) error {
+func writeMessage(w io.Writer, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -723,92 +802,370 @@ func writeMessage(w io.Writer, payload response) error {
 	return err
 }
 
+func newProgressReporter(s *Server, toolName string, token any) *progressReporter {
+	if s == nil || toolName != "ssh_exec" {
+		return nil
+	}
+	now := time.Now()
+	return &progressReporter{
+		server:            s,
+		token:             token,
+		flushInterval:     progressFlushInterval,
+		heartbeatInterval: progressHeartbeatInterval,
+		started:           now,
+		lastSent:          now,
+	}
+}
+
+func progressTokenFromParams(meta map[string]any, args map[string]any) any {
+	token, ok := progressTokenFromMeta(meta)
+	if ok {
+		return token
+	}
+	if nested, ok := args["_meta"].(map[string]any); ok {
+		token, ok = progressTokenFromMeta(nested)
+		if ok {
+			return token
+		}
+	}
+	return nil
+}
+
+func progressTokenFromMeta(meta map[string]any) (any, bool) {
+	if len(meta) == 0 {
+		return nil, false
+	}
+	token, ok := meta["progressToken"]
+	if !ok {
+		return nil, false
+	}
+	switch token.(type) {
+	case string, float64, int, int32, int64, uint, uint32, uint64:
+		return token, true
+	default:
+		return nil, false
+	}
+}
+
+func (r *progressReporter) Start(ctx context.Context) {
+	if r == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(progressTickInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if msg, ok := r.nextTickMessage(); ok {
+					r.emit(msg)
+				}
+			}
+		}
+	}()
+}
+
+func (r *progressReporter) OnProgress(p sshbridge.ExecProgress) {
+	if r == nil {
+		return
+	}
+	if msg, ok := r.appendChunk(normalizeProgressChunk(p.Stream, p.Chunk)); ok {
+		r.emit(msg)
+	}
+}
+
+func (r *progressReporter) Close() {
+	if r == nil {
+		return
+	}
+	if msg, ok := r.closePending(); ok {
+		r.emit(msg)
+	}
+}
+
+func (r *progressReporter) Discard() {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closed = true
+	r.pending.Reset()
+}
+
+func (r *progressReporter) appendChunk(chunk string) (string, bool) {
+	if chunk == "" {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return "", false
+	}
+	r.pending.WriteString(chunk)
+	if countRunes(r.pending.String()) < progressMaxMessageRunes {
+		return "", false
+	}
+	msg := truncateProgressMessage(r.pending.String())
+	r.pending.Reset()
+	r.lastSent = time.Now()
+	return msg, true
+}
+
+func (r *progressReporter) nextTickMessage() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return "", false
+	}
+	now := time.Now()
+	if r.pending.Len() > 0 && now.Sub(r.lastSent) >= r.flushInterval {
+		msg := truncateProgressMessage(r.pending.String())
+		r.pending.Reset()
+		r.lastSent = now
+		return msg, true
+	}
+	if r.pending.Len() == 0 && now.Sub(r.lastSent) >= r.heartbeatInterval {
+		r.lastSent = now
+		return fmt.Sprintf("Command still running (%s elapsed).", formatElapsed(now.Sub(r.started))), true
+	}
+	return "", false
+}
+
+func (r *progressReporter) closePending() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return "", false
+	}
+	r.closed = true
+	if r.pending.Len() == 0 {
+		return "", false
+	}
+	msg := truncateProgressMessage(r.pending.String())
+	r.pending.Reset()
+	return msg, true
+}
+
+func (r *progressReporter) emit(message string) {
+	if r == nil || strings.TrimSpace(message) == "" {
+		return
+	}
+	if r.token == nil {
+		if !r.server.shouldEmitLogLevel(loggingLevelInfo) {
+			return
+		}
+		payload := map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "notifications/message",
+			"params": map[string]any{
+				"level":  loggingLevelName(loggingLevelInfo),
+				"logger": "ssh_exec",
+				"data":   message,
+			},
+		}
+		r.server.writeMu.Lock()
+		defer r.server.writeMu.Unlock()
+		_ = writeMessage(r.server.out, payload)
+		return
+	}
+	r.mu.Lock()
+	r.seq++
+	progress := r.seq
+	r.mu.Unlock()
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/progress",
+		"params": map[string]any{
+			"progressToken": r.token,
+			"progress":      progress,
+			"message":       message,
+		},
+	}
+	r.server.writeMu.Lock()
+	defer r.server.writeMu.Unlock()
+	_ = writeMessage(r.server.out, payload)
+}
+
+func (s *Server) shouldEmitLogLevel(level loggingLevel) bool {
+	return level >= loggingLevel(s.minLogLevel.Load())
+}
+
+func parseLoggingLevel(level string) (loggingLevel, bool) {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "debug":
+		return loggingLevelDebug, true
+	case "info":
+		return loggingLevelInfo, true
+	case "notice":
+		return loggingLevelNotice, true
+	case "warning":
+		return loggingLevelWarning, true
+	case "error":
+		return loggingLevelError, true
+	case "critical":
+		return loggingLevelCritical, true
+	case "alert":
+		return loggingLevelAlert, true
+	case "emergency":
+		return loggingLevelEmergency, true
+	default:
+		return 0, false
+	}
+}
+
+func loggingLevelName(level loggingLevel) string {
+	switch level {
+	case loggingLevelDebug:
+		return "debug"
+	case loggingLevelInfo:
+		return "info"
+	case loggingLevelNotice:
+		return "notice"
+	case loggingLevelWarning:
+		return "warning"
+	case loggingLevelError:
+		return "error"
+	case loggingLevelCritical:
+		return "critical"
+	case loggingLevelAlert:
+		return "alert"
+	case loggingLevelEmergency:
+		return "emergency"
+	default:
+		return "info"
+	}
+}
+
+func normalizeProgressChunk(_ string, chunk string) string {
+	if chunk == "" {
+		return ""
+	}
+	chunk = strings.ReplaceAll(chunk, "\r\n", "\n")
+	chunk = strings.ReplaceAll(chunk, "\r", "\n")
+	return chunk
+}
+
+func truncateProgressMessage(msg string) string {
+	msg = strings.Trim(msg, "\n")
+	if msg == "" {
+		return ""
+	}
+	runes := []rune(msg)
+	if len(runes) <= progressMaxMessageRunes {
+		return msg
+	}
+	return "...\n" + string(runes[len(runes)-progressMaxMessageRunes:])
+}
+
+func countRunes(s string) int {
+	return len([]rune(s))
+}
+
+func formatElapsed(d time.Duration) string {
+	if d < time.Minute {
+		seconds := int(d.Round(time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		return fmt.Sprintf("%ds", seconds)
+	}
+	minutes := int(d / time.Minute)
+	seconds := int((d % time.Minute) / time.Second)
+	return fmt.Sprintf("%dm%02ds", minutes, seconds)
+}
+
 func toolDefs(ctlPath string) []map[string]any {
 	return []map[string]any{
 		tool(
 			"ssh_connect",
 			"Create an SSH connection and return connection_id. Workflow: ssh_profile_setup(step=template/save) or ssh_profile(action=list) -> ssh_connect -> optional ssh_open_session -> ssh_exec. Profile-based connect is the default policy. Optional limit_dir can narrow runtime access to a specific subdirectory.",
 			connectSchema(),
+			mutatingAnnotations("Connect to SSH Host", true),
 		),
 		tool(
 			"ssh_open_session",
 			"Create a reusable shell session bound to an existing connection_id. Optional cwd/shell let later ssh_exec calls reuse context.",
 			reqSchema([]string{"connection_id"}, "connection_id", "cwd", "shell"),
+			mutatingAnnotations("Open Shell Session", false),
 		),
 		tool(
 			"ssh_exec",
 			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. Catastrophic commands (rm -rf /, fork bombs) are hard-denied. Dangerous commands (mkfs, shutdown) return approval_required. When approval_required is returned, the user must run `"+ctlPath+" approve <id>` in a separate terminal, then retry with approval_token.",
 			reqSchema([]string{"connection_id", "command"}, "connection_id", "command", "session_id", "cwd", "timeout_sec", "approval_token"),
+			mutatingAnnotations("Execute Remote Command", true),
 		),
 		tool(
 			"ssh_connection_status",
 			"Inspect SSH connection health. Optional connection_id targets one connection; without it returns all active in-memory connections. Optional timeout_sec controls health-check timeout.",
 			reqSchema(nil, "connection_id", "timeout_sec"),
+			readOnlyAnnotations("Check Connection Health", false),
 		),
 		tool(
-			"ssh_privilege_status",
-			"Inspect privilege grants. Optional connection_id narrows to one connection. active_only defaults true.",
-			reqSchema(nil, "connection_id", "active_only"),
-		),
-		tool(
-			"ssh_privilege_revoke",
-			"Revoke an active privilege grant immediately. Requires grant_id.",
-			reqSchema([]string{"grant_id"}, "grant_id"),
+			"ssh_privilege",
+			"Manage privilege grants. action=status (default) inspects grants, optional connection_id narrows scope, active_only defaults true. action=revoke revokes a grant immediately by grant_id.",
+			privilegeSchema(),
+			mutatingAnnotations("Manage Privilege Grants", false),
 		),
 		tool(
 			"ssh_transfer",
 			"Transfer file using scp client with existing connection_id. Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
 			transferSchema(),
+			destructiveAnnotations("Transfer File via SCP", true),
 		),
 		tool(
 			"ssh_read_file",
 			"Read remote file content (workspace_roots guarded). Requires connection_id + path; supports max_bytes truncation.",
 			reqSchema([]string{"connection_id", "path"}, "connection_id", "path", "max_bytes", "cwd"),
+			readOnlyAnnotations("Read Remote File", true),
 		),
 		tool(
 			"ssh_write_file",
 			"Write remote file content inside workspace_roots. Requires connection_id/path/content; mode supports create|overwrite|append.",
 			reqSchema([]string{"connection_id", "path", "content"}, "connection_id", "path", "content", "mode", "cwd"),
+			destructiveAnnotations("Write Remote File", true),
 		),
 		tool(
 			"ssh_apply_patch",
 			"Apply unified patch via patch(1) on remote host. Requires connection_id + patch_unified; base_dir defaults to '/'.",
 			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir"),
-		),
-		tool(
-			"ssh_list_dir",
-			"List remote directory entries (workspace_roots guarded). Requires connection_id + path; optional depth controls recursion.",
-			reqSchema([]string{"connection_id", "path"}, "connection_id", "path", "depth", "cwd"),
-		),
-		tool(
-			"ssh_search_text",
-			"Search text in remote files. Requires connection_id/path/pattern. Optional glob and limit narrow results.",
-			reqSchema([]string{"connection_id", "path", "pattern"}, "connection_id", "path", "pattern", "glob", "limit", "cwd"),
-		),
-		tool(
-			"ssh_tail_log",
-			"Tail remote log file content. Requires connection_id + path; optional lines defaults to 200.",
-			reqSchema([]string{"connection_id", "path"}, "connection_id", "path", "lines", "cwd"),
+			destructiveAnnotations("Apply Patch on Remote", true),
 		),
 		tool(
 			"ssh_disconnect",
 			"Close an SSH connection and attached sessions. Requires connection_id.",
 			reqSchema([]string{"connection_id"}, "connection_id"),
+			annotations("Disconnect SSH", false, true, true, false),
 		),
 		tool(
 			"ssh_profile",
 			"Unified profile operations. action=list returns saved SSH profiles. action=delete deletes one profile by profile_id using confirmation token flow (first call returns confirm_required + confirm_token; second call includes confirm_token). Optional delete_secrets (default true) also removes password/key_passphrase/sudo_password from keychain.",
 			profileSchema(),
+			mutatingAnnotations("Manage SSH Profiles", false),
+		),
+		tool(
+			"ssh_cnote",
+			"Manage per-profile Cnote (connection note) — a persistent, per-profile scratchpad for the AI. "+
+				"Use it to record observations, user preferences, environment quirks, or recurring instructions specific to this profile so that future sessions can pick up where you left off. "+
+				"action=get reads the current Cnote. action=set overwrites it. action=append adds a new block (preferred for incremental notes). action=clear empties it. "+
+				"The Cnote is automatically returned in ssh_connect responses; you do not need to call get after connecting. "+
+				"Use profile_id when possible; profile_name is supported if unique.",
+			cnoteSchema(),
+			mutatingAnnotations("Manage Connection Notes", false),
 		),
 		tool(
 			"ssh_profile_setup",
 			"Unified quick setup flow. step=template returns onboarding form template. step=save persists SSH profile metadata. For save step, provide purpose/host/username plus optional profile/workspace/auth/security fields. After save, call ssh_credentials_prompt for credential entry.",
 			profileSetupSchema(),
+			mutatingAnnotations("Setup SSH Profile", false),
 		),
 		tool(
 			"ssh_credentials_prompt",
 			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual `"+ctlPath+" secret set-*` commands with profile_id. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
+			mutatingAnnotations("Enter SSH Credentials", false),
 		),
 	}
 }
@@ -873,8 +1230,36 @@ func transferSchema() map[string]any {
 	}
 }
 
+func privilegeSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":        map[string]any{"type": "string", "enum": []string{"status", "revoke"}, "description": "Privilege action. status lists grants. revoke requires grant_id."},
+			"connection_id": paramSchema("connection_id"),
+			"active_only":   paramSchema("active_only"),
+			"grant_id":      paramSchema("grant_id"),
+		},
+	}
+}
+
 func profileSchema() map[string]any {
 	return reqSchema(nil, "action", "profile_id", "delete_secrets", "confirm_token")
+}
+
+func cnoteSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action": map[string]any{
+				"type":        "string",
+				"enum":        []string{"get", "set", "append", "clear"},
+				"description": "Cnote action. get reads the current Cnote. set overwrites it. append adds a new block. clear empties it.",
+			},
+			"profile_id":   paramSchema("profile_id"),
+			"profile_name": paramSchema("profile_name"),
+			"content":      paramSchema("content"),
+		},
+	}
 }
 
 func profileSetupSchema() map[string]any {
@@ -996,6 +1381,33 @@ func paramSchema(key string) map[string]any {
 	}
 }
 
-func tool(name, desc string, input map[string]any) map[string]any {
-	return map[string]any{"name": name, "description": desc, "inputSchema": input}
+func tool(name, desc string, input map[string]any, ann ...map[string]any) map[string]any {
+	t := map[string]any{"name": name, "description": desc, "inputSchema": input}
+	if len(ann) > 0 && ann[0] != nil {
+		t["annotations"] = ann[0]
+	}
+	return t
+}
+
+// annotations builds an MCP tool annotations object (MCP spec 2025-03-26).
+func annotations(title string, readOnly, destructive, idempotent, openWorld bool) map[string]any {
+	return map[string]any{
+		"title":           title,
+		"readOnlyHint":    readOnly,
+		"destructiveHint": destructive,
+		"idempotentHint":  idempotent,
+		"openWorldHint":   openWorld,
+	}
+}
+
+func readOnlyAnnotations(title string, openWorld bool) map[string]any {
+	return annotations(title, true, false, true, openWorld)
+}
+
+func mutatingAnnotations(title string, openWorld bool) map[string]any {
+	return annotations(title, false, false, false, openWorld)
+}
+
+func destructiveAnnotations(title string, openWorld bool) map[string]any {
+	return annotations(title, false, true, false, openWorld)
 }

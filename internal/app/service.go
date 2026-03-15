@@ -33,6 +33,7 @@ import (
 type Service struct {
 	cfg       model.Config
 	profiles  *store.ProfileStore
+	cnotes    *store.ProfileNoteStore
 	secrets   store.SecretStore
 	approvals *approvals.Store
 	grants    *approvals.GrantStore
@@ -52,6 +53,7 @@ func NewService(cfg model.Config) *Service {
 	svc := &Service{
 		cfg:          cfg,
 		profiles:     store.NewProfileStore(cfg.ProfilesFile),
+		cnotes:       store.NewProfileNoteStore(cfg.RuntimeDir),
 		secrets:      store.NewSecretStore(),
 		approvals:    approvals.NewStore(pathJoin(cfg.RuntimeDir, "approvals.jsonl")),
 		grants:       approvals.NewGrantStore(pathJoin(cfg.RuntimeDir, "grants.json")),
@@ -93,10 +95,49 @@ func pathJoin(a, b string) string {
 	return a + "/" + b
 }
 
-func (s *Service) ProfileStore() *store.ProfileStore { return s.profiles }
-func (s *Service) SecretStore() store.SecretStore    { return s.secrets }
-func (s *Service) Approvals() *approvals.Store       { return s.approvals }
-func (s *Service) Grants() *approvals.GrantStore     { return s.grants }
+func (s *Service) ensureProfileCnotePath(profile *model.Profile) string {
+	if strings.TrimSpace(profile.NotePath) == "" {
+		profile.NotePath = s.cnotes.ResolvePath(profile.ID)
+	}
+	return profile.NotePath
+}
+
+func (s *Service) persistProfileCnotePath(profile *model.Profile) error {
+	if profile == nil {
+		return nil
+	}
+	if strings.TrimSpace(profile.NotePath) != "" {
+		return nil
+	}
+	profile.NotePath = s.cnotes.ResolvePath(profile.ID)
+	return s.profiles.Upsert(*profile)
+}
+
+func (s *Service) readProfileCnote(profile *model.Profile) (string, string, error) {
+	path := s.ensureProfileCnotePath(profile)
+	if err := s.cnotes.Ensure(path); err != nil {
+		return "", "", err
+	}
+	content, err := s.cnotes.Read(path)
+	if err != nil {
+		return "", "", err
+	}
+	return path, strings.TrimRight(content, "\n"), nil
+}
+
+func cnotePreview(content string) string {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(content, "\n", " "))
+	if len(trimmed) <= 120 {
+		return trimmed
+	}
+	return trimmed[:120] + "..."
+}
+
+func (s *Service) ProfileStore() *store.ProfileStore   { return s.profiles }
+func (s *Service) CnoteStore() *store.ProfileNoteStore { return s.cnotes }
+func (s *Service) SecretStore() store.SecretStore      { return s.secrets }
+func (s *Service) Approvals() *approvals.Store         { return s.approvals }
+func (s *Service) Grants() *approvals.GrantStore       { return s.grants }
 
 func (s *Service) AuditToolCall(tool, status, detail string) {
 	tool = strings.TrimSpace(tool)
@@ -142,6 +183,17 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		"workspace_roots":  conn.WorkspaceRoots,
 		"security_profile": conn.SecurityProfile,
 	}
+	if strings.TrimSpace(conn.ProfileID) != "" {
+		resp["cnote_path"] = conn.CnotePath
+		resp["cnote"] = conn.Cnote
+		cnotePresent := strings.TrimSpace(conn.Cnote) != ""
+		resp["cnote_present"] = cnotePresent
+		if cnotePresent {
+			resp["cnote_hint"] = "This profile has a Cnote — follow the instructions/preferences within. Use ssh_cnote(action=append) to add new observations during this session."
+		} else {
+			resp["cnote_hint"] = "This profile has no Cnote yet. If you discover useful preferences, environment details, or recurring patterns during this session, consider recording them with ssh_cnote(action=append) so future sessions benefit."
+		}
+	}
 	if strings.TrimSpace(conn.LimitDir) != "" {
 		resp["limit_dir"] = conn.LimitDir
 	}
@@ -173,6 +225,10 @@ func (s *Service) Exec(connectionID, sessionID, command, cwd string, timeoutSec 
 }
 
 func (s *Service) ExecWithContext(ctx context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string) (map[string]any, error) {
+	return s.ExecWithProgress(ctx, connectionID, sessionID, command, cwd, timeoutSec, approvalToken, nil)
+}
+
+func (s *Service) ExecWithProgress(ctx context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, approvalToken string, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	if ctx.Err() != nil {
 		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
 	}
@@ -245,7 +301,7 @@ func (s *Service) ExecWithContext(ctx context.Context, connectionID, sessionID, 
 		}
 	}
 
-	res, err := s.ssh.ExecWithInputCtx(ctx, connectionID, sessionID, runCommand, cwd, timeoutSec, runInput)
+	res, err := s.ssh.ExecWithProgressCtx(ctx, connectionID, sessionID, runCommand, cwd, timeoutSec, runInput, onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -387,8 +443,8 @@ func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[str
 				}
 				return g.ExpiresAt.Format(time.RFC3339)
 			}(),
-			"approved_by":           g.ApprovedBy,
-			"source":                g.Source,
+			"approved_by": g.ApprovedBy,
+			"source":      g.Source,
 		})
 	}
 	resp := map[string]any{"grants": out}
@@ -871,147 +927,6 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[st
 	return resp, nil
 }
 
-func (s *Service) ListDir(connectionID, dir string, depth int, cwd string) (map[string]any, error) {
-	traceID := util.NewID("trace")
-	conn, err := s.ssh.GetConnection(connectionID)
-	if err != nil {
-		return nil, err
-	}
-	if depth <= 0 {
-		depth = 1
-	}
-	resolved := s.resolveAndCheckPath(conn, dir, cwd)
-	if resolved == "" {
-		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
-	}
-	cmd := "find " + util.ShellQuote(resolved) + " -mindepth 1 -maxdepth " + strconv.Itoa(depth) + " -print"
-	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
-	if err != nil {
-		return nil, err
-	}
-	if res.ExitCode != 0 {
-		return nil, commandResultError(res, "list directory failed")
-	}
-	lines := splitNonEmpty(res.Stdout)
-	entries := make([]map[string]any, 0, len(lines))
-	for _, it := range lines {
-		entries = append(entries, map[string]any{"path": it})
-	}
-	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_list_dir",
-		ConnectionID: connectionID,
-		FilePath:     resolved,
-		Status:       "ok",
-	})
-	resp := map[string]any{"entries": entries}
-	s.enrichWithReconnectInfo(resp, connectionID)
-	return resp, nil
-}
-
-func (s *Service) SearchText(connectionID, basePath, pattern, glob string, limit int, cwd string) (map[string]any, error) {
-	traceID := util.NewID("trace")
-	conn, err := s.ssh.GetConnection(connectionID)
-	if err != nil {
-		return nil, err
-	}
-	if limit <= 0 {
-		limit = 50
-	}
-	resolved := s.resolveAndCheckPath(conn, basePath, cwd)
-	if resolved == "" {
-		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
-	}
-	var cmd string
-	if glob == "" {
-		cmd = strings.Join([]string{
-			"set -o pipefail",
-			"grep -R -n -E -- " + util.ShellQuote(pattern) + " " + util.ShellQuote(resolved) + " | head -n " + strconv.Itoa(limit),
-			"rc=$?",
-			"if [ \"$rc\" -eq 1 ] || [ \"$rc\" -eq 141 ]; then exit 0; fi",
-			"exit \"$rc\"",
-		}, "; ")
-	} else {
-		cmd = strings.Join([]string{
-			"set -o pipefail",
-			"find " + util.ShellQuote(resolved) + " -type f -name " + util.ShellQuote(glob) + " -exec grep -n -E -- " + util.ShellQuote(pattern) + " {} + | head -n " + strconv.Itoa(limit),
-			"rc=$?",
-			"if [ \"$rc\" -eq 1 ] || [ \"$rc\" -eq 141 ]; then exit 0; fi",
-			"exit \"$rc\"",
-		}, "; ")
-	}
-	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
-	if err != nil {
-		return nil, err
-	}
-	if res.ExitCode != 0 {
-		return nil, commandResultError(res, "search text failed")
-	}
-	matches := make([]map[string]any, 0)
-	for _, line := range splitNonEmpty(res.Stdout) {
-		// format: file:line:snippet
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) < 3 {
-			continue
-		}
-		ln, _ := strconv.Atoi(parts[1])
-		matches = append(matches, map[string]any{
-			"file":    parts[0],
-			"line":    ln,
-			"snippet": parts[2],
-		})
-		if len(matches) >= limit {
-			break
-		}
-	}
-	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_search_text",
-		ConnectionID: connectionID,
-		FilePath:     resolved,
-		Status:       "ok",
-	})
-	resp := map[string]any{"matches": matches}
-	s.enrichWithReconnectInfo(resp, connectionID)
-	return resp, nil
-}
-
-func (s *Service) TailLog(connectionID, filePath string, lines int, cwd string) (map[string]any, error) {
-	traceID := util.NewID("trace")
-	conn, err := s.ssh.GetConnection(connectionID)
-	if err != nil {
-		return nil, err
-	}
-	if lines <= 0 {
-		lines = 200
-	}
-	resolved := s.resolveAndCheckPath(conn, filePath, cwd)
-	if resolved == "" {
-		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
-	}
-	cmd := "tail -n " + strconv.Itoa(lines) + " " + util.ShellQuote(resolved)
-	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
-	if err != nil {
-		return nil, err
-	}
-	if res.ExitCode != 0 {
-		return nil, commandResultError(res, "tail log failed")
-	}
-	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_tail_log",
-		ConnectionID: connectionID,
-		FilePath:     resolved,
-		Status:       "ok",
-	})
-	resp := map[string]any{"content": res.Stdout}
-	s.enrichWithReconnectInfo(resp, connectionID)
-	return resp, nil
-}
-
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	host := ""
@@ -1082,7 +997,6 @@ func ensureLocalPathAllowed(localPath string, allowLocalAnywhere bool) error {
 	}
 	return nil
 }
-
 
 func (s *Service) remotePathExists(connectionID, remotePath string) (bool, error) {
 	res, err := s.ssh.Exec(connectionID, "", "test -e "+util.ShellQuote(remotePath), "", 30)
@@ -1307,18 +1221,6 @@ func (s *Service) writeTransferAudit(traceID, typ, connectionID, host, filePath,
 		Detail:       detail,
 		DurationMS:   durationMS,
 	})
-}
-
-func splitNonEmpty(s string) []string {
-	parts := strings.Split(s, "\n")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
 
 func commandResultError(res sshbridge.ExecResult, fallback string) error {
@@ -1596,6 +1498,10 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		if err != nil {
 			return model.Connection{}, err
 		}
+		cnotePath, cnote, err := s.readProfileCnote(p)
+		if err != nil {
+			return model.Connection{}, err
+		}
 		maxAutoRisk := p.MaxAutoRisk
 		if strings.TrimSpace(maxAutoRisk) == "" && strings.EqualFold(securityProfile, "ops_strict") {
 			maxAutoRisk = "L1"
@@ -1620,6 +1526,8 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 			AllowDiskOps:    p.AllowDiskOps,
 			DenyPatterns:    append([]string{}, p.DenyPatterns...),
 			GrantTTLSec:     p.GrantTTLSec,
+			CnotePath:       cnotePath,
+			Cnote:           cnote,
 		}, nil
 	}
 

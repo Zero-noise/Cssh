@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"cssh/internal/app"
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/sshbridge"
 )
 
 func findToolDef(t *testing.T, name string) map[string]any {
@@ -178,29 +180,27 @@ func TestSSHTransferSchema(t *testing.T) {
 }
 
 func TestPrivilegeToolsSchema(t *testing.T) {
-	statusTool := findToolDef(t, "ssh_privilege_status")
-	statusSchema, ok := statusTool["inputSchema"].(map[string]any)
+	tool := findToolDef(t, "ssh_privilege")
+	schema, ok := tool["inputSchema"].(map[string]any)
 	if !ok {
 		t.Fatalf("inputSchema missing")
 	}
-	statusProps, ok := statusSchema["properties"].(map[string]any)
+	props, ok := schema["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	for _, k := range []string{"connection_id", "active_only"} {
-		if _, exists := statusProps[k]; !exists {
-			t.Fatalf("ssh_privilege_status missing %s", k)
-		}
-	}
-
-	revokeTool := findToolDef(t, "ssh_privilege_revoke")
-	revokeSchema, ok := revokeTool["inputSchema"].(map[string]any)
+	actionProp, ok := props["action"].(map[string]any)
 	if !ok {
-		t.Fatalf("inputSchema missing")
+		t.Fatalf("ssh_privilege should include action")
 	}
-	req := requiredAsAny(t, revokeSchema)
-	if !containsString(req, "grant_id") {
-		t.Fatalf("ssh_privilege_revoke should require grant_id")
+	actionEnum := toAnySlice(actionProp["enum"])
+	if !containsString(actionEnum, "status") || !containsString(actionEnum, "revoke") {
+		t.Fatalf("ssh_privilege action enum should include status/revoke: %#v", actionEnum)
+	}
+	for _, k := range []string{"connection_id", "active_only", "grant_id"} {
+		if _, exists := props[k]; !exists {
+			t.Fatalf("ssh_privilege should include %s", k)
+		}
 	}
 }
 
@@ -225,6 +225,33 @@ func TestProfileToolsSchema(t *testing.T) {
 	for _, k := range []string{"profile_id", "delete_secrets", "confirm_token"} {
 		if _, exists := profileProps[k]; !exists {
 			t.Fatalf("ssh_profile should include %s", k)
+		}
+	}
+}
+
+func TestCnoteToolSchema(t *testing.T) {
+	tool := findToolDef(t, "ssh_cnote")
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	actionProp, ok := props["action"].(map[string]any)
+	if !ok {
+		t.Fatalf("ssh_cnote should include action")
+	}
+	actionEnum := toAnySlice(actionProp["enum"])
+	for _, want := range []string{"get", "set", "append", "clear"} {
+		if !containsString(actionEnum, want) {
+			t.Fatalf("ssh_cnote action enum should include %s: %#v", want, actionEnum)
+		}
+	}
+	for _, k := range []string{"profile_id", "profile_name", "content"} {
+		if _, exists := props[k]; !exists {
+			t.Fatalf("ssh_cnote should include %s", k)
 		}
 	}
 }
@@ -293,6 +320,19 @@ func TestInitializedNotificationGate(t *testing.T) {
 	s.handleNotification(request{Method: "notifications/initialized"})
 	if !s.clientInitialized.Load() {
 		t.Fatalf("client should be initialized after notification")
+	}
+
+	initRes := s.handle(request{Method: "initialize"}, 2)
+	result, ok := initRes.Result.(map[string]any)
+	if !ok {
+		t.Fatalf("initialize result missing: %#v", initRes)
+	}
+	caps, ok := result["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities missing: %#v", result)
+	}
+	if _, ok := caps["logging"]; !ok {
+		t.Fatalf("initialize should advertise logging capability: %#v", caps)
 	}
 }
 
@@ -370,6 +410,8 @@ func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
 		"ssh_quick_setup_template",
 		"ssh_quick_setup_save",
 		"ssh_sudo_password_prompt",
+		"ssh_privilege_status",
+		"ssh_privilege_revoke",
 	}
 	tools := toolDefs("csshctl")
 	for _, alias := range legacy {
@@ -406,6 +448,43 @@ func TestAliasCallReturnsCanonicalWarning(t *testing.T) {
 	}
 	if !strings.Contains(rawWarnings[0], "deprecated") {
 		t.Fatalf("warning should mention deprecation: %#v", rawWarnings)
+	}
+}
+
+func TestCnoteToolCall(t *testing.T) {
+	tmp := t.TempDir()
+	svc := app.NewService(model.Config{
+		DefaultShell:           "bash -lc",
+		DefaultTimeoutSec:      120,
+		RuntimeDir:             filepath.Join(tmp, "runtime"),
+		LogsDir:                filepath.Join(tmp, "logs"),
+		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
+		SecurityProfileDefault: "easy_safe",
+		ConnectRequireProfile:  true,
+	})
+	if _, err := svc.QuickSetupSave(app.QuickSetupInput{
+		Purpose:  "debug worker",
+		Host:     "100.100.1.9",
+		Username: "ubuntu",
+		AuthMode: "password",
+	}); err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+
+	s := NewServer(svc)
+	out, err := s.callTool("ssh_cnote", map[string]any{
+		"action":     "set",
+		"profile_id": "debug-worker-100-100-1-9",
+		"content":    "下载大文件时统一落到 /mnt/ssd",
+	})
+	if err != nil {
+		t.Fatalf("ssh_cnote call failed: %v", err)
+	}
+	if out["cnote_present"] != true {
+		t.Fatalf("expected cnote_present=true, got %#v", out["cnote_present"])
+	}
+	if out["recorded"] != "下载大文件时统一落到 /mnt/ssd" {
+		t.Fatalf("unexpected recorded content: %#v", out["recorded"])
 	}
 }
 
@@ -510,4 +589,220 @@ func TestToRPCErrorCancelledMapping(t *testing.T) {
 	if res.Error == nil || res.Error.Code != -32800 {
 		t.Fatalf("expected -32800, got: %#v", res.Error)
 	}
+}
+
+func TestProgressTokenFromMeta(t *testing.T) {
+	if got, ok := progressTokenFromMeta(map[string]any{"progressToken": "tok-1"}); !ok || got != "tok-1" {
+		t.Fatalf("unexpected token: %#v", got)
+	}
+	if got, ok := progressTokenFromMeta(map[string]any{"progressToken": map[string]any{"bad": true}}); ok || got != nil {
+		t.Fatalf("invalid token should be ignored, got %#v", got)
+	}
+}
+
+func TestProgressTokenFromParamsFallsBackToArgumentsMeta(t *testing.T) {
+	got := progressTokenFromParams(nil, map[string]any{
+		"_meta": map[string]any{"progressToken": "tok-2"},
+	})
+	if got != "tok-2" {
+		t.Fatalf("unexpected fallback token: %#v", got)
+	}
+}
+
+func TestProgressReporterEmitsOutputAndHeartbeat(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil)
+	s.out = &out
+
+	reporter := newProgressReporter(s, "ssh_exec", "tok-1")
+	if reporter == nil {
+		t.Fatal("expected reporter")
+	}
+	reporter.flushInterval = 10 * time.Millisecond
+	reporter.heartbeatInterval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reporter.Start(ctx)
+	reporter.OnProgress(sshbridge.ExecProgress{Stream: "stderr", Chunk: "Cloning into 'ghostty'...\r"})
+
+	waitForCondition(t, time.Second, func() bool {
+		return strings.Contains(out.String(), "Cloning into 'ghostty'...")
+	})
+	waitForCondition(t, time.Second, func() bool {
+		return strings.Contains(out.String(), "Command still running")
+	})
+
+	cancel()
+	reporter.Close()
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("expected at least two progress notifications, got %d: %q", len(lines), out.String())
+	}
+
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("failed to decode first progress notification: %v", err)
+	}
+	if first["method"] != "notifications/progress" {
+		t.Fatalf("unexpected method: %#v", first["method"])
+	}
+	params, ok := first["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params missing: %#v", first)
+	}
+	if params["progressToken"] != "tok-1" {
+		t.Fatalf("unexpected progress token: %#v", params["progressToken"])
+	}
+	if _, ok := params["message"].(string); !ok {
+		t.Fatalf("expected message in progress notification: %#v", params["message"])
+	}
+}
+
+func TestProgressReporterFallsBackToMessageWithoutToken(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil)
+	s.out = &out
+
+	reporter := newProgressReporter(s, "ssh_exec", nil)
+	if reporter == nil {
+		t.Fatal("expected reporter without token")
+	}
+	reporter.flushInterval = 10 * time.Millisecond
+	reporter.heartbeatInterval = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reporter.Start(ctx)
+	reporter.OnProgress(sshbridge.ExecProgress{Stream: "stdout", Chunk: "clone started"})
+
+	waitForCondition(t, time.Second, func() bool {
+		return strings.Contains(out.String(), "notifications/message")
+	})
+	cancel()
+	reporter.Close()
+
+	var msg map[string]any
+	line := strings.TrimSpace(strings.Split(out.String(), "\n")[0])
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		t.Fatalf("failed to decode message notification: %v", err)
+	}
+	if msg["method"] != "notifications/message" {
+		t.Fatalf("unexpected method: %#v", msg["method"])
+	}
+	params, ok := msg["params"].(map[string]any)
+	if !ok {
+		t.Fatalf("params missing: %#v", msg)
+	}
+	if params["level"] != "info" {
+		t.Fatalf("unexpected level: %#v", params["level"])
+	}
+	if params["logger"] != "ssh_exec" {
+		t.Fatalf("unexpected logger: %#v", params["logger"])
+	}
+	if params["data"] != "clone started" {
+		t.Fatalf("unexpected data: %#v", params["data"])
+	}
+}
+
+func TestNewProgressReporterRequiresSSHExecOnly(t *testing.T) {
+	s := NewServer(nil)
+	if reporter := newProgressReporter(s, "ssh_exec", nil); reporter == nil {
+		t.Fatalf("expected reporter for ssh_exec without token")
+	}
+	if reporter := newProgressReporter(s, "ssh_profile", "tok-1"); reporter != nil {
+		t.Fatalf("expected nil reporter for non-ssh_exec tool")
+	}
+}
+
+func TestProgressReporterDiscardDropsPendingOutput(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil)
+	s.out = &out
+
+	reporter := newProgressReporter(s, "ssh_exec", "tok-3")
+	reporter.OnProgress(sshbridge.ExecProgress{Stream: "stdout", Chunk: "partial output"})
+	reporter.Discard()
+	reporter.Close()
+
+	if out.Len() != 0 {
+		t.Fatalf("discard should suppress progress notifications, got %q", out.String())
+	}
+}
+
+func TestProgressReporterRespectsLoggingSetLevel(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil)
+	s.out = &out
+
+	params, _ := json.Marshal(map[string]any{"level": "warning"})
+	res := s.handle(request{Method: "logging/setLevel", Params: params}, 1)
+	if res.Error != nil {
+		t.Fatalf("logging/setLevel returned error: %#v", res.Error)
+	}
+
+	reporter := newProgressReporter(s, "ssh_exec", nil)
+	reporter.OnProgress(sshbridge.ExecProgress{Stream: "stdout", Chunk: "info output"})
+	reporter.Close()
+	if out.Len() != 0 {
+		t.Fatalf("warning log level should suppress info messages, got %q", out.String())
+	}
+}
+
+func TestLoggingSetLevelRejectsInvalidLevel(t *testing.T) {
+	s := NewServer(nil)
+	params, _ := json.Marshal(map[string]any{"level": "verbose"})
+	res := s.handle(request{Method: "logging/setLevel", Params: params}, 1)
+	if res.Error == nil || res.Error.Code != -32602 {
+		t.Fatalf("expected invalid params error, got %#v", res)
+	}
+}
+
+func TestToolAnnotations(t *testing.T) {
+	tools := toolDefs("csshctl")
+	for _, td := range tools {
+		name := td["name"].(string)
+		ann, ok := td["annotations"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool %s missing annotations", name)
+		}
+		if _, ok := ann["title"].(string); !ok {
+			t.Fatalf("tool %s missing annotations.title", name)
+		}
+	}
+}
+
+func TestReadOnlyToolAnnotations(t *testing.T) {
+	for _, name := range []string{"ssh_connection_status", "ssh_read_file"} {
+		td := findToolDef(t, name)
+		ann := td["annotations"].(map[string]any)
+		if ann["readOnlyHint"] != true {
+			t.Errorf("%s: readOnlyHint should be true", name)
+		}
+		if ann["destructiveHint"] != false {
+			t.Errorf("%s: destructiveHint should be false", name)
+		}
+	}
+}
+
+func TestDestructiveToolAnnotations(t *testing.T) {
+	for _, name := range []string{"ssh_write_file", "ssh_apply_patch", "ssh_transfer"} {
+		td := findToolDef(t, name)
+		ann := td["annotations"].(map[string]any)
+		if ann["destructiveHint"] != true {
+			t.Errorf("%s: destructiveHint should be true", name)
+		}
+	}
+}
+
+func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met before timeout")
 }

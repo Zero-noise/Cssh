@@ -26,6 +26,20 @@ type ExecResult struct {
 	DurationMS int64
 }
 
+type ExecProgress struct {
+	Stream string
+	Chunk  string
+}
+
+type ExecProgressFn func(ExecProgress)
+
+type execStreamWriter struct {
+	mu         sync.Mutex
+	buf        bytes.Buffer
+	stream     string
+	onProgress ExecProgressFn
+}
+
 type TransferResult struct {
 	DurationMS     int64
 	Protocol       string
@@ -36,6 +50,7 @@ type TransferResult struct {
 const (
 	transferProtocolSFTP      = "sftp"
 	transferProtocolSCPLegacy = "scp_legacy"
+	execWaitDelay             = 5 * time.Second
 )
 
 // masterHandle holds a reference to a managed SSH master process.
@@ -599,6 +614,10 @@ func (m *Manager) ExecWithInput(connectionID, sessionID, command, cwd string, ti
 }
 
 func (m *Manager) ExecWithInputCtx(parent context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, stdin string) (ExecResult, error) {
+	return m.ExecWithProgressCtx(parent, connectionID, sessionID, command, cwd, timeoutSec, stdin, nil)
+}
+
+func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sessionID, command, cwd string, timeoutSec int, stdin string, onProgress ExecProgressFn) (ExecResult, error) {
 	if command == "" {
 		return ExecResult{}, errorsx.New(errorsx.CodeInvalidParams, "command is required")
 	}
@@ -675,10 +694,11 @@ func (m *Manager) ExecWithInputCtx(parent context.Context, connectionID, session
 		remoteCmd,
 	}
 	cmd := exec.CommandContext(ctx, "ssh", args...)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdoutWriter := &execStreamWriter{stream: "stdout", onProgress: onProgress}
+	stderrWriter := &execStreamWriter{stream: "stderr", onProgress: onProgress}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
+	cmd.WaitDelay = execWaitDelay
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -687,8 +707,8 @@ func (m *Manager) ExecWithInputCtx(parent context.Context, connectionID, session
 	d := time.Since(start)
 
 	res := ExecResult{
-		Stdout:     stdout.String(),
-		Stderr:     stderr.String(),
+		Stdout:     stdoutWriter.String(),
+		Stderr:     stderrWriter.String(),
 		DurationMS: d.Milliseconds(),
 	}
 	if ctx.Err() != nil {
@@ -725,7 +745,32 @@ func (m *Manager) ExecWithInputCtx(parent context.Context, connectionID, session
 		}
 		return res, nil
 	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		return res, errorsx.New(errorsx.CodeExecTimeout, "command execution finished but output pipes did not close before wait delay elapsed")
+	}
 	return res, errorsx.New(errorsx.CodeInternal, err.Error())
+}
+
+func (w *execStreamWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	_, _ = w.buf.Write(p)
+	w.mu.Unlock()
+	if w.onProgress != nil {
+		w.onProgress(ExecProgress{
+			Stream: w.stream,
+			Chunk:  string(p),
+		})
+	}
+	return len(p), nil
+}
+
+func (w *execStreamWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
 }
 
 func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeoutSec int) (TransferResult, error) {

@@ -47,11 +47,28 @@ unregister_mcp() {
   fi
 }
 
+remove_permissions() {
+  local settings_file="$HOME/.claude/settings.json"
+  [ -f "$settings_file" ] || return
+  command -v jq &>/dev/null || { warn "jq not found — cannot clean permissions"; return; }
+  jq empty "$settings_file" 2>/dev/null || return
+  local tmp; tmp="$(mktemp)"
+  jq '
+    if .permissions?.allow then
+      .permissions.allow = [.permissions.allow[] | select(startswith("mcp__cssh__") | not)]
+    else . end |
+    if .permissions?.allow == [] then del(.permissions.allow) else . end |
+    if .permissions == {} then del(.permissions) else . end
+  ' "$settings_file" > "$tmp" && mv "$tmp" "$settings_file"
+  info "Removed cssh permissions from Claude Code settings"
+}
+
 main() {
   info "Uninstalling cssh..."
   remove_binaries
   remove_path_injection
   unregister_mcp
+  remove_permissions
   echo ""
   info "Uninstall complete!"
 }

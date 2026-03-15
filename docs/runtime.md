@@ -8,6 +8,7 @@ All runtime artifacts are auto-created — no manual setup needed.
 |------|------|---------|
 | Config | `~/.csbridge/config.toml` | Global settings (approval TTL, security defaults) |
 | Profiles | `~/.csbridge/profiles.json` | Saved SSH profile definitions |
+| Cnotes | `~/.csbridge/runtime/profiles/<profile>/cnote.md` | Per-profile AI instructions and operating notes |
 | Approvals | `~/.csbridge/runtime/approvals.jsonl` | Pending/resolved approval requests |
 | Grants | `~/.csbridge/runtime/grants.json` | Active reusable privilege grants |
 | Audit logs | `~/.csbridge/logs/audit-YYYYMMDD.jsonl` | Per-day audit trail of all operations |

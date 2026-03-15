@@ -130,6 +130,44 @@ register_mcp() {
   fi
 }
 
+SETTINGS_FILE="$HOME/.claude/settings.json"
+CSSH_TOOLS=(
+  "mcp__cssh__ssh_connect"
+  "mcp__cssh__ssh_open_session"
+  "mcp__cssh__ssh_exec"
+  "mcp__cssh__ssh_connection_status"
+  "mcp__cssh__ssh_privilege"
+  "mcp__cssh__ssh_read_file"
+  "mcp__cssh__ssh_disconnect"
+  "mcp__cssh__ssh_profile"
+  "mcp__cssh__ssh_cnote"
+  "mcp__cssh__ssh_profile_setup"
+  "mcp__cssh__ssh_credentials_prompt"
+)
+
+inject_permissions() {
+  if ! command -v jq &>/dev/null; then
+    warn "jq not found — skipping permission setup"
+    warn "You can manually allow cssh tools in ~/.claude/settings.json"
+    return
+  fi
+  mkdir -p "$(dirname "$SETTINGS_FILE")"
+  [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
+  if ! jq empty "$SETTINGS_FILE" 2>/dev/null; then
+    warn "$SETTINGS_FILE is not valid JSON — skipping permission injection"
+    return
+  fi
+  local tools_json
+  tools_json=$(printf '%s\n' "${CSSH_TOOLS[@]}" | jq -R . | jq -s .)
+  local tmp; tmp="$(mktemp)"
+  jq --argjson t "$tools_json" '
+    .permissions //= {} |
+    .permissions.allow //= [] |
+    .permissions.allow = (.permissions.allow + ($t - .permissions.allow))
+  ' "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
+  info "Auto-approved ${#CSSH_TOOLS[@]} cssh tools in Claude Code settings"
+}
+
 verify() {
   if "$INSTALL_DIR/csshctl" --help &>/dev/null; then
     info "csshctl is working"
@@ -153,6 +191,7 @@ main() {
 
   inject_path
   register_mcp
+  inject_permissions
   verify
 
   echo ""

@@ -3,6 +3,7 @@ package sshbridge
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -158,6 +159,32 @@ func TestExecWithInputRejectsSessionFromOtherConnection(t *testing.T) {
 	ce, ok := err.(*errorsx.CsshError)
 	if !ok || ce.Code != errorsx.CodeInvalidParams {
 		t.Fatalf("expected invalid params error, got %#v", err)
+	}
+}
+
+func TestExecStreamWriterCopiesAndReports(t *testing.T) {
+	var got strings.Builder
+	writer := &execStreamWriter{
+		stream: "stdout",
+		onProgress: func(p ExecProgress) {
+			if p.Stream != "stdout" {
+				t.Fatalf("unexpected stream: %q", p.Stream)
+			}
+			got.WriteString(p.Chunk)
+		},
+	}
+	n, err := writer.Write([]byte("hello\nworld\n"))
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if n != len("hello\nworld\n") {
+		t.Fatalf("unexpected write count: %d", n)
+	}
+	if writer.String() != "hello\nworld\n" {
+		t.Fatalf("buffer mismatch: %q", writer.String())
+	}
+	if got.String() != "hello\nworld\n" {
+		t.Fatalf("progress mismatch: %q", got.String())
 	}
 }
 

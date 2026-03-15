@@ -134,6 +134,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	profile := model.Profile{
 		ID:                profileID,
 		Name:              profileName,
+		NotePath:          s.cnotes.ResolvePath(profileID),
 		Host:              strings.TrimSpace(in.Host),
 		Port:              in.Port,
 		Username:          strings.TrimSpace(in.Username),
@@ -165,6 +166,9 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	if err := s.profiles.Upsert(profile); err != nil {
 		return nil, err
 	}
+	if err := s.cnotes.Ensure(profile.NotePath); err != nil {
+		return nil, err
+	}
 
 	secretsSaved := map[string]bool{
 		"password":       s.hasSecretValue(profileID, "password"),
@@ -181,6 +185,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		"saved":            true,
 		"profile_id":       profileID,
 		"profile_name":     profileName,
+		"cnote_path":       profile.NotePath,
 		"auth_priority":    authPriority,
 		"workspace_roots":  profile.WorkspaceRoots,
 		"security_profile": profile.SecurityProfile,
@@ -238,9 +243,15 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 	}
 	out := make([]map[string]any, 0, len(items))
 	for _, p := range items {
+		path := s.ensureProfileCnotePath(&p)
+		content, err := s.cnotes.Read(path)
+		if err != nil {
+			content = ""
+		}
 		out = append(out, map[string]any{
 			"id":                p.ID,
 			"name":              p.Name,
+			"cnote_path":        path,
 			"host":              p.Host,
 			"port":              p.Port,
 			"username":          p.Username,
@@ -250,6 +261,8 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			"security_profile":  p.SecurityProfile,
 			"allow_root_user":   p.AllowRootUser,
 			"grant_ttl_sec":     p.GrantTTLSec,
+			"has_cnote":         strings.TrimSpace(content) != "",
+			"cnote_preview":     cnotePreview(content),
 		})
 	}
 	resp := map[string]any{"profiles": out}
@@ -301,6 +314,7 @@ func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmTok
 	if err := s.profiles.Delete(id); err != nil {
 		return nil, err
 	}
+	_ = s.cnotes.Delete(s.ensureProfileCnotePath(p))
 	secretsDeleted := []string{}
 	if deleteSecrets {
 		for _, kind := range []string{"password", "key_passphrase", "sudo_password"} {

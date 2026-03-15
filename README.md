@@ -121,6 +121,7 @@ codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
 - **Runtime narrowing**: `ssh_connect(limit_dir=...)` can narrow AI runtime access to one subdirectory within `workspace_roots`.
 - **Credential storage**: passwords and key passphrases are stored in the OS keychain (macOS Keychain / Linux Secret Service), never in config files.
 - **Root policy**: `allow_root_user` is per-profile; global `allow_root_login=true` overrides and permits root login.
+- **Per-profile Cnote**: every profile gets a dedicated `cnote.md` file for AI-facing instructions such as preferred download locations or operational constraints. `ssh_connect(profile_id=...)` returns the current Cnote so the AI can follow it immediately.
 
 ## Tools
 
@@ -134,15 +135,12 @@ codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
 | `ssh_read_file` | Read remote file |
 | `ssh_write_file` | Write remote file |
 | `ssh_apply_patch` | Apply unified diff patch on remote host |
-| `ssh_list_dir` | List remote directory entries |
-| `ssh_search_text` | Search text in remote files |
-| `ssh_tail_log` | Tail remote log file |
 | `ssh_transfer` | Transfer files using `scp` client (SFTP by default, legacy SCP fallback) with optional SHA-256 verification |
 | `ssh_profile` | List or delete saved profiles |
+| `ssh_cnote` | Read or update the per-profile Cnote instructions |
 | `ssh_profile_setup` | Create profiles via guided setup flow |
 | `ssh_credentials_prompt` | Securely store credentials via local web form |
-| `ssh_privilege_status` | List active privilege grants |
-| `ssh_privilege_revoke` | Revoke a privilege grant |
+| `ssh_privilege` | Inspect or revoke privilege grants |
 
 ## Build
 
@@ -193,9 +191,10 @@ Use canonical tools only (legacy aliases remain compatible but deprecated):
 
 1. `ssh_profile_setup(step=template|save)`
 2. `ssh_credentials_prompt(profile_id=...)` (if auth requires credentials)
-3. `ssh_connect(profile_id=...)`
-4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
-5. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
+3. `ssh_cnote(action=get, profile_id=...)` when the user wants to inspect or update long-lived AI instructions
+4. `ssh_connect(profile_id=...)` and read the returned `cnote`
+5. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
+6. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
 
 ```json
 {
@@ -208,7 +207,8 @@ Use canonical tools only (legacy aliases remain compatible but deprecated):
 
 ## Notes
 
+- Tell the AI to "record this in the Cnote" when you want a profile-level rule persisted.
+- Typical Cnote content: "Download large files to /mnt/ssd" or "Do not restart this host during business hours."
 - Password auth uses `SSH_ASKPASS` flow.
 - `ssh_apply_patch` requires `patch` and `base64` on the remote host.
-- `ssh_search_text` uses `grep`/`find` on the remote host.
 - Default config path: `~/.csbridge/config.toml` (auto-created on first run).

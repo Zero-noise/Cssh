@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,7 +51,7 @@ func newTestService(t *testing.T) *Service {
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
 		ConnectRequireProfile:  true,
-		SudoEnabled: true,
+		SudoEnabled:            true,
 	}
 	svc := NewService(cfg)
 	svc.secrets = newTestSecretStore()
@@ -90,7 +91,7 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	out, err := svc.QuickSetupSave(QuickSetupInput{
 		Purpose:     "debug worker",
 		ProfileName: "rayna-dev",
-		Host:        "100.100.1.9",
+		Host:        "10.0.0.9",
 		Username:    "ubuntu",
 		AuthMode:    "password",
 	})
@@ -110,6 +111,12 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	}
 	if p.Name != "rayna-dev" {
 		t.Fatalf("unexpected profile name: %s", p.Name)
+	}
+	if p.NotePath == "" {
+		t.Fatalf("expected note path to be persisted")
+	}
+	if _, err := os.Stat(p.NotePath); err != nil {
+		t.Fatalf("expected cnote file to exist: %v", err)
 	}
 	if p.SecurityProfile != "easy_safe" {
 		t.Fatalf("unexpected security_profile: %s", p.SecurityProfile)
@@ -142,6 +149,68 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	fields, ok := args["fields"].([]string)
 	if !ok || len(fields) != 1 || fields[0] != "password" {
 		t.Fatalf("unexpected credentials_hint fields: %#v", args["fields"])
+	}
+}
+
+func TestCnoteSetAndResolveConnectionInput(t *testing.T) {
+	svc := newTestService(t)
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:     "debug worker",
+		ProfileName: "rayna-dev",
+		Host:        "10.0.0.9",
+		Username:    "ubuntu",
+		AuthMode:    "password",
+	})
+	if err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+	profileID, _ := out["profile_id"].(string)
+	if _, err := svc.Cnote("set", profileID, "", "下载大文件时统一落到 /mnt/ssd"); err != nil {
+		t.Fatalf("cnote set err: %v", err)
+	}
+
+	conn, err := svc.resolveConnectionInput(model.ConnectionInput{ProfileID: profileID})
+	if err != nil {
+		t.Fatalf("resolve connection err: %v", err)
+	}
+	if conn.Cnote != "下载大文件时统一落到 /mnt/ssd" {
+		t.Fatalf("unexpected cnote: %#v", conn.Cnote)
+	}
+	if conn.CnotePath == "" {
+		t.Fatalf("expected cnote path to be present")
+	}
+}
+
+func TestProfilesListIncludesCnoteMetadata(t *testing.T) {
+	svc := newTestService(t)
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:     "debug worker",
+		ProfileName: "rayna-dev",
+		Host:        "100.100.1.9",
+		Username:    "ubuntu",
+		AuthMode:    "password",
+	})
+	if err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+	profileID, _ := out["profile_id"].(string)
+	if _, err := svc.Cnote("append", profileID, "", "下载大文件时统一落到 /mnt/ssd"); err != nil {
+		t.Fatalf("cnote append err: %v", err)
+	}
+
+	list, err := svc.ProfilesList()
+	if err != nil {
+		t.Fatalf("profiles list err: %v", err)
+	}
+	profiles, ok := list["profiles"].([]map[string]any)
+	if !ok || len(profiles) != 1 {
+		t.Fatalf("unexpected profiles payload: %#v", list["profiles"])
+	}
+	if profiles[0]["has_cnote"] != true {
+		t.Fatalf("expected has_cnote=true, got %#v", profiles[0]["has_cnote"])
+	}
+	if !strings.Contains(profiles[0]["cnote_preview"].(string), "/mnt/ssd") {
+		t.Fatalf("unexpected cnote preview: %#v", profiles[0]["cnote_preview"])
 	}
 }
 
@@ -233,6 +302,11 @@ func TestProfileDeleteRemovesProfileAndSecrets(t *testing.T) {
 	_ = sec.Set("to-del", "password", "x")
 	_ = sec.Set("to-del", "key_passphrase", "y")
 	_ = sec.Set("to-del", "sudo_password", "z")
+	cnote, err := svc.Cnote("set", "to-del", "", "下载大文件时统一落到 /mnt/ssd")
+	if err != nil {
+		t.Fatalf("cnote set: %v", err)
+	}
+	cnotePath, _ := cnote["cnote_path"].(string)
 
 	first, err := svc.ProfileDelete("to-del", true, "")
 	if err != nil {
@@ -264,5 +338,8 @@ func TestProfileDeleteRemovesProfileAndSecrets(t *testing.T) {
 	}
 	if _, ok := sec.values["to-del:sudo_password"]; ok {
 		t.Fatalf("sudo_password secret should be deleted")
+	}
+	if _, err := os.Stat(cnotePath); !os.IsNotExist(err) {
+		t.Fatalf("cnote file should be deleted, got err=%v", err)
 	}
 }

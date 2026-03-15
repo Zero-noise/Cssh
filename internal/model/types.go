@@ -12,6 +12,7 @@ const (
 type Profile struct {
 	ID                string   `json:"id"`
 	Name              string   `json:"name,omitempty"`
+	NotePath          string   `json:"note_path,omitempty"`
 	Host              string   `json:"host"`
 	Port              int      `json:"port"`
 	Username          string   `json:"username"`
@@ -37,8 +38,8 @@ type Config struct {
 	LogsDir                string `json:"logs_dir"`
 	ProfilesFile           string `json:"profiles_file"`
 	SecurityProfileDefault string `json:"security_profile_default"`
-	ConnectRequireProfile bool `json:"connect_require_profile"`
-	SudoEnabled           bool `json:"sudo_enabled"`
+	ConnectRequireProfile  bool   `json:"connect_require_profile"`
+	SudoEnabled            bool   `json:"sudo_enabled"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 
@@ -77,6 +78,8 @@ type Connection struct {
 	AllowDiskOps    bool
 	DenyPatterns    []string
 	GrantTTLSec     int
+	CnotePath       string
+	Cnote           string
 	ControlPath     string
 	AuthMethod      string
 	Generation      uint64
@@ -180,6 +183,6 @@ type AuditEvent struct {
 	SecurityProfile string    `json:"security_profile,omitempty"`
 	Capability      string    `json:"capability,omitempty"`
 	CommandHash     string    `json:"command_template_hash,omitempty"`
-	GrantID     string `json:"grant_id,omitempty"`
-	ConfirmMode string `json:"confirm_mode,omitempty"`
+	GrantID         string    `json:"grant_id,omitempty"`
+	ConfirmMode     string    `json:"confirm_mode,omitempty"`
 }
