@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"cssh/internal/approvals"
 	"cssh/internal/audit"
@@ -327,12 +328,48 @@ func (s *Service) ExecWithProgress(ctx context.Context, connectionID, sessionID,
 		ConfirmMode:     authz.ConfirmMode,
 		GrantID:         authz.GrantID,
 	})
+	stdout, stdoutTrunc, stdoutOrigLen := truncateOutput(res.Stdout)
+	stderr, stderrTrunc, stderrOrigLen := truncateOutput(res.Stderr)
+
+	// Best-effort save full output to remote temp file if anything was truncated.
+	var overflowPath string
+	if stdoutTrunc || stderrTrunc {
+		var combined strings.Builder
+		if stdoutTrunc {
+			combined.WriteString("=== STDOUT ===\n")
+			combined.WriteString(res.Stdout)
+			combined.WriteString("\n")
+		}
+		if stderrTrunc {
+			combined.WriteString("=== STDERR ===\n")
+			combined.WriteString(res.Stderr)
+			combined.WriteString("\n")
+		}
+		overflowPath = s.saveFullOutputRemote(connectionID, combined.String())
+	}
+
 	resp := map[string]any{
 		"exit_code":   res.ExitCode,
-		"stdout":      res.Stdout,
-		"stderr":      res.Stderr,
+		"stdout":      stdout,
+		"stderr":      stderr,
 		"duration_ms": res.DurationMS,
 	}
+
+	if stdoutTrunc || stderrTrunc {
+		truncMeta := map[string]any{}
+		if stdoutTrunc {
+			truncMeta["stdout_original_bytes"] = stdoutOrigLen
+		}
+		if stderrTrunc {
+			truncMeta["stderr_original_bytes"] = stderrOrigLen
+		}
+		if overflowPath != "" {
+			truncMeta["full_output_path"] = overflowPath
+			truncMeta["retrieve_hint"] = "Use ssh_read_file or ssh_exec with: cat " + overflowPath
+		}
+		resp["truncated"] = truncMeta
+	}
+
 	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
 }
@@ -451,7 +488,7 @@ func (s *Service) PrivilegeStatus(connectionID string, activeOnly bool) (map[str
 	_ = s.audit.Write(model.AuditEvent{
 		Timestamp:    time.Now().UTC(),
 		TraceID:      traceID,
-		Type:         "ssh_privilege_status",
+		Type:         "ssh_privilege",
 		ConnectionID: connectionID,
 		Status:       "ok",
 	})
@@ -478,7 +515,7 @@ func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
 	_ = s.audit.Write(model.AuditEvent{
 		Timestamp:    time.Now().UTC(),
 		TraceID:      traceID,
-		Type:         "ssh_privilege_revoke",
+		Type:         "ssh_privilege",
 		ConnectionID: g.ConnectionID,
 		Status:       "ok",
 		GrantID:      g.ID,
@@ -819,7 +856,88 @@ func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd stri
 	return resp, nil
 }
 
+const maxWriteFileBytes = 5 * 1024 * 1024 // 5 MB
+
+const (
+	execOutputTruncateThreshold = 128 * 1024 // 128KB per stream triggers truncation
+	execOutputHeadBytes         = 16 * 1024  // keep first 16KB
+	execOutputTailBytes         = 48 * 1024  // keep last 48KB (results/errors usually most relevant)
+	execOverflowSaveTimeout     = 30         // seconds for remote save
+)
+
+// truncateOutput returns a head+tail truncated version of s if it exceeds the
+// threshold. It adjusts cut points to avoid splitting multi-byte UTF-8 chars.
+func truncateOutput(s string) (result string, truncated bool, originalLen int) {
+	originalLen = len(s)
+	if originalLen <= execOutputTruncateThreshold {
+		return s, false, originalLen
+	}
+
+	// Advance head boundary to a valid rune start to avoid splitting a multi-byte char.
+	head := execOutputHeadBytes
+	for head < originalLen && head < execOutputHeadBytes+3 && !utf8.RuneStart(s[head]) {
+		head++
+	}
+
+	// Retreat tail start to a valid rune start.
+	tailStart := originalLen - execOutputTailBytes
+	for tailStart > head && tailStart < originalLen && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+
+	marker := fmt.Sprintf(
+		"\n\n--- OUTPUT TRUNCATED ---\nShowing first %d and last %d of %d bytes.\n--- END TRUNCATION NOTICE ---\n\n",
+		head, originalLen-tailStart, originalLen,
+	)
+	return s[:head] + marker + s[tailStart:], true, originalLen
+}
+
+// saveFullOutputRemote saves full command output to a temp file on the remote
+// host. Best-effort: returns the remote path on success or "" on failure.
+func (s *Service) saveFullOutputRemote(connectionID, content string) string {
+	remotePath := "/tmp/cssh-exec-" + util.NewID("out") + ".log"
+	ctx, cancel := context.WithTimeout(context.Background(), execOverflowSaveTimeout*time.Second)
+	defer cancel()
+	cmd := "cat > " + util.ShellQuote(remotePath)
+	res, err := s.ssh.ExecWithInputCtx(ctx, connectionID, "", cmd, "", execOverflowSaveTimeout, content)
+	if err != nil || res.ExitCode != 0 {
+		return ""
+	}
+	return remotePath
+}
+
+// buildWriteFileCmd constructs a shell command that reads base64 data from stdin
+// and writes the decoded content to resolved. Returns ("", error) for invalid mode.
+func buildWriteFileCmd(resolved, mode string) (string, error) {
+	q := util.ShellQuote(resolved)
+	dir := path.Dir(resolved)
+	mkdir := "mkdir -p " + util.ShellQuote(dir)
+
+	switch mode {
+	case "create":
+		// set -C (noclobber) as secondary guard; explicit existence check with exit 17 as primary.
+		return mkdir + " && set -C; if [ -e " + q + " ]; then exit 17; fi; " +
+			"base64 -d > " + q, nil
+	case "append":
+		return mkdir + " && base64 -d >> " + q, nil
+	case "overwrite":
+		// Atomic: write to temp file in same directory, then mv.
+		// trap ensures temp file cleanup on any failure.
+		return mkdir + ` && _t="$(mktemp "` + util.ShellQuote(dir) + `"/tmp.XXXXXX)" && ` +
+			`trap 'rm -f "$_t"' EXIT && ` +
+			`base64 -d > "$_t" && ` +
+			`{ [ -e ` + q + ` ] && chmod --reference=` + q + ` "$_t" 2>/dev/null; true; } && ` +
+			`mv -f "$_t" ` + q, nil
+	default:
+		return "", errorsx.New(errorsx.CodeInvalidParams, "mode must be create|overwrite|append")
+	}
+}
+
 func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (map[string]any, error) {
+	if len(content) > maxWriteFileBytes {
+		return nil, errorsx.New(errorsx.CodeContentTooLarge,
+			fmt.Sprintf("content exceeds %d bytes; use ssh_transfer for large files", maxWriteFileBytes))
+	}
 	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
@@ -832,27 +950,18 @@ func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (
 	if mode == "" {
 		mode = "overwrite"
 	}
-	enc := base64.StdEncoding.EncodeToString([]byte(content))
-	dir := path.Dir(resolved)
-	cmd := "mkdir -p " + util.ShellQuote(dir) + "; "
-	switch mode {
-	case "create":
-		cmd += "if [ -e " + util.ShellQuote(resolved) + " ]; then exit 17; fi; "
-		cmd += "echo " + util.ShellQuote(enc) + " | base64 -d > " + util.ShellQuote(resolved)
-	case "append":
-		cmd += "echo " + util.ShellQuote(enc) + " | base64 -d >> " + util.ShellQuote(resolved)
-	case "overwrite":
-		cmd += "echo " + util.ShellQuote(enc) + " | base64 -d > " + util.ShellQuote(resolved)
-	default:
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "mode must be create|overwrite|append")
+	cmd, err := buildWriteFileCmd(resolved, mode)
+	if err != nil {
+		return nil, err
 	}
-	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
+	enc := base64.StdEncoding.EncodeToString([]byte(content))
+	res, err := s.ssh.ExecWithInput(connectionID, "", cmd, "", 60, enc)
 	if err != nil {
 		return nil, err
 	}
 	if res.ExitCode != 0 {
 		if res.ExitCode == 17 {
-			return nil, errorsx.New(errorsx.CodeInvalidParams, "target exists")
+			return nil, errorsx.New(errorsx.CodeFileExists, "target already exists")
 		}
 		return nil, errorsx.New(errorsx.CodeInternal, strings.TrimSpace(res.Stderr))
 	}
@@ -870,7 +979,7 @@ func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (
 	return resp, nil
 }
 
-func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[string]any, error) {
+func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun bool) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
@@ -881,48 +990,62 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string) (map[st
 		return nil, errorsx.New(errorsx.CodePathForbidden, "base_dir is outside workspace_roots")
 	}
 	enc := base64.StdEncoding.EncodeToString([]byte(patchUnified))
-	cmd := strings.Join([]string{
-		"tmp=$(mktemp)",
-		"echo " + util.ShellQuote(enc) + " | base64 -d > \"$tmp\"",
-		"cd " + util.ShellQuote(base),
-		"patch -p0 < \"$tmp\"",
-		"rc=$?",
-		"rm -f \"$tmp\"",
-		"exit $rc",
-	}, "; ")
+
+	patchFlags := "--batch --fuzz=0 -p0"
+	if dryRun {
+		patchFlags += " --dry-run"
+	}
+	cmd := "cd " + util.ShellQuote(base) + " && echo " + util.ShellQuote(enc) + " | base64 -d | patch " + patchFlags
+
 	res, err := s.ssh.Exec(connectionID, "", cmd, "", 120)
 	if err != nil {
 		return nil, err
 	}
 	out := res.Stdout + "\n" + res.Stderr
-	filesChanged := 0
-	hunksApplied := 0
-	rejects := 0
+
+	var filesPatched []string
+	hunksOK := 0
+	hunksFailed := 0
 	for _, line := range strings.Split(out, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "patching file ") {
-			filesChanged++
+			filesPatched = append(filesPatched, strings.TrimPrefix(l, "patching file "))
 		}
-		if strings.Contains(l, "Hunk #") {
-			hunksApplied++
-		}
-		if strings.Contains(l, ".rej") || strings.Contains(strings.ToLower(l), "failed") {
-			rejects++
+		if strings.HasPrefix(l, "Hunk #") {
+			if strings.Contains(l, "FAILED") {
+				hunksFailed++
+			} else {
+				hunksOK++
+			}
 		}
 	}
+
 	if res.ExitCode != 0 {
-		return nil, errorsx.New(errorsx.CodeInternal, strings.TrimSpace(out))
+		summary := fmt.Sprintf("patch failed: %d hunk(s) applied, %d hunk(s) FAILED across %d file(s)\n%s",
+			hunksOK, hunksFailed, len(filesPatched), strings.TrimSpace(out))
+		return nil, errorsx.New(errorsx.CodeInternal, summary)
 	}
-	_ = s.audit.Write(model.AuditEvent{
-		Timestamp:    time.Now().UTC(),
-		TraceID:      traceID,
-		Type:         "ssh_apply_patch",
-		ConnectionID: connectionID,
-		FilePath:     base,
-		RiskLevel:    string(model.RiskL1),
-		Status:       "ok",
-	})
-	resp := map[string]any{"files_changed": filesChanged, "hunks_applied": hunksApplied, "rejects": rejects}
+
+	if !dryRun {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_apply_patch",
+			ConnectionID: connectionID,
+			FilePath:     base,
+			RiskLevel:    string(model.RiskL1),
+			Status:       "ok",
+		})
+	}
+
+	resp := map[string]any{
+		"files_changed": len(filesPatched),
+		"hunks_applied": hunksOK,
+		"dry_run":       dryRun,
+	}
+	if dryRun {
+		resp["message"] = "dry-run succeeded; no files were modified"
+	}
 	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
 }

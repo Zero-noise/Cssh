@@ -17,7 +17,7 @@ curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/install
 git clone https://github.com/Zero-noise/Cssh.git && cd Cssh && ./scripts/install.sh
 ```
 
-The installer will build binaries to `~/.csbridge/bin/`, add them to your PATH, and register the MCP server with Claude Code.
+The installer builds binaries to `~/.csbridge/bin/`, adds them to your PATH, registers the MCP server with Claude Code, and auto-approves tool permissions.
 
 Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
 
@@ -46,55 +46,54 @@ claude mcp add --transport stdio --scope user cssh -- ~/.csbridge/bin/cssh-mcp
 
 The install script registers cssh with **Claude Code** automatically. For other clients, add the config manually.
 
-Default binary path after install: `~/.csbridge/bin/cssh-mcp`
+Binary path: `~/.csbridge/bin/cssh-mcp` — if your client does not expand `~`, use the full absolute path.
 
-> If your client does not expand `~`, use the full absolute path (e.g. `/home/you/.csbridge/bin/cssh-mcp`).
-
-### Cursor
+<details>
+<summary><b>Cursor</b></summary>
 
 `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project):
 
 ```json
 {
   "mcpServers": {
-    "cssh": {
-      "command": "~/.csbridge/bin/cssh-mcp"
-    }
+    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
   }
 }
 ```
+</details>
 
-### VS Code / GitHub Copilot
+<details>
+<summary><b>VS Code / GitHub Copilot</b></summary>
 
-`.vscode/mcp.json` (workspace) or via command palette → **MCP: Open User Configuration**:
+`.vscode/mcp.json` (workspace) or command palette → **MCP: Open User Configuration**:
 
 ```json
 {
   "servers": {
-    "cssh": {
-      "command": "~/.csbridge/bin/cssh-mcp"
-    }
+    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
   }
 }
 ```
 
-> **Note:** VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+> VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+</details>
 
-### Windsurf
+<details>
+<summary><b>Windsurf</b></summary>
 
 `~/.codeium/windsurf/mcp_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "cssh": {
-      "command": "~/.csbridge/bin/cssh-mcp"
-    }
+    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
   }
 }
 ```
+</details>
 
-### Codex CLI
+<details>
+<summary><b>Codex CLI</b></summary>
 
 `~/.codex/config.toml` (global) or `.codex/config.toml` (project):
 
@@ -103,25 +102,40 @@ Default binary path after install: `~/.csbridge/bin/cssh-mcp`
 command = "~/.csbridge/bin/cssh-mcp"
 ```
 
-Or via CLI:
+Or: `codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp`
+</details>
 
-```bash
-codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
-```
-
-### JetBrains IDEs
+<details>
+<summary><b>JetBrains IDEs</b></summary>
 
 **Settings** → **Tools** → **AI Assistant** → **Model Context Protocol (MCP)** → **+** → add stdio server with command `~/.csbridge/bin/cssh-mcp`.
+</details>
+
+## Features
+
+- **Managed SSH master lifecycle** — master processes run with `-MN`; Cssh tracks process health and detects death automatically
+- **Auto-reconnect** — if an SSH master dies unexpectedly, Cssh reconnects transparently and notifies the AI agent
+- **Exec progress streaming** — real-time output via MCP progress notifications during long-running commands
+- **Per-profile Cnote** — persistent AI-facing notes per profile (e.g. "download to /mnt/ssd", "don't restart during business hours"); returned automatically on `ssh_connect`
+- **File transfer with verification** — `scp` transport with automatic SFTP/legacy-SCP fallback and SHA-256 checksums
+- **Credential storage** — passwords and key passphrases stored in OS keychain (macOS Keychain / Linux Secret Service), never in config files
+- **Tool annotations** — all tools annotated with MCP spec hints (`readOnlyHint`, `destructiveHint`, etc.)
 
 ## Security Model
 
-- **Profile-based access**: connections are restricted to pre-configured profiles. Public-host access follows OR precedence (`global allow_public_host` OR `profile allow_public_host`), and defaults to `true`.
-- **Command approval**: in `easy_safe` mode (default), only critical destructive commands (e.g. `rm -rf /`, `reboot`, `mkfs`) require approval. In `ops_strict` mode, all high-risk commands, sudo commands, and profile override bypasses require explicit approval with no grant caching.
-- **Write protection**: remote file writes are restricted to directories listed in `workspace_roots`.
-- **Runtime narrowing**: `ssh_connect(limit_dir=...)` can narrow AI runtime access to one subdirectory within `workspace_roots`.
-- **Credential storage**: passwords and key passphrases are stored in the OS keychain (macOS Keychain / Linux Secret Service), never in config files.
-- **Root policy**: `allow_root_user` is per-profile; global `allow_root_login=true` overrides and permits root login.
-- **Per-profile Cnote**: every profile gets a dedicated `cnote.md` file for AI-facing instructions such as preferred download locations or operational constraints. `ssh_connect(profile_id=...)` returns the current Cnote so the AI can follow it immediately.
+Two built-in security profiles control command approval:
+
+| | `easy_safe` (default) | `ops_strict` |
+|---|---|---|
+| **Intent** | Development — trust the AI | Production — verify everything |
+| **Hard deny** | `rm -rf /`, fork bombs, destructive finds | Same |
+| **Approval** | Only irreversible ops (reboot, mkfs) | All high-risk + all sudo |
+| **Grant caching** | Configurable TTL | Disabled (fresh approval every time) |
+| **Overrides** | `AllowReboot`, `AllowDiskOps` | Ignored |
+
+Additional controls: profile-only connections, `workspace_roots` write restrictions, `limit_dir` runtime narrowing, `allow_root_user` policy, public-host OR-precedence.
+
+> Full details: [docs/security-model.md](docs/security-model.md)
 
 ## Tools
 
@@ -129,15 +143,15 @@ codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
 |------|-------------|
 | `ssh_connect` | Create an SSH connection, returns `connection_id` |
 | `ssh_open_session` | Create a reusable shell session |
-| `ssh_exec` | Run a command on remote host |
-| `ssh_connection_status` | Check connection health |
+| `ssh_exec` | Run a command with real-time progress streaming |
+| `ssh_connection_status` | Inspect connection health |
 | `ssh_disconnect` | Close a connection |
 | `ssh_read_file` | Read remote file |
-| `ssh_write_file` | Write remote file |
+| `ssh_write_file` | Write remote file (workspace_roots guarded) |
 | `ssh_apply_patch` | Apply unified diff patch on remote host |
-| `ssh_transfer` | Transfer files using `scp` client (SFTP by default, legacy SCP fallback) with optional SHA-256 verification |
+| `ssh_transfer` | Transfer files via scp (SFTP default, legacy SCP fallback) with SHA-256 verification |
 | `ssh_profile` | List or delete saved profiles |
-| `ssh_cnote` | Read or update the per-profile Cnote instructions |
+| `ssh_cnote` | Read or update per-profile Cnote instructions |
 | `ssh_profile_setup` | Create profiles via guided setup flow |
 | `ssh_credentials_prompt` | Securely store credentials via local web form |
 | `ssh_privilege` | Inspect or revoke privilege grants |
@@ -145,11 +159,10 @@ codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp
 ## Build
 
 ```bash
-# Both binaries
 go build -o cssh-mcp ./cmd/cssh-mcp && go build -o csshctl ./cmd/csshctl
 ```
 
-> **Note**: After modifying `.go` source files, re-run `go build` to regenerate the binary.
+> After modifying `.go` source files, re-run `go build` to regenerate the binary.
 
 ## CLI Reference
 
@@ -175,40 +188,19 @@ csshctl approvals list --status pending
 csshctl approve apr_xxx --by yourname
 ```
 
-## File Transfer
+## AI Workflow
 
-`ssh_transfer` supports `direction=upload` (local → remote) and `direction=download` (remote → local).
+> Full setup flow: [docs/setup-flow.md](docs/setup-flow.md) · Runtime paths: [docs/runtime.md](docs/runtime.md)
 
-- `scp` is the transport client. On modern OpenSSH it uses SFTP mode by default; if SFTP subsystem is unavailable, Cssh retries with legacy SCP (`-O`).
-- Default mode is `create` (fails if target exists). Use `mode=overwrite` to replace.
-- SHA-256 checksum verification is enabled by default.
-- Local paths are restricted to the current working directory unless `allow_local_anywhere=true`.
-- Response includes `transfer_protocol` (`sftp` or `scp_legacy`) and `fallback_used` (`true/false`). When fallback happens, `fallback_reason` is also returned.
-
-## Recommended AI Workflow
-
-Use canonical tools only (legacy aliases remain compatible but deprecated):
-
-1. `ssh_profile_setup(step=template|save)`
-2. `ssh_credentials_prompt(profile_id=...)` (if auth requires credentials)
-3. `ssh_cnote(action=get, profile_id=...)` when the user wants to inspect or update long-lived AI instructions
-4. `ssh_connect(profile_id=...)` and read the returned `cnote`
-5. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer`
-6. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
-
-```json
-{
-  "direction": "upload",
-  "connection_id": "conn_xxx",
-  "local_path": "./model.bin",
-  "remote_path": "/home/ubuntu/project/model.bin"
-}
-```
+1. `ssh_profile_setup(step=template|save)` — create a profile
+2. `ssh_credentials_prompt(profile_id=...)` — store credentials if needed
+3. `ssh_connect(profile_id=...)` — connect (Cnote is returned automatically)
+4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer` — work on the remote host
+5. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
 
 ## Notes
 
-- Tell the AI to "record this in the Cnote" when you want a profile-level rule persisted.
-- Typical Cnote content: "Download large files to /mnt/ssd" or "Do not restart this host during business hours."
+- Tell the AI to "record this in the Cnote" to persist profile-level rules.
 - Password auth uses `SSH_ASKPASS` flow.
 - `ssh_apply_patch` requires `patch` and `base64` on the remote host.
 - Default config path: `~/.csbridge/config.toml` (auto-created on first run).

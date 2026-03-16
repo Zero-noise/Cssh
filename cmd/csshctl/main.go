@@ -15,6 +15,15 @@ import (
 )
 
 func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(0)
+	}
+	if os.Args[1] == "help" || os.Args[1] == "--help" || os.Args[1] == "-h" {
+		usage()
+		os.Exit(0)
+	}
+
 	configPath := os.Getenv("CSSH_CONFIG")
 	if configPath == "" {
 		configPath = "~/.csbridge/config.toml"
@@ -24,11 +33,6 @@ func main() {
 		fatal(err)
 	}
 	svc := app.NewService(cfg)
-
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
-	}
 
 	switch os.Args[1] {
 	case "profile":

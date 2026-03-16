@@ -17,8 +17,6 @@ If an operation returns `status=approval_required` (for example from `ssh_exec` 
 1. Run `csshctl approve <approval_id>` from a separate terminal.
 2. Retry the original tool call with `approval_token=<approval_id>`.
 
-Do not switch to legacy alias tools (`ssh_upload_file`, `ssh_profile_delete`, etc.); they remain backward-compatible but are deprecated.
-
 ## Example `ssh_profile_setup` Save Payload
 
 ```json

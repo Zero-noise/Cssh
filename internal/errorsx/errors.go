@@ -30,6 +30,7 @@ const (
 	CodeProfileConflict     = "PROFILE_CONFLICT"
 	CodeConnectionDead      = "CONNECTION_DEAD"
 	CodeReconnectFailed     = "RECONNECT_FAILED"
+	CodeContentTooLarge     = "CONTENT_TOO_LARGE"
 	CodeCancelled           = "CANCELLED"
 	CodeInternal            = "INTERNAL"
 )

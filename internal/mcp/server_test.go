@@ -274,6 +274,7 @@ func TestToRPCErrorAdditionalMappings(t *testing.T) {
 		{errorsx.New(errorsx.CodeFileExists, "exists"), -32007},
 		{errorsx.New(errorsx.CodeChecksumMismatch, "mismatch"), -32008},
 		{errorsx.New(errorsx.CodeChecksumUnavailable, "missing"), -32009},
+		{errorsx.New(errorsx.CodeContentTooLarge, "too large"), -32012},
 	}
 	for _, tc := range cases {
 		res := toRPCError(1, tc.err)
@@ -401,53 +402,14 @@ func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 	}
 }
 
-func TestToolDefsDoNotExposeLegacyAliases(t *testing.T) {
-	legacy := []string{
-		"ssh_upload_file",
-		"ssh_download_file",
-		"ssh_profiles_list",
-		"ssh_profile_delete",
-		"ssh_quick_setup_template",
-		"ssh_quick_setup_save",
-		"ssh_sudo_password_prompt",
-		"ssh_privilege_status",
-		"ssh_privilege_revoke",
+func TestUnknownToolReturnsError(t *testing.T) {
+	s := NewServer(nil)
+	_, err := s.callTool("ssh_nonexistent", nil)
+	if err == nil {
+		t.Fatal("expected error for unknown tool")
 	}
-	tools := toolDefs("csshctl")
-	for _, alias := range legacy {
-		for _, td := range tools {
-			name, _ := td["name"].(string)
-			if name == alias {
-				t.Fatalf("legacy alias should not be exposed in tools/list: %s", alias)
-			}
-		}
-	}
-}
-
-func TestAliasCallReturnsCanonicalWarning(t *testing.T) {
-	tmp := t.TempDir()
-	svc := app.NewService(model.Config{
-		DefaultShell:      "bash -lc",
-		DefaultTimeoutSec: 120,
-		RuntimeDir:        filepath.Join(tmp, "runtime"),
-		LogsDir:           filepath.Join(tmp, "logs"),
-		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
-	})
-	s := NewServer(svc)
-
-	out, err := s.callTool("ssh_profiles_list", nil)
-	if err != nil {
-		t.Fatalf("ssh_profiles_list alias call failed: %v", err)
-	}
-	if out["canonical_tool"] != "ssh_profile" {
-		t.Fatalf("canonical_tool mismatch: %#v", out["canonical_tool"])
-	}
-	rawWarnings, ok := out["warnings"].([]string)
-	if !ok || len(rawWarnings) == 0 {
-		t.Fatalf("warnings should include deprecation hint: %#v", out["warnings"])
-	}
-	if !strings.Contains(rawWarnings[0], "deprecated") {
-		t.Fatalf("warning should mention deprecation: %#v", rawWarnings)
+	if !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -488,17 +450,6 @@ func TestCnoteToolCall(t *testing.T) {
 	}
 }
 
-func TestApplyToolAliasDefaultsForSudoPrompt(t *testing.T) {
-	in := map[string]any{"profile_id": "p1"}
-	out := applyToolAliasDefaults(in, "ssh_sudo_password_prompt")
-	fields, ok := out["fields"].([]string)
-	if !ok || len(fields) != 1 || fields[0] != "sudo_password" {
-		t.Fatalf("unexpected fields defaults: %#v", out["fields"])
-	}
-	if out["prompt_mode"] != "web" {
-		t.Fatalf("prompt_mode should default to web, got: %#v", out["prompt_mode"])
-	}
-}
 
 func TestCancelledNotification(t *testing.T) {
 	s := NewServer(nil)
@@ -782,6 +733,37 @@ func TestReadOnlyToolAnnotations(t *testing.T) {
 		if ann["destructiveHint"] != false {
 			t.Errorf("%s: destructiveHint should be false", name)
 		}
+	}
+}
+
+func TestApplyPatchSchemaIncludesDryRun(t *testing.T) {
+	tool := findToolDef(t, "ssh_apply_patch")
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	requiredAny := requiredAsAny(t, schema)
+	for _, k := range []string{"connection_id", "patch_unified"} {
+		if !containsString(requiredAny, k) {
+			t.Fatalf("required should contain %s: %#v", k, requiredAny)
+		}
+	}
+	if containsString(requiredAny, "dry_run") {
+		t.Fatalf("dry_run should NOT be required")
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	drProp, ok := props["dry_run"].(map[string]any)
+	if !ok {
+		t.Fatalf("dry_run property missing from ssh_apply_patch schema")
+	}
+	if drProp["type"] != "boolean" {
+		t.Fatalf("dry_run should be boolean, got %v", drProp["type"])
+	}
+	if _, ok := props["base_dir"]; !ok {
+		t.Fatalf("base_dir property missing")
 	}
 }
 

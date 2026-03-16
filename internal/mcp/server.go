@@ -312,19 +312,10 @@ func (s *Server) callToolWithContext(ctx context.Context, name string, args map[
 	if args == nil {
 		args = map[string]any{}
 	}
-	canonicalName, deprecatedFrom, ok := resolveToolAlias(name)
-	if !ok {
+	if _, ok := canonicalToolNames[name]; !ok {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
-	args = applyToolAliasDefaults(args, deprecatedFrom)
-	result, err := s.callCanonicalToolWithContext(ctx, canonicalName, args, onProgress)
-	if err != nil {
-		return nil, err
-	}
-	if deprecatedFrom != "" {
-		result = withDeprecatedToolWarning(result, deprecatedFrom, canonicalName)
-	}
-	return result, nil
+	return s.callCanonicalToolWithContext(ctx, name, args, onProgress)
 }
 
 // callCanonicalToolWithContext dispatches to the appropriate service method.
@@ -357,19 +348,10 @@ func (s *Server) callTool(name string, args map[string]any) (map[string]any, err
 	if args == nil {
 		args = map[string]any{}
 	}
-	canonicalName, deprecatedFrom, ok := resolveToolAlias(name)
-	if !ok {
+	if _, ok := canonicalToolNames[name]; !ok {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
-	args = applyToolAliasDefaults(args, deprecatedFrom)
-	result, err := s.callCanonicalTool(canonicalName, args)
-	if err != nil {
-		return nil, err
-	}
-	if deprecatedFrom != "" {
-		result = withDeprecatedToolWarning(result, deprecatedFrom, canonicalName)
-	}
-	return result, nil
+	return s.callCanonicalTool(name, args)
 }
 
 func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string]any, error) {
@@ -511,7 +493,7 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		if baseDir == "" {
 			baseDir = "/"
 		}
-		return s.svc.ApplyPatch(connID, patch, baseDir)
+		return s.svc.ApplyPatch(connID, patch, baseDir, app.ParseBoolAny(args["dry_run"], false))
 	case "ssh_disconnect":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -621,106 +603,6 @@ var canonicalToolNames = map[string]struct{}{
 	"ssh_credentials_prompt": {},
 }
 
-var toolAliases = map[string]string{
-	"ssh_upload_file":          "ssh_transfer",
-	"ssh_download_file":        "ssh_transfer",
-	"ssh_profiles_list":        "ssh_profile",
-	"ssh_profile_delete":       "ssh_profile",
-	"ssh_quick_setup_template": "ssh_profile_setup",
-	"ssh_quick_setup_save":     "ssh_profile_setup",
-	"ssh_sudo_password_prompt": "ssh_credentials_prompt",
-	"ssh_privilege_status":     "ssh_privilege",
-	"ssh_privilege_revoke":     "ssh_privilege",
-}
-
-func resolveToolAlias(name string) (canonicalName, deprecatedFrom string, ok bool) {
-	if canonical, found := toolAliases[name]; found {
-		return canonical, name, true
-	}
-	if _, found := canonicalToolNames[name]; found {
-		return name, "", true
-	}
-	return "", "", false
-}
-
-func applyToolAliasDefaults(args map[string]any, deprecatedFrom string) map[string]any {
-	if deprecatedFrom == "" {
-		return args
-	}
-	out := make(map[string]any, len(args)+2)
-	for k, v := range args {
-		out[k] = v
-	}
-	switch deprecatedFrom {
-	case "ssh_upload_file":
-		if stringArg(out, "direction") == "" {
-			out["direction"] = "upload"
-		}
-	case "ssh_download_file":
-		if stringArg(out, "direction") == "" {
-			out["direction"] = "download"
-		}
-	case "ssh_profiles_list":
-		if stringArg(out, "action") == "" {
-			out["action"] = "list"
-		}
-	case "ssh_profile_delete":
-		if stringArg(out, "action") == "" {
-			out["action"] = "delete"
-		}
-	case "ssh_quick_setup_template":
-		if stringArg(out, "step") == "" {
-			out["step"] = "template"
-		}
-	case "ssh_quick_setup_save":
-		if stringArg(out, "step") == "" {
-			out["step"] = "save"
-		}
-	case "ssh_sudo_password_prompt":
-		if _, ok := out["fields"]; !ok {
-			out["fields"] = []string{"sudo_password"}
-		}
-		if stringArg(out, "prompt_mode") == "" {
-			out["prompt_mode"] = "web"
-		}
-	case "ssh_privilege_status":
-		if stringArg(out, "action") == "" {
-			out["action"] = "status"
-		}
-	case "ssh_privilege_revoke":
-		if stringArg(out, "action") == "" {
-			out["action"] = "revoke"
-		}
-	}
-	return out
-}
-
-func withDeprecatedToolWarning(result map[string]any, deprecatedFrom, canonicalName string) map[string]any {
-	if result == nil {
-		result = map[string]any{}
-	}
-	warning := fmt.Sprintf("Tool %s is deprecated; use %s.", deprecatedFrom, canonicalName)
-	var warnings []string
-	switch raw := result["warnings"].(type) {
-	case []string:
-		warnings = append(warnings, raw...)
-	case []any:
-		for _, item := range raw {
-			s, ok := item.(string)
-			if ok && strings.TrimSpace(s) != "" {
-				warnings = append(warnings, s)
-			}
-		}
-	case string:
-		if strings.TrimSpace(raw) != "" {
-			warnings = append(warnings, raw)
-		}
-	}
-	warnings = append(warnings, warning)
-	result["warnings"] = warnings
-	result["canonical_tool"] = canonicalName
-	return result
-}
 
 func stringArg(args map[string]any, key string) string {
 	v, ok := args[key]
@@ -758,6 +640,8 @@ func toRPCError(id any, err error) response {
 			code = -32008
 		case errorsx.CodeChecksumUnavailable:
 			code = -32009
+		case errorsx.CodeContentTooLarge:
+			code = -32012
 		case errorsx.CodeCancelled:
 			code = -32800
 		}
@@ -1123,14 +1007,14 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_write_file",
-			"Write remote file content inside workspace_roots. Requires connection_id/path/content; mode supports create|overwrite|append.",
+			"Write remote file content inside workspace_roots (max 5 MB; use ssh_transfer for larger files). mode: create fails if exists, overwrite atomically replaces, append creates or appends. Default: overwrite.",
 			reqSchema([]string{"connection_id", "path", "content"}, "connection_id", "path", "content", "mode", "cwd"),
 			destructiveAnnotations("Write Remote File", true),
 		),
 		tool(
 			"ssh_apply_patch",
-			"Apply unified patch via patch(1) on remote host. Requires connection_id + patch_unified; base_dir defaults to '/'.",
-			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir"),
+			"Apply unified patch via patch(1) on remote host. Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files.",
+			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir", "dry_run"),
 			destructiveAnnotations("Apply Patch on Remote", true),
 		),
 		tool(
@@ -1345,7 +1229,7 @@ func paramSchema(key string) map[string]any {
 	case "content":
 		return map[string]any{"type": "string", "description": "File content payload for write operation."}
 	case "mode":
-		return map[string]any{"type": "string", "enum": []string{"create", "overwrite", "append"}, "description": "Write mode."}
+		return map[string]any{"type": "string", "enum": []string{"create", "overwrite", "append"}, "description": "Write mode. create: fails if file exists. overwrite (default): atomic replace via temp file. append: creates file or appends to existing."}
 	case "create_parents":
 		return map[string]any{"type": "boolean", "description": "Create destination parent directories if missing. Default true."}
 	case "verify_checksum":
@@ -1356,6 +1240,8 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "description": "Unified diff patch text."}
 	case "base_dir":
 		return map[string]any{"type": "string", "description": "Base directory to apply patch in."}
+	case "dry_run":
+		return map[string]any{"type": "boolean", "description": "Dry-run mode: validate patch without applying. Default false."}
 	case "depth":
 		return map[string]any{"type": "integer", "description": "Directory listing recursion depth."}
 	case "pattern":
