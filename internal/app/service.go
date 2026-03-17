@@ -1594,133 +1594,108 @@ func sanitizeCommandForAudit(command string) string {
 }
 
 func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Connection, error) {
-	if input.ProfileID != "" || input.ProfileName != "" {
-		p, err := s.resolveProfileRef(input.ProfileID, input.ProfileName)
-		if err != nil {
-			return model.Connection{}, err
-		}
-		if strings.EqualFold(strings.TrimSpace(p.Username), "root") && !p.AllowRootUser && !s.cfg.AllowRootLogin {
-			return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy; enable allow_root_user in profile to override")
-		}
-		allowPublic := p.AllowPublicHost || s.cfg.AllowPublicHost
-		if input.AllowPublicHost != nil {
-			allowPublic = *input.AllowPublicHost
-		}
-		password, _ := s.secrets.Get(p.ID, "password")
-		keyPassphrase, _ := s.secrets.Get(p.ID, "key_passphrase")
-		sudoPassword, _ := s.secrets.Get(p.ID, "sudo_password")
-		securityProfile := strings.TrimSpace(p.SecurityProfile)
-		if securityProfile == "" {
-			securityProfile = s.cfg.SecurityProfileDefault
-		}
-		if securityProfile == "" {
-			securityProfile = "easy_safe"
-		}
-		roots := append([]string{}, p.WorkspaceRoots...)
-		limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
-		if err != nil {
-			return model.Connection{}, err
-		}
-		cnotePath, cnote, err := s.readProfileCnote(p)
-		if err != nil {
-			return model.Connection{}, err
-		}
-		maxAutoRisk := p.MaxAutoRisk
-		if strings.TrimSpace(maxAutoRisk) == "" && strings.EqualFold(securityProfile, "ops_strict") {
-			maxAutoRisk = "L1"
-		}
-		return model.Connection{
-			ProfileID:       p.ID,
-			Host:            p.Host,
-			Port:            p.Port,
-			Username:        p.Username,
-			AuthPriority:    append([]string{}, p.AuthPriority...),
-			KeyPath:         p.KeyPath,
-			KeyPassphrase:   keyPassphrase,
-			Password:        password,
-			SudoPassword:    sudoPassword,
-			WorkspaceRoots:  roots,
-			LimitDir:        limitDir,
-			AllowPublicHost: allowPublic,
-			SecurityProfile: securityProfile,
-			AllowRootUser:   p.AllowRootUser,
-			MaxAutoRisk:     maxAutoRisk,
-			AllowReboot:     p.AllowReboot,
-			AllowDiskOps:    p.AllowDiskOps,
-			DenyPatterns:    append([]string{}, p.DenyPatterns...),
-			GrantTTLSec:     p.GrantTTLSec,
-			CnotePath:       cnotePath,
-			Cnote:           cnote,
-		}, nil
+	if input.ProfileID == "" && input.ProfileName == "" {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams,
+			"profile_id or profile_name is required; create a profile first with ssh_profile_setup(step=save)")
 	}
-
-	if s.cfg.ConnectRequireProfile {
-		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "direct host connection denied by policy; use profile_id/profile_name")
+	p, err := s.resolveProfileRef(input.ProfileID, input.ProfileName)
+	if err != nil {
+		return model.Connection{}, err
 	}
-	if input.Host == "" || input.Username == "" {
-		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "provide profile_id/profile_name or host/username")
+	if strings.EqualFold(strings.TrimSpace(p.Username), "root") && !p.AllowRootUser && !s.cfg.AllowRootLogin {
+		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy; enable allow_root_user in profile to override")
 	}
-	if strings.EqualFold(strings.TrimSpace(input.Username), "root") && !s.cfg.AllowRootLogin {
-		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy")
-	}
-	allowPublic := s.cfg.AllowPublicHost
+	allowPublic := p.AllowPublicHost || s.cfg.AllowPublicHost
 	if input.AllowPublicHost != nil {
 		allowPublic = *input.AllowPublicHost
 	}
-	authPriority := []string{"key", "password"}
-	if input.AuthMode != "" {
-		switch strings.ToLower(strings.TrimSpace(input.AuthMode)) {
-		case "hybrid":
-			authPriority = []string{"key", "password"}
-		case "key", "password":
-			authPriority = []string{strings.ToLower(strings.TrimSpace(input.AuthMode))}
-		default:
-			return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "auth_mode must be key|password|hybrid")
-		}
+	password, _ := s.secrets.Get(p.ID, "password")
+	keyPassphrase, _ := s.secrets.Get(p.ID, "key_passphrase")
+	sudoPassword, _ := s.secrets.Get(p.ID, "sudo_password")
+	securityProfile := strings.TrimSpace(p.SecurityProfile)
+	if securityProfile == "" {
+		securityProfile = s.cfg.SecurityProfileDefault
 	}
-	password := ""
-	if input.PasswordRef != "" {
-		val, err := s.secrets.Get(input.PasswordRef, "password")
-		if err == nil {
-			password = val
-		}
+	if securityProfile == "" {
+		securityProfile = "easy_safe"
 	}
-	keyPath := input.KeyRef
-	if keyPath == "" {
-		keyPath = "~/.ssh/id_rsa"
-	}
-	roots := input.WorkspaceRoots
-	if len(roots) == 0 {
-		roots = []string{"/"}
-	}
-	for i := range roots {
-		roots[i] = path.Clean(roots[i])
-	}
+	roots := append([]string{}, p.WorkspaceRoots...)
 	limitDir, roots, err := applyLimitDir(input.LimitDir, roots)
 	if err != nil {
 		return model.Connection{}, err
 	}
-	securityProfile := strings.TrimSpace(s.cfg.SecurityProfileDefault)
-	if securityProfile == "" {
-		securityProfile = "easy_safe"
+	cnotePath, cnote, err := s.readProfileCnote(p)
+	if err != nil {
+		return model.Connection{}, err
 	}
-	maxAutoRisk := ""
-	if strings.EqualFold(securityProfile, "ops_strict") {
+	maxAutoRisk := p.MaxAutoRisk
+	if strings.TrimSpace(maxAutoRisk) == "" && strings.EqualFold(securityProfile, "ops_strict") {
 		maxAutoRisk = "L1"
 	}
+
+	// Phase 6: passphrase pre-detection for key-based auth
+	if containsStr(p.AuthPriority, "key") && strings.TrimSpace(p.KeyPath) != "" {
+		expandedKeyPath := config.ExpandHome(strings.TrimSpace(p.KeyPath))
+		if _, statErr := os.Stat(expandedKeyPath); os.IsNotExist(statErr) {
+			return model.Connection{}, &errorsx.CsshError{
+				Code:    errorsx.CodeKeyNotFound,
+				Message: fmt.Sprintf("key file not found: %s; use ssh_key_setup to select a key", expandedKeyPath),
+				Data: map[string]any{
+					"profile_id": p.ID,
+					"key_path":   expandedKeyPath,
+					"hint": map[string]any{
+						"tool":      "ssh_key_setup",
+						"arguments": map[string]any{"profile_id": p.ID},
+					},
+				},
+			}
+		}
+		needsPass, checkErr := CheckKeyPassphrase(expandedKeyPath)
+		if checkErr == nil && needsPass {
+			// Check ssh-agent first
+			inAgent, _ := IsKeyLoadedInAgent(expandedKeyPath)
+			if !inAgent {
+				// Check keychain
+				if strings.TrimSpace(keyPassphrase) == "" {
+					return model.Connection{}, &errorsx.CsshError{
+						Code:    errorsx.CodeKeyPassphraseRequired,
+						Message: fmt.Sprintf("key %s requires a passphrase but none is available in agent or keychain", expandedKeyPath),
+						Data: map[string]any{
+							"profile_id": p.ID,
+							"key_path":   expandedKeyPath,
+							"hint": map[string]any{
+								"tool":      "ssh_credentials_prompt",
+								"arguments": map[string]any{"profile_id": p.ID, "fields": []string{"key_passphrase"}},
+							},
+						},
+					}
+				}
+			}
+		}
+	}
+
 	return model.Connection{
-		Host:            input.Host,
-		Port:            input.Port,
-		Username:        input.Username,
-		AuthPriority:    authPriority,
-		KeyPath:         config.ExpandHome(keyPath),
+		ProfileID:       p.ID,
+		Host:            p.Host,
+		Port:            p.Port,
+		Username:        p.Username,
+		AuthPriority:    append([]string{}, p.AuthPriority...),
+		KeyPath:         p.KeyPath,
+		KeyPassphrase:   keyPassphrase,
 		Password:        password,
+		SudoPassword:    sudoPassword,
 		WorkspaceRoots:  roots,
 		LimitDir:        limitDir,
 		AllowPublicHost: allowPublic,
 		SecurityProfile: securityProfile,
-		AllowRootUser:   s.cfg.AllowRootLogin,
+		AllowRootUser:   p.AllowRootUser,
 		MaxAutoRisk:     maxAutoRisk,
+		AllowReboot:     p.AllowReboot,
+		AllowDiskOps:    p.AllowDiskOps,
+		DenyPatterns:    append([]string{}, p.DenyPatterns...),
+		GrantTTLSec:     p.GrantTTLSec,
+		CnotePath:       cnotePath,
+		Cnote:           cnote,
 	}, nil
 }
 

@@ -18,7 +18,6 @@ default_shell = "bash -lc"
 default_timeout_sec = 120
 allow_public_host = true
 security_profile_default = "easy_safe"
-connect_require_profile = true
 sudo_enabled = true
 allow_root_login = false
 `
@@ -66,7 +65,6 @@ func Load(configPath string) (model.Config, error) {
 		LogsDir:                filepath.Join(base, "logs"),
 		ProfilesFile:           filepath.Join(base, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
-		ConnectRequireProfile: true,
 		SudoEnabled:           true,
 		AllowRootLogin:         false,
 	}
@@ -116,8 +114,6 @@ func Load(configPath string) (model.Config, error) {
 			if strings.TrimSpace(val) != "" {
 				cfg.SecurityProfileDefault = strings.TrimSpace(val)
 			}
-		case "connect_require_profile":
-			cfg.ConnectRequireProfile = strings.EqualFold(val, "true")
 		case "sudo_enabled":
 			cfg.SudoEnabled = strings.EqualFold(val, "true")
 		case "allow_root_login":

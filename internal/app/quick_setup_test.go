@@ -50,7 +50,6 @@ func newTestService(t *testing.T) *Service {
 		LogsDir:                filepath.Join(tmp, "logs"),
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
-		ConnectRequireProfile:  true,
 		SudoEnabled:            true,
 	}
 	svc := NewService(cfg)
@@ -274,14 +273,11 @@ func TestBuildProfileID(t *testing.T) {
 	}
 }
 
-func TestResolveConnectionInputDirectDeniedByPolicy(t *testing.T) {
+func TestResolveConnectionInputRequiresProfile(t *testing.T) {
 	svc := newTestService(t)
-	_, err := svc.resolveConnectionInput(model.ConnectionInput{
-		Host:     "100.100.1.9",
-		Username: "ubuntu",
-	})
+	_, err := svc.resolveConnectionInput(model.ConnectionInput{})
 	if err == nil {
-		t.Fatalf("expected direct connection to be denied")
+		t.Fatalf("expected error when no profile specified")
 	}
 }
 

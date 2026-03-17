@@ -39,6 +39,8 @@ func main() {
 		handleProfile(svc, cfg, os.Args[2:])
 	case "secret":
 		handleSecret(svc, os.Args[2:])
+	case "key":
+		handleKey(os.Args[2:])
 	case "approvals":
 		handleApprovals(svc, os.Args[2:])
 	case "approve":
@@ -56,9 +58,12 @@ func main() {
 func usage() {
 	fmt.Print(`csshctl commands:
   profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false] [--max-auto-risk L2] [--allow-reboot=false] [--allow-disk-ops=false] [--deny-patterns pat1,pat2]
+  profile edit --id ID [--name NAME] [--host HOST] [--user USER] [--port 22] [--key-path PATH] [--auth-priority key,password] [--workspace-roots /a,/b] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false] [--grant-ttl-sec 0]
   profile list
   profile show --id ID
   profile remove --id ID
+
+  key scan [--dir ~/.ssh/]
 
   secret set-password --profile ID [--value VALUE]
   secret delete-password --profile ID
@@ -154,6 +159,69 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 			fatal(fmt.Errorf("profile not found"))
 		}
 		printJSON(p)
+	case "edit":
+		fs := flag.NewFlagSet("profile edit", flag.ExitOnError)
+		id := fs.String("id", "", "profile id (required)")
+		name := fs.String("name", "", "profile display name")
+		host := fs.String("host", "", "ssh host")
+		port := fs.Int("port", -1, "ssh port")
+		user := fs.String("user", "", "ssh username")
+		keyPath := fs.String("key-path", "", "ssh private key path")
+		authPriority := fs.String("auth-priority", "", "auth priority (comma separated)")
+		workspaceRoots := fs.String("workspace-roots", "", "comma separated roots")
+		allowPublic := fs.String("allow-public", "", "allow public host (true/false)")
+		securityProfile := fs.String("security-profile", "", "security profile")
+		allowRootUser := fs.String("allow-root-user", "", "allow root user (true/false)")
+		grantTTLSec := fs.Int("grant-ttl-sec", -1, "grant TTL in seconds")
+		_ = fs.Parse(args[1:])
+		if *id == "" {
+			fatal(fmt.Errorf("--id is required"))
+		}
+		p, err := store.Get(*id)
+		if err != nil {
+			fatal(err)
+		}
+		if p == nil {
+			fatal(fmt.Errorf("profile not found: %s", *id))
+		}
+		if *name != "" {
+			p.Name = *name
+		}
+		if *host != "" {
+			p.Host = *host
+		}
+		if *port >= 0 {
+			p.Port = *port
+		}
+		if *user != "" {
+			p.Username = *user
+		}
+		if *keyPath != "" {
+			p.KeyPath = config.ExpandHome(*keyPath)
+		}
+		if *authPriority != "" {
+			p.AuthPriority = splitCSV(*authPriority)
+		}
+		if *workspaceRoots != "" {
+			p.WorkspaceRoots = splitCSV(*workspaceRoots)
+		}
+		if *allowPublic != "" {
+			p.AllowPublicHost = strings.EqualFold(*allowPublic, "true")
+		}
+		if *securityProfile != "" {
+			p.SecurityProfile = normalizeSecurityProfile(*securityProfile, cfg.SecurityProfileDefault)
+		}
+		if *allowRootUser != "" {
+			p.AllowRootUser = strings.EqualFold(*allowRootUser, "true")
+		}
+		if *grantTTLSec >= 0 {
+			p.GrantTTLSec = *grantTTLSec
+		}
+		applySecurityProfileDefaults(p)
+		if err := store.Upsert(*p); err != nil {
+			fatal(err)
+		}
+		printJSON(map[string]any{"ok": true, "profile": p})
 	case "remove":
 		fs := flag.NewFlagSet("profile remove", flag.ExitOnError)
 		id := fs.String("id", "", "profile id")
@@ -169,6 +237,39 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		usage()
 		os.Exit(1)
 	}
+}
+
+func handleKey(args []string) {
+	if len(args) == 0 || args[0] != "scan" {
+		usage()
+		os.Exit(1)
+	}
+	fs := flag.NewFlagSet("key scan", flag.ExitOnError)
+	dir := fs.String("dir", "~/.ssh/", "directory to scan for SSH keys")
+	_ = fs.Parse(args[1:])
+	scanDir := config.ExpandHome(*dir)
+	keys, err := app.ScanSSHKeys(scanDir)
+	if err != nil {
+		fatal(err)
+	}
+	// Table output
+	fmt.Fprintf(os.Stderr, "%-40s %-12s %-18s\n", "PATH", "ALGORITHM", "PASSPHRASE")
+	for _, k := range keys {
+		passStatus := "no"
+		if k.NeedsPassphrase {
+			passStatus = "yes"
+			if k.InAgent {
+				passStatus = "yes (in agent)"
+			}
+		}
+		path := k.Path
+		home, _ := os.UserHomeDir()
+		if home != "" && strings.HasPrefix(path, home) {
+			path = "~" + path[len(home):]
+		}
+		fmt.Fprintf(os.Stderr, "%-40s %-12s %-18s\n", path, k.Algorithm, passStatus)
+	}
+	printJSON(keys)
 }
 
 func handleSecret(svc *app.Service, args []string) {

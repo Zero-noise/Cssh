@@ -222,7 +222,7 @@ func TestDenyAlwaysCannotBeApproved(t *testing.T) {
 	}
 }
 
-// TestOpsStrictDefaultsUpgradeL2(t *testing.T) verifies that ops_strict
+// TestOpsStrictDefaultsUpgradeL2 verifies that ops_strict
 // connections default to MaxAutoRisk=L1, upgrading L2 DenyNone to DenyNeedApprove.
 func TestOpsStrictDefaultsUpgradeL2(t *testing.T) {
 	tmp := t.TempDir()
@@ -233,16 +233,19 @@ func TestOpsStrictDefaultsUpgradeL2(t *testing.T) {
 		LogsDir:                filepath.Join(tmp, "logs"),
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
 		SecurityProfileDefault: "ops_strict",
-		ConnectRequireProfile:  false,
 		SudoEnabled:            true,
 	})
 
-	allowPublic := true
-	conn, err := svc.resolveConnectionInput(model.ConnectionInput{
-		Host:            "10.0.0.5",
-		Username:        "deploy",
-		AllowPublicHost: &allowPublic,
-	})
+	// Create ops_strict profile
+	if err := svc.profiles.Upsert(model.Profile{
+		ID: "ops-test", Name: "ops-test", Host: "10.0.0.5", Port: 22,
+		Username: "deploy", AuthPriority: []string{"key"}, KeyPath: "",
+		WorkspaceRoots: []string{"/"}, AllowPublicHost: true,
+		SecurityProfile: "ops_strict",
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	conn, err := svc.resolveConnectionInput(model.ConnectionInput{ProfileID: "ops-test"})
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -258,13 +261,16 @@ func TestOpsStrictDefaultsUpgradeL2(t *testing.T) {
 		LogsDir:                filepath.Join(tmp, "logs2"),
 		ProfilesFile:           filepath.Join(tmp, "profiles2.json"),
 		SecurityProfileDefault: "easy_safe",
-		ConnectRequireProfile:  false,
 	})
-	conn2, err := svc2.resolveConnectionInput(model.ConnectionInput{
-		Host:            "10.0.0.6",
-		Username:        "dev",
-		AllowPublicHost: &allowPublic,
-	})
+	if err := svc2.profiles.Upsert(model.Profile{
+		ID: "easy-test", Name: "easy-test", Host: "10.0.0.6", Port: 22,
+		Username: "dev", AuthPriority: []string{"key"}, KeyPath: "",
+		WorkspaceRoots: []string{"/"}, AllowPublicHost: true,
+		SecurityProfile: "easy_safe",
+	}); err != nil {
+		t.Fatalf("upsert2: %v", err)
+	}
+	conn2, err := svc2.resolveConnectionInput(model.ConnectionInput{ProfileID: "easy-test"})
 	if err != nil {
 		t.Fatalf("resolve2: %v", err)
 	}

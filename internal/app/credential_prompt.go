@@ -455,45 +455,43 @@ var credFormTmpl = template.Must(template.New("cred").Parse(`<!DOCTYPE html>
 <title>CSSH — Credential Entry</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
-.card{background:#fff;border-radius:12px;box-shadow:0 2px 16px rgba(0,0,0,.1);max-width:480px;width:100%;padding:32px}
-h1{font-size:20px;margin-bottom:8px;color:#1a1a1a}
-.context{background:#f7f8fa;border-radius:8px;padding:12px 16px;margin:12px 0 24px;font-size:13px;color:#555;line-height:1.6}
-.context span{color:#333;font-weight:500}
-.field{margin-bottom:20px}
-.field label{display:block;font-size:14px;font-weight:500;margin-bottom:6px;color:#333}
-.input-wrap{position:relative}
-.input-wrap input{width:100%;padding:10px 42px 10px 12px;border:1px solid #d0d5dd;border-radius:8px;font-size:14px;outline:none;transition:border-color .2s}
-.input-wrap input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.1)}
-.toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:#888;font-size:13px;padding:4px 6px}
-.toggle:hover{color:#333}
-button[type=submit]{width:100%;padding:12px;background:#2563eb;color:#fff;border:none;border-radius:8px;font-size:15px;font-weight:500;cursor:pointer;transition:background .2s}
-button[type=submit]:hover{background:#1d4ed8}
-.note{margin-top:16px;font-size:12px;color:#888;text-align:center;line-height:1.5}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);max-width:420px;width:100%;padding:24px}
+h1{font-size:15px;font-weight:600;color:#111;margin-bottom:12px}
+.ctx{font-size:12px;color:#666;margin-bottom:16px;line-height:1.5}
+.ctx b{color:#333;font-weight:500}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:13px;font-weight:500;margin-bottom:4px;color:#333}
+.iw{position:relative}
+.iw input{width:100%;padding:7px 36px 7px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;outline:none}
+.iw input:focus{border-color:#333}
+.tog{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:#aaa;font-size:11px;padding:2px 4px}
+.tog:hover{color:#555}
+.sub{width:100%;padding:9px;background:#222;color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:500;cursor:pointer}
+.sub:hover{background:#000}
+.note{margin-top:12px;font-size:11px;color:#aaa;text-align:center;line-height:1.4}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>SSH Credential Entry</h1>
-<div class="context">
-Host: <span>{{.Profile.Host}}:{{.Profile.Port}}</span><br>
-Username: <span>{{.Profile.Username}}</span><br>
-Auth Mode: <span>{{range $i, $v := .Profile.AuthPriority}}{{if $i}}, {{end}}{{$v}}{{end}}</span>
+<div class="ctx">
+<b>{{.Profile.Host}}:{{.Profile.Port}}</b> &middot; {{.Profile.Username}} &middot; {{range $i, $v := .Profile.AuthPriority}}{{if $i}}, {{end}}{{$v}}{{end}}
 </div>
 <form method="POST" action="/submit">
 <input type="hidden" name="nonce" value="{{.Nonce}}">
 {{range .Fields}}
 <div class="field">
 <label>{{if eq . "password"}}Password{{else if eq . "key_passphrase"}}Key Passphrase{{else if eq . "sudo_password"}}Sudo Password{{else}}{{.}}{{end}}</label>
-<div class="input-wrap">
+<div class="iw">
 <input type="password" name="{{.}}" id="f_{{.}}" autocomplete="off">
-<button type="button" class="toggle" onclick="toggleVis('f_{{.}}',this)">Show</button>
+<button type="button" class="tog" onclick="toggleVis('f_{{.}}',this)">Show</button>
 </div>
 </div>
 {{end}}
-<button type="submit">Save to Keychain</button>
+<button type="submit" class="sub">Save to Keychain</button>
 </form>
-<p class="note">Credentials are saved directly to the system keychain.<br>AI will never see any passwords.</p>
+<p class="note">Credentials saved to system keychain. AI never sees them.</p>
 </div>
 <script>
 function toggleVis(id,btn){var el=document.getElementById(id);if(el.type==='password'){el.type='text';btn.textContent='Hide'}else{el.type='password';btn.textContent='Show'}}
@@ -508,18 +506,18 @@ const credSuccessHTML = `<!DOCTYPE html>
 <title>CSSH — Saved</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
-.card{background:#fff;border-radius:12px;box-shadow:0 2px 16px rgba(0,0,0,.1);max-width:400px;width:100%;padding:40px;text-align:center}
-.ok{font-size:48px;margin-bottom:16px}
-h1{font-size:20px;color:#1a1a1a;margin-bottom:8px}
-p{color:#666;font-size:14px}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);max-width:320px;width:100%;padding:32px;text-align:center}
+.ok{font-size:36px;margin-bottom:12px}
+h1{font-size:15px;font-weight:600;color:#111;margin-bottom:6px}
+p{color:#888;font-size:12px}
 </style>
 </head>
 <body>
 <div class="card">
 <div class="ok">&#10003;</div>
 <h1>Credentials Saved</h1>
-<p>You can close this page now.</p>
+<p>You can close this page.</p>
 </div>
 <script>setTimeout(function(){window.close()},2000)</script>
 </body>
@@ -532,16 +530,16 @@ const credNoChangesHTML = `<!DOCTYPE html>
 <title>CSSH — No Credentials Saved</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
-.card{background:#fff;border-radius:12px;box-shadow:0 2px 16px rgba(0,0,0,.1);max-width:440px;width:100%;padding:36px;text-align:center}
-h1{font-size:20px;color:#1a1a1a;margin-bottom:10px}
-p{color:#666;font-size:14px;line-height:1.6}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);max-width:320px;width:100%;padding:32px;text-align:center}
+h1{font-size:15px;font-weight:600;color:#111;margin-bottom:8px}
+p{color:#888;font-size:12px;line-height:1.5}
 </style>
 </head>
 <body>
 <div class="card">
 <h1>No Credentials Saved</h1>
-<p>No non-empty credential values were submitted.<br>Fill at least one field and submit again.</p>
+<p>No values were submitted. Fill at least one field and submit again.</p>
 </div>
 </body>
 </html>`
@@ -553,16 +551,16 @@ const credPartialHTML = `<!DOCTYPE html>
 <title>CSSH — Partially Saved</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
-.card{background:#fff;border-radius:12px;box-shadow:0 2px 16px rgba(0,0,0,.1);max-width:440px;width:100%;padding:36px;text-align:center}
-h1{font-size:20px;color:#1a1a1a;margin-bottom:10px}
-p{color:#666;font-size:14px;line-height:1.6}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);max-width:320px;width:100%;padding:32px;text-align:center}
+h1{font-size:15px;font-weight:600;color:#111;margin-bottom:8px}
+p{color:#888;font-size:12px;line-height:1.5}
 </style>
 </head>
 <body>
 <div class="card">
-<h1>Credentials Partially Saved</h1>
-<p>Some fields were saved, but at least one field was left empty.</p>
+<h1>Partially Saved</h1>
+<p>Some fields were saved, but at least one was left empty.</p>
 </div>
 <script>setTimeout(function(){window.close()},2500)</script>
 </body>

@@ -53,7 +53,7 @@ Grants are always revoked on disconnect via `RevokeByConnection`. In `ops_strict
 
 ## Access Controls
 
-- **Profile-only connect**: remote connections are restricted to pre-configured profiles. Direct host/username connect is blocked unless a matching profile exists.
+- **Profile-only connect**: remote connections require a pre-configured profile (`profile_id` or `profile_name`). Direct host/username connect is not supported.
 - **Public host policy**: public internet hosts are allowed by default (`allow_public_host=true`). Effective rule is OR (global OR profile): if global is `true`, profile cannot further restrict; if global is `false`, only profiles with `allow_public_host=true` can connect public hosts.
 - **Write scope**: remote file writes (`ssh_write_file`, `ssh_apply_patch`) are restricted to directories listed in `workspace_roots`.
 - **Runtime narrowing**: `ssh_connect(limit_dir=...)` can further narrow effective runtime scope to a subdirectory (must be inside configured `workspace_roots`).
@@ -73,11 +73,17 @@ Stored credential types:
 - `key_passphrase` — passphrase for encrypted SSH private keys
 - `sudo_password` — password for `sudo` command execution on remote host
 
-The `ssh_credentials_prompt` tool opens a **local web form** where the user enters credentials directly into the OS keychain. Credentials never pass through the AI model.
+The `ssh_credentials_prompt` tool opens a **local web form** where the user enters credentials directly into the OS keychain. The `ssh_key_setup` tool opens a similar form for selecting an SSH key and entering its passphrase. Credentials never pass through the AI model.
 
-If the web form is unavailable, the tool returns manual CLI commands with the auto-resolved `csshctl` path:
+If the web form is unavailable, each tool returns manual CLI commands with the auto-resolved `csshctl` path:
 ```bash
+# ssh_credentials_prompt fallback
 csshctl secret set-password --profile <profile_id>
 csshctl secret set-key-passphrase --profile <profile_id>
 csshctl secret set-sudo-password --profile <profile_id>
+
+# ssh_key_setup fallback
+csshctl key scan --dir ~/.ssh/
+csshctl profile edit --id <profile_id> --key-path <path>
+csshctl secret set-key-passphrase --profile <profile_id>
 ```

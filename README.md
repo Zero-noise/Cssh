@@ -141,7 +141,7 @@ Additional controls: profile-only connections, `workspace_roots` write restricti
 
 | Tool | Description |
 |------|-------------|
-| `ssh_connect` | Create an SSH connection, returns `connection_id` |
+| `ssh_connect` | Profile-based SSH connection, returns `connection_id` |
 | `ssh_open_session` | Create a reusable shell session |
 | `ssh_exec` | Run a command with real-time progress streaming |
 | `ssh_connection_status` | Inspect connection health |
@@ -152,8 +152,9 @@ Additional controls: profile-only connections, `workspace_roots` write restricti
 | `ssh_transfer` | Transfer files via scp (SFTP default, legacy SCP fallback) with SHA-256 verification |
 | `ssh_profile` | List or delete saved profiles |
 | `ssh_cnote` | Read or update per-profile Cnote instructions |
-| `ssh_profile_setup` | Create profiles via guided setup flow |
+| `ssh_profile_setup` | Create or edit profiles via guided setup flow |
 | `ssh_credentials_prompt` | Securely store credentials via local web form |
+| `ssh_key_setup` | Select SSH key and store passphrase via local web form |
 | `ssh_privilege` | Inspect or revoke privilege grants |
 
 ## Build
@@ -178,6 +179,12 @@ csshctl profile add \
   --key-path ~/.ssh/id_ed25519 \
   --security-profile easy_safe
 
+# Edit a profile
+csshctl profile edit --id devbox --host 10.0.0.5 --workspace-roots /home/ubuntu/app
+
+# Scan for SSH keys
+csshctl key scan --dir ~/.ssh/
+
 # Store credentials
 csshctl secret set-password --profile devbox
 csshctl secret set-key-passphrase --profile devbox
@@ -193,10 +200,11 @@ csshctl approve apr_xxx --by yourname
 > Full setup flow: [docs/setup-flow.md](docs/setup-flow.md) · Runtime paths: [docs/runtime.md](docs/runtime.md)
 
 1. `ssh_profile_setup(step=template|save)` — create a profile
-2. `ssh_credentials_prompt(profile_id=...)` — store credentials if needed
-3. `ssh_connect(profile_id=...)` — connect (Cnote is returned automatically)
-4. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer` — work on the remote host
-5. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
+2. `ssh_key_setup(profile_id=...)` — select SSH key and store passphrase (if key auth)
+3. `ssh_credentials_prompt(profile_id=...)` — store password/sudo credentials if needed
+4. `ssh_connect(profile_id=...)` — connect (Cnote is returned automatically)
+5. `ssh_exec` / `ssh_read_file` / `ssh_write_file` / `ssh_transfer` — work on the remote host
+6. When a call returns `approval_required`, run `csshctl approve <id>` in a separate terminal, then retry with `approval_token`
 
 ## Notes
 

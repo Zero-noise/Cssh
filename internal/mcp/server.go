@@ -358,16 +358,9 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 	switch name {
 	case "ssh_connect":
 		in := model.ConnectionInput{
-			ProfileID:      stringArg(args, "profile_id"),
-			ProfileName:    stringArg(args, "profile_name"),
-			Host:           stringArg(args, "host"),
-			Port:           app.ParseIntAny(args["port"], 22),
-			Username:       stringArg(args, "username"),
-			AuthMode:       stringArg(args, "auth_mode"),
-			KeyRef:         stringArg(args, "key_ref"),
-			PasswordRef:    stringArg(args, "password_ref"),
-			WorkspaceRoots: app.ParseStringSliceAny(args["workspace_roots"]),
-			LimitDir:       stringArg(args, "limit_dir"),
+			ProfileID:   stringArg(args, "profile_id"),
+			ProfileName: stringArg(args, "profile_name"),
+			LimitDir:    stringArg(args, "limit_dir"),
 		}
 		if v, ok := args["allow_public_host"]; ok {
 			b := app.ParseBoolAny(v, false)
@@ -529,47 +522,75 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		if step == "" {
 			step = "template"
 		}
-		if step == "template" {
+		switch step {
+		case "template":
 			return s.svc.QuickSetupTemplate(stringArg(args, "purpose"), stringArg(args, "auth_mode"), stringArg(args, "username"))
-		}
-		if step != "save" {
-			return nil, errorsx.New(errorsx.CodeInvalidParams, "step must be one of: template, save")
-		}
-		purpose, err := app.RequireString(args, "purpose")
-		if err != nil {
-			return nil, err
-		}
-		host, err := app.RequireString(args, "host")
-		if err != nil {
-			return nil, err
-		}
-		username, err := app.RequireString(args, "username")
-		if err != nil {
-			return nil, err
-		}
-		roots := app.ParseStringSliceAny(args["workspace_roots"])
-		if len(roots) == 0 {
-			single := stringArg(args, "workspace_root")
-			if single != "" {
-				roots = []string{single}
+		case "edit":
+			profileID, err := app.RequireString(args, "profile_id")
+			if err != nil {
+				return nil, err
 			}
+			editRoots := app.ParseStringSliceAny(args["workspace_roots"])
+			if len(editRoots) == 0 {
+				if single := stringArg(args, "workspace_root"); single != "" {
+					editRoots = []string{single}
+				}
+			}
+			in := app.QuickSetupEditInput{
+				ProfileID:    profileID,
+				ProfileName:  stringPtrArg(args, "profile_name"),
+				Host:         stringPtrArg(args, "host"),
+				Port:         intPtrArg(args, "port"),
+				Username:     stringPtrArg(args, "username"),
+				AuthMode:     stringPtrArg(args, "auth_mode"),
+				AuthPriority: app.ParseStringSliceAny(args["auth_priority"]),
+				WorkspaceRoots: editRoots,
+				KeyPath:      stringPtrArg(args, "key_path"),
+				AllowPublicHost: boolPtrArg(args, "allow_public_host"),
+				SecurityProfile: stringPtrArg(args, "security_profile"),
+				AllowRootUser:   boolPtrArg(args, "allow_root_user"),
+				GrantTTLSec:     intPtrArg(args, "grant_ttl_sec"),
+			}
+			return s.svc.QuickSetupEdit(in)
+		case "save":
+			purpose, err := app.RequireString(args, "purpose")
+			if err != nil {
+				return nil, err
+			}
+			host, err := app.RequireString(args, "host")
+			if err != nil {
+				return nil, err
+			}
+			username, err := app.RequireString(args, "username")
+			if err != nil {
+				return nil, err
+			}
+			roots := app.ParseStringSliceAny(args["workspace_roots"])
+			if len(roots) == 0 {
+				single := stringArg(args, "workspace_root")
+				if single != "" {
+					roots = []string{single}
+				}
+			}
+			in := app.QuickSetupInput{
+				Purpose:         purpose,
+				ProfileID:       stringArg(args, "profile_id"),
+				ProfileName:     stringArg(args, "profile_name"),
+				Host:            host,
+				Port:            app.ParseIntAny(args["port"], 22),
+				Username:        username,
+				AuthMode:        stringArg(args, "auth_mode"),
+				WorkspaceRoots:  roots,
+				KeyPath:         stringArg(args, "key_path"),
+				AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
+				SecurityProfile: stringArg(args, "security_profile"),
+				AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
+				GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
+			}
+			return s.svc.QuickSetupSave(in)
+		default:
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "step must be one of: template, save, edit")
 		}
-		in := app.QuickSetupInput{
-			Purpose:         purpose,
-			ProfileID:       stringArg(args, "profile_id"),
-			ProfileName:     stringArg(args, "profile_name"),
-			Host:            host,
-			Port:            app.ParseIntAny(args["port"], 22),
-			Username:        username,
-			AuthMode:        stringArg(args, "auth_mode"),
-			WorkspaceRoots:  roots,
-			KeyPath:         stringArg(args, "key_path"),
-			AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
-			SecurityProfile: stringArg(args, "security_profile"),
-			AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
-			GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
-		}
-		return s.svc.QuickSetupSave(in)
 	case "ssh_credentials_prompt":
 		profileID, err := app.RequireString(args, "profile_id")
 		if err != nil {
@@ -581,6 +602,17 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			Mode:      stringArg(args, "prompt_mode"),
 		}
 		return s.svc.CredentialPrompt(in)
+	case "ssh_key_setup":
+		profileID, err := app.RequireString(args, "profile_id")
+		if err != nil {
+			return nil, err
+		}
+		in := app.KeySetupInput{
+			ProfileID: profileID,
+			ScanDir:   stringArg(args, "scan_dir"),
+			Mode:      stringArg(args, "prompt_mode"),
+		}
+		return s.svc.KeySetup(in)
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
@@ -601,6 +633,7 @@ var canonicalToolNames = map[string]struct{}{
 	"ssh_cnote":              {},
 	"ssh_profile_setup":      {},
 	"ssh_credentials_prompt": {},
+	"ssh_key_setup":          {},
 }
 
 
@@ -614,6 +647,37 @@ func stringArg(args map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(s)
+}
+
+func stringPtrArg(args map[string]any, key string) *string {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return nil
+	}
+	s = strings.TrimSpace(s)
+	return &s
+}
+
+func intPtrArg(args map[string]any, key string) *int {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return nil
+	}
+	n := app.ParseIntAny(v, 0)
+	return &n
+}
+
+func boolPtrArg(args map[string]any, key string) *bool {
+	v, ok := args[key]
+	if !ok || v == nil {
+		return nil
+	}
+	b := app.ParseBoolAny(v, false)
+	return &b
 }
 
 func toRPCError(id any, err error) response {
@@ -642,10 +706,18 @@ func toRPCError(id any, err error) response {
 			code = -32009
 		case errorsx.CodeContentTooLarge:
 			code = -32012
+		case errorsx.CodeKeyPassphraseRequired:
+			code = -32013
+		case errorsx.CodeKeyNotFound:
+			code = -32014
 		case errorsx.CodeCancelled:
 			code = -32800
 		}
-		return rpcError(id, code, ce.Message, map[string]any{"code": ce.Code})
+		data := map[string]any{"code": ce.Code}
+		for k, v := range ce.Data {
+			data[k] = v
+		}
+		return rpcError(id, code, ce.Message, data)
 	}
 	return rpcError(id, -32000, err.Error(), nil)
 }
@@ -965,7 +1037,9 @@ func toolDefs(ctlPath string) []map[string]any {
 	return []map[string]any{
 		tool(
 			"ssh_connect",
-			"Create an SSH connection and return connection_id. Workflow: ssh_profile_setup(step=template/save) or ssh_profile(action=list) -> ssh_connect -> optional ssh_open_session -> ssh_exec. Profile-based connect is the default policy. Optional limit_dir can narrow runtime access to a specific subdirectory.",
+			"Profile-based only. Requires profile_id or profile_name. If no profile exists, first call ssh_profile_setup(step=save) to create one. "+
+				"Workflow: ssh_profile_setup(step=save) -> ssh_key_setup (if key auth) -> ssh_credentials_prompt (if needed) -> ssh_connect -> ssh_exec. "+
+				"Optional limit_dir narrows runtime access to a specific subdirectory.",
 			connectSchema(),
 			mutatingAnnotations("Connect to SSH Host", true),
 		),
@@ -1041,7 +1115,9 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_profile_setup",
-			"Unified quick setup flow. step=template returns onboarding form template. step=save persists SSH profile metadata. For save step, provide purpose/host/username plus optional profile/workspace/auth/security fields. After save, call ssh_credentials_prompt for credential entry.",
+			"Unified quick setup flow. step=template returns onboarding form template. step=save persists SSH profile metadata. "+
+				"step=edit modifies existing profile fields (provide profile_id + fields to change; auth_priority overrides auth_mode if both given). "+
+				"For save step, provide purpose/host/username plus optional profile/workspace/auth/security fields. After save, call ssh_credentials_prompt for credential entry.",
 			profileSetupSchema(),
 			mutatingAnnotations("Setup SSH Profile", false),
 		),
@@ -1050,6 +1126,15 @@ func toolDefs(ctlPath string) []map[string]any {
 			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual `"+ctlPath+" secret set-*` commands with profile_id. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
 			mutatingAnnotations("Enter SSH Credentials", false),
+		),
+		tool(
+			"ssh_key_setup",
+			"Open a local form for the user to select an SSH private key and optional passphrase. "+
+				"Scans directory for keys, shows passphrase status. Saves key_path to profile, passphrase to keychain. "+
+				"AI never sees keys or passphrases. Use after profile creation when auth includes key, "+
+				"or when KEY_PASSPHRASE_REQUIRED / KEY_NOT_FOUND errors occur.",
+			keySetupSchema(),
+			mutatingAnnotations("Setup SSH Key", false),
 		),
 	}
 }
@@ -1072,13 +1157,13 @@ func credentialPromptSchema() map[string]any {
 
 func connectSchema() map[string]any {
 	props := map[string]any{}
-	for _, key := range []string{"profile_id", "profile_name", "host", "port", "username", "auth_mode", "key_ref", "password_ref", "workspace_roots", "limit_dir", "allow_public_host"} {
+	for _, key := range []string{"profile_id", "profile_name", "limit_dir", "allow_public_host"} {
 		props[key] = paramSchema(key)
 	}
 	return map[string]any{
 		"type":        "object",
 		"properties":  props,
-		"description": "Provide one of: profile_id, profile_name, or host+username.",
+		"description": "Provide profile_id or profile_name. Create a profile first with ssh_profile_setup(step=save) if none exists.",
 	}
 }
 
@@ -1147,7 +1232,19 @@ func cnoteSchema() map[string]any {
 }
 
 func profileSetupSchema() map[string]any {
-	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user", "grant_ttl_sec")
+	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "auth_priority", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user", "grant_ttl_sec")
+}
+
+func keySetupSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"profile_id":  paramSchema("profile_id"),
+			"scan_dir":    map[string]any{"type": "string", "description": "Directory to scan for SSH keys. Defaults to ~/.ssh/"},
+			"prompt_mode": paramSchema("prompt_mode"),
+		},
+		"required": []string{"profile_id"},
+	}
 }
 
 func paramSchema(key string) map[string]any {
@@ -1164,10 +1261,6 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "description": "SSH login username."}
 	case "auth_mode":
 		return map[string]any{"type": "string", "enum": []string{"hybrid", "key", "password"}, "description": "Authentication strategy: key, password, or hybrid fallback."}
-	case "key_ref":
-		return map[string]any{"type": "string", "description": "Path to SSH private key for direct connect mode."}
-	case "password_ref":
-		return map[string]any{"type": "string", "description": "Secret reference used to resolve password for direct connect mode."}
 	case "workspace_roots":
 		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Allowed remote root paths for read/write operations."}
 	case "limit_dir":
@@ -1189,7 +1282,9 @@ func paramSchema(key string) map[string]any {
 	case "action":
 		return map[string]any{"type": "string", "enum": []string{"list", "delete"}, "description": "Profile action. list returns all profiles. delete requires profile_id (and may require confirm_token)."}
 	case "step":
-		return map[string]any{"type": "string", "enum": []string{"template", "save"}, "description": "Profile setup step. template returns form defaults; save persists profile metadata."}
+		return map[string]any{"type": "string", "enum": []string{"template", "save", "edit"}, "description": "Profile setup step. template returns form defaults; save persists profile metadata; edit modifies existing profile fields."}
+	case "auth_priority":
+		return map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"key", "password"}}, "description": "Explicit auth priority order. Overrides auth_mode if both provided."}
 	case "direction":
 		return map[string]any{"type": "string", "enum": []string{"upload", "download"}, "description": "Transfer direction. upload copies local_path to remote_path; download copies remote_path to local_path."}
 	case "approval_id":

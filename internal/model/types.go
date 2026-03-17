@@ -38,23 +38,15 @@ type Config struct {
 	LogsDir                string `json:"logs_dir"`
 	ProfilesFile           string `json:"profiles_file"`
 	SecurityProfileDefault string `json:"security_profile_default"`
-	ConnectRequireProfile  bool   `json:"connect_require_profile"`
 	SudoEnabled            bool   `json:"sudo_enabled"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
 }
 
 type ConnectionInput struct {
-	ProfileID       string   `json:"profile_id,omitempty"`
-	ProfileName     string   `json:"profile_name,omitempty"`
-	Host            string   `json:"host,omitempty"`
-	Port            int      `json:"port,omitempty"`
-	Username        string   `json:"username,omitempty"`
-	AuthMode        string   `json:"auth_mode,omitempty"`
-	KeyRef          string   `json:"key_ref,omitempty"`
-	PasswordRef     string   `json:"password_ref,omitempty"`
-	WorkspaceRoots  []string `json:"workspace_roots,omitempty"`
-	LimitDir        string   `json:"limit_dir,omitempty"`
-	AllowPublicHost *bool    `json:"allow_public_host,omitempty"`
+	ProfileID       string `json:"profile_id,omitempty"`
+	ProfileName     string `json:"profile_name,omitempty"`
+	LimitDir        string `json:"limit_dir,omitempty"`
+	AllowPublicHost *bool  `json:"allow_public_host,omitempty"`
 }
 
 type Connection struct {

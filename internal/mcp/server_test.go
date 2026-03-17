@@ -301,7 +301,7 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	for _, key := range []string{"profile_id", "profile_name", "host", "username"} {
+	for _, key := range []string{"profile_id", "profile_name", "limit_dir", "allow_public_host"} {
 		if _, exists := props[key]; !exists {
 			t.Fatalf("properties should include %s", key)
 		}
@@ -422,7 +422,6 @@ func TestCnoteToolCall(t *testing.T) {
 		LogsDir:                filepath.Join(tmp, "logs"),
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
-		ConnectRequireProfile:  true,
 	})
 	if _, err := svc.QuickSetupSave(app.QuickSetupInput{
 		Purpose:  "debug worker",

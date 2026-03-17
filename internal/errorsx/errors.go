@@ -3,8 +3,9 @@ package errorsx
 import "fmt"
 
 type CsshError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Data    map[string]any `json:"data,omitempty"`
 }
 
 func (e *CsshError) Error() string {
@@ -31,6 +32,8 @@ const (
 	CodeConnectionDead      = "CONNECTION_DEAD"
 	CodeReconnectFailed     = "RECONNECT_FAILED"
 	CodeContentTooLarge     = "CONTENT_TOO_LARGE"
-	CodeCancelled           = "CANCELLED"
-	CodeInternal            = "INTERNAL"
+	CodeCancelled              = "CANCELLED"
+	CodeKeyPassphraseRequired  = "KEY_PASSPHRASE_REQUIRED"
+	CodeKeyNotFound            = "KEY_NOT_FOUND"
+	CodeInternal               = "INTERNAL"
 )

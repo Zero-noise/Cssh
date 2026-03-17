@@ -227,6 +227,116 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	return result, nil
 }
 
+// QuickSetupEditInput uses pointer types to distinguish "not provided" from "zero value".
+type QuickSetupEditInput struct {
+	ProfileID       string
+	ProfileName     *string
+	Host            *string
+	Port            *int
+	Username        *string
+	AuthMode        *string
+	AuthPriority    []string
+	WorkspaceRoots  []string
+	KeyPath         *string
+	AllowPublicHost *bool
+	SecurityProfile *string
+	AllowRootUser   *bool
+	GrantTTLSec     *int
+}
+
+func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error) {
+	traceID := util.NewID("trace")
+	if strings.TrimSpace(in.ProfileID) == "" {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile_id is required for edit")
+	}
+	p, err := s.profiles.Get(strings.TrimSpace(in.ProfileID))
+	if err != nil {
+		return nil, err
+	}
+	if p == nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "profile not found: "+in.ProfileID)
+	}
+
+	if in.ProfileName != nil {
+		p.Name = strings.TrimSpace(*in.ProfileName)
+	}
+	if in.Host != nil {
+		p.Host = strings.TrimSpace(*in.Host)
+	}
+	if in.Port != nil {
+		p.Port = *in.Port
+	}
+	if in.Username != nil {
+		p.Username = strings.TrimSpace(*in.Username)
+	}
+	if in.KeyPath != nil {
+		p.KeyPath = config.ExpandHome(strings.TrimSpace(*in.KeyPath))
+	}
+	if in.AllowPublicHost != nil {
+		p.AllowPublicHost = *in.AllowPublicHost
+	}
+	if in.SecurityProfile != nil {
+		p.SecurityProfile = normalizeSecurityProfileDefault(*in.SecurityProfile)
+	}
+	if in.AllowRootUser != nil {
+		p.AllowRootUser = *in.AllowRootUser
+	}
+	if in.GrantTTLSec != nil {
+		p.GrantTTLSec = *in.GrantTTLSec
+	}
+	if len(in.WorkspaceRoots) > 0 {
+		for i := range in.WorkspaceRoots {
+			in.WorkspaceRoots[i] = path.Clean(strings.TrimSpace(in.WorkspaceRoots[i]))
+		}
+		p.WorkspaceRoots = in.WorkspaceRoots
+	}
+
+	// auth_priority takes precedence over auth_mode
+	if len(in.AuthPriority) > 0 {
+		p.AuthPriority = in.AuthPriority
+	} else if in.AuthMode != nil {
+		mode := normalizeAuthMode(*in.AuthMode)
+		switch mode {
+		case "key":
+			p.AuthPriority = []string{"key"}
+		case "password":
+			p.AuthPriority = []string{"password"}
+		case "hybrid":
+			p.AuthPriority = []string{"key", "password"}
+		}
+	}
+
+	applyProfileSecurityDefaults(p)
+	if err := s.profiles.Upsert(*p); err != nil {
+		return nil, err
+	}
+
+	result := map[string]any{
+		"edited":           true,
+		"profile_id":       p.ID,
+		"profile_name":     p.Name,
+		"host":             p.Host,
+		"port":             p.Port,
+		"username":         p.Username,
+		"auth_priority":    p.AuthPriority,
+		"key_path":         p.KeyPath,
+		"workspace_roots":  p.WorkspaceRoots,
+		"allow_public_host": p.AllowPublicHost,
+		"security_profile": p.SecurityProfile,
+		"allow_root_user":  p.AllowRootUser,
+		"grant_ttl_sec":    p.GrantTTLSec,
+	}
+
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp: time.Now().UTC(),
+		TraceID:   traceID,
+		Type:      "ssh_profile_setup",
+		Status:    "ok",
+		Detail:    "step=edit profile_id=" + p.ID,
+	})
+	return result, nil
+}
+
 func (s *Service) hasSecretValue(profileID, kind string) bool {
 	v, err := s.secrets.Get(profileID, kind)
 	if err != nil {
