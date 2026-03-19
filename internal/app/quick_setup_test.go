@@ -41,6 +41,10 @@ func (s *testSecretStore) Delete(profileID, kind string) error {
 }
 
 func newTestService(t *testing.T) *Service {
+	return newTestServiceWithSecurityProfile(t, "easy_safe")
+}
+
+func newTestServiceWithSecurityProfile(t *testing.T, securityProfile string) *Service {
 	t.Helper()
 	tmp := t.TempDir()
 	cfg := model.Config{
@@ -49,7 +53,7 @@ func newTestService(t *testing.T) *Service {
 		RuntimeDir:             filepath.Join(tmp, "runtime"),
 		LogsDir:                filepath.Join(tmp, "logs"),
 		ProfilesFile:           filepath.Join(tmp, "profiles.json"),
-		SecurityProfileDefault: "easy_safe",
+		SecurityProfileDefault: securityProfile,
 		SudoEnabled:            true,
 	}
 	svc := NewService(cfg)
@@ -73,6 +77,10 @@ func TestQuickSetupTemplateDefaults(t *testing.T) {
 	if defaults["security_profile"] != "easy_safe" {
 		t.Fatalf("security_profile default mismatch: %#v", defaults["security_profile"])
 	}
+	roots, ok := defaults["workspace_roots"].([]string)
+	if !ok || len(roots) != 1 || roots[0] != "/" {
+		t.Fatalf("workspace_roots default mismatch: %#v", defaults["workspace_roots"])
+	}
 	fields, ok := res["fields"].([]map[string]any)
 	if !ok {
 		t.Fatalf("fields missing")
@@ -82,6 +90,25 @@ func TestQuickSetupTemplateDefaults(t *testing.T) {
 		if name == "password" || name == "key_passphrase" {
 			t.Fatalf("template should not include credential field %q", name)
 		}
+	}
+}
+
+func TestQuickSetupTemplateDefaultsForOpsStrict(t *testing.T) {
+	svc := newTestServiceWithSecurityProfile(t, "ops_strict")
+	res, err := svc.QuickSetupTemplate("ops box", "", "root")
+	if err != nil {
+		t.Fatalf("template err: %v", err)
+	}
+	defaults, ok := res["defaults"].(map[string]any)
+	if !ok {
+		t.Fatalf("defaults missing")
+	}
+	if defaults["security_profile"] != "ops_strict" {
+		t.Fatalf("security_profile default mismatch: %#v", defaults["security_profile"])
+	}
+	roots, ok := defaults["workspace_roots"].([]string)
+	if !ok || len(roots) != 1 || roots[0] != "/root" {
+		t.Fatalf("workspace_roots default mismatch for ops_strict root user: %#v", defaults["workspace_roots"])
 	}
 }
 
@@ -123,6 +150,9 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	if len(p.AuthPriority) != 1 || p.AuthPriority[0] != "password" {
 		t.Fatalf("unexpected auth priority: %#v", p.AuthPriority)
 	}
+	if len(p.WorkspaceRoots) != 1 || p.WorkspaceRoots[0] != "/" {
+		t.Fatalf("unexpected workspace roots: %#v", p.WorkspaceRoots)
+	}
 	secretsSaved, ok := out["secrets_saved"].(map[string]bool)
 	if !ok {
 		t.Fatalf("secrets_saved should be present")
@@ -148,6 +178,32 @@ func TestQuickSetupSavePersistsProfile(t *testing.T) {
 	fields, ok := args["fields"].([]string)
 	if !ok || len(fields) != 1 || fields[0] != "password" {
 		t.Fatalf("unexpected credentials_hint fields: %#v", args["fields"])
+	}
+}
+
+func TestQuickSetupSaveDefaultsWorkspaceRootForOpsStrict(t *testing.T) {
+	svc := newTestService(t)
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:         "ops worker",
+		ProfileName:     "ops-dev",
+		Host:            "10.0.0.10",
+		Username:        "ubuntu",
+		AuthMode:        "password",
+		SecurityProfile: "ops_strict",
+	})
+	if err != nil {
+		t.Fatalf("quick save err: %v", err)
+	}
+	profileID, _ := out["profile_id"].(string)
+	p, err := svc.ProfileStore().Get(profileID)
+	if err != nil {
+		t.Fatalf("profile get err: %v", err)
+	}
+	if p == nil {
+		t.Fatalf("profile not saved")
+	}
+	if len(p.WorkspaceRoots) != 1 || p.WorkspaceRoots[0] != "/home/ubuntu" {
+		t.Fatalf("unexpected workspace roots for ops_strict: %#v", p.WorkspaceRoots)
 	}
 }
 
@@ -250,7 +306,7 @@ func TestResolveConnectionByProfileName(t *testing.T) {
 		Port:           22,
 		Username:       "ubuntu",
 		AuthPriority:   []string{"key"},
-		WorkspaceRoots: []string{"/home/ubuntu/project"},
+		WorkspaceRoots: []string{"/home/ubuntu"},
 	}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
 	}
@@ -291,7 +347,7 @@ func TestProfileDeleteRemovesProfileAndSecrets(t *testing.T) {
 		Port:           22,
 		Username:       "ubuntu",
 		AuthPriority:   []string{"password"},
-		WorkspaceRoots: []string{"/home/ubuntu/project"},
+		WorkspaceRoots: []string{"/home/ubuntu"},
 	}); err != nil {
 		t.Fatalf("upsert profile: %v", err)
 	}

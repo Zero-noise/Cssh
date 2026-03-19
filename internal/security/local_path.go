@@ -2,6 +2,7 @@ package security
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,42 @@ func IsWithinLocalRoot(target, root string) bool {
 		return false
 	}
 	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+// ValidateLocalDirSymlinks walks a directory and ensures no symlink target
+// escapes the directory root. This prevents uploading directories containing
+// symlinks that point to sensitive files outside the transfer root, and
+// catches dangerous symlinks in downloaded directories.
+func ValidateLocalDirSymlinks(dirPath string) error {
+	root, err := filepath.Abs(dirPath)
+	if err != nil {
+		return fmt.Errorf("resolve dir path: %w", err)
+	}
+	// Resolve the root itself in case it's a symlink.
+	rootResolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return fmt.Errorf("resolve dir symlinks: %w", err)
+	}
+	return filepath.WalkDir(rootResolved, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.Type()&os.ModeSymlink == 0 {
+			return nil
+		}
+		target, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return fmt.Errorf("resolve symlink %s: %w", p, err)
+		}
+		rel, err := filepath.Rel(rootResolved, target)
+		if err != nil {
+			return fmt.Errorf("compute relative path for %s: %w", p, err)
+		}
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return fmt.Errorf("symlink %s escapes directory root (target: %s)", p, target)
+		}
+		return nil
+	})
 }
 
 func canonicalLocalPath(p string) string {

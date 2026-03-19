@@ -45,6 +45,8 @@ type TransferResult struct {
 	Protocol       string
 	FallbackUsed   bool
 	FallbackReason string
+	FileCount      int   // directory transfers: number of files transferred
+	TotalBytes     int64 // directory transfers: total size in bytes
 }
 
 const (
@@ -93,6 +95,7 @@ type Manager struct {
 	sessions    map[string]*model.Session
 	masters     map[string]*masterHandle
 	reconState  map[string]*reconnectState
+	rsyncAvail  map[string]bool // cached rsync availability per connection
 	onReconnect func(connectionID, reason string)
 	wg          sync.WaitGroup
 }
@@ -403,8 +406,9 @@ func (m *Manager) handleMasterDeath(connectionID, reason string) {
 		return
 	}
 	m.masters[connectionID] = mh
-	conn.Generation++ // invalidates pending approval tokens
-	m.wg.Add(1)       // must be inside lock so Shutdown's wg.Wait() can't race
+	conn.Generation++                  // invalidates pending approval tokens
+	delete(m.rsyncAvail, connectionID) // clear cached rsync availability
+	m.wg.Add(1)                        // must be inside lock so Shutdown's wg.Wait() can't race
 	m.mu.Unlock()
 
 	if m.onReconnect != nil {
@@ -773,7 +777,7 @@ func (w *execStreamWriter) String() string {
 	return w.buf.String()
 }
 
-func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeoutSec int) (TransferResult, error) {
+func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeoutSec int, recursive bool, onProgress ExecProgressFn) (TransferResult, error) {
 	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(remotePath) == "" {
 		return TransferResult{}, errorsx.New(errorsx.CodeInvalidParams, "local_path and remote_path are required")
 	}
@@ -785,10 +789,10 @@ func (m *Manager) UploadFile(connectionID, localPath, remotePath string, timeout
 		return TransferResult{}, err
 	}
 	target := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, connectionID, timeoutSec, localPath, target)
+	return m.runSCP(conn, connectionID, timeoutSec, recursive, onProgress, localPath, target)
 }
 
-func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int) (TransferResult, error) {
+func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeoutSec int, recursive bool, onProgress ExecProgressFn) (TransferResult, error) {
 	if strings.TrimSpace(remotePath) == "" || strings.TrimSpace(localPath) == "" {
 		return TransferResult{}, errorsx.New(errorsx.CodeInvalidParams, "remote_path and local_path are required")
 	}
@@ -800,7 +804,7 @@ func (m *Manager) DownloadFile(connectionID, remotePath, localPath string, timeo
 		return TransferResult{}, err
 	}
 	source := scpRemoteSpec(conn.Username, conn.Host, remotePath)
-	return m.runSCP(conn, connectionID, timeoutSec, source, localPath)
+	return m.runSCP(conn, connectionID, timeoutSec, recursive, onProgress, source, localPath)
 }
 
 func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bool, string, error) {
@@ -853,13 +857,13 @@ func (m *Manager) CheckConnection(connectionID string, timeoutSec int) (bool, bo
 	return false, socketExists, msg, nil
 }
 
-func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec int, source, target string) (TransferResult, error) {
+func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec int, recursive bool, onProgress ExecProgressFn, source, target string) (TransferResult, error) {
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
 	}
 	totalTimeout := time.Duration(timeoutSec) * time.Second
 	start := time.Now()
-	firstStderr, firstErr := m.runSCPOnce(conn, totalTimeout, false, source, target)
+	firstStderr, firstErr := m.runSCPOnce(conn, totalTimeout, false, recursive, onProgress, source, target)
 	if firstErr == nil {
 		return TransferResult{
 			DurationMS: time.Since(start).Milliseconds(),
@@ -888,7 +892,7 @@ func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec
 			FallbackReason: fallbackReason,
 		}, m.timeoutOrDeadError(connectionID)
 	}
-	secondStderr, secondErr := m.runSCPOnce(conn, remaining, true, source, target)
+	secondStderr, secondErr := m.runSCPOnce(conn, remaining, true, recursive, onProgress, source, target)
 	if secondErr == nil {
 		return TransferResult{
 			DurationMS:     time.Since(start).Milliseconds(),
@@ -915,7 +919,7 @@ func (m *Manager) runSCP(conn *model.Connection, connectionID string, timeoutSec
 	}, errorsx.New(errorsx.CodeInternal, msg)
 }
 
-func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, legacy bool, source, target string) (string, error) {
+func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, legacy, recursive bool, onProgress ExecProgressFn, source, target string) (string, error) {
 	if timeout <= 0 {
 		return "", errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 	}
@@ -931,19 +935,101 @@ func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, lega
 	if legacy {
 		args = append(args, "-O")
 	}
+	if recursive {
+		args = append(args, "-r")
+	}
 	args = append(args, "--", source, target)
 
 	cmd := exec.CommandContext(ctx, "scp", args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	sw := &execStreamWriter{stream: "stderr", onProgress: onProgress}
+	cmd.Stderr = sw
 	err := cmd.Run()
 	if ctx.Err() == context.DeadlineExceeded {
-		return stderr.String(), errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
+		return sw.String(), errorsx.New(errorsx.CodeExecTimeout, "command execution timed out")
 	}
 	if err == nil {
-		return stderr.String(), nil
+		return sw.String(), nil
 	}
-	return stderr.String(), err
+	return sw.String(), err
+}
+
+// HasRsync checks whether rsync is available on the remote host.
+// The result is cached per connection (cleared on reconnect).
+func (m *Manager) HasRsync(connectionID string) bool {
+	m.mu.RLock()
+	if avail, ok := m.rsyncAvail[connectionID]; ok {
+		m.mu.RUnlock()
+		return avail
+	}
+	m.mu.RUnlock()
+	res, err := m.Exec(connectionID, "", "command -v rsync", "", 5)
+	avail := err == nil && res.ExitCode == 0
+	m.mu.Lock()
+	if m.rsyncAvail == nil {
+		m.rsyncAvail = map[string]bool{}
+	}
+	m.rsyncAvail[connectionID] = avail
+	m.mu.Unlock()
+	return avail
+}
+
+// RunRsync performs a file transfer using rsync --partial for resume support.
+func (m *Manager) RunRsync(connectionID string, timeoutSec int, source, target string, isUpload bool, onProgress ExecProgressFn) (TransferResult, error) {
+	conn, err := m.GetConnection(connectionID)
+	if err != nil {
+		return TransferResult{}, err
+	}
+	if err := m.PreFlightCheck(connectionID); err != nil {
+		return TransferResult{}, err
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = m.defaultTimeoutS
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	rshFlag := fmt.Sprintf("ssh -o ControlPath=%s -o BatchMode=yes -p %d",
+		conn.ControlPath, conn.Port)
+	remote := fmt.Sprintf("%s@%s", conn.Username, normalizeSCPHost(conn.Host))
+
+	var rsyncSource, rsyncTarget string
+	if isUpload {
+		rsyncSource = source
+		rsyncTarget = remote + ":" + target
+	} else {
+		rsyncSource = remote + ":" + source
+		rsyncTarget = target
+	}
+
+	args := buildRsyncArgs(rshFlag, rsyncSource, rsyncTarget)
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, "rsync", args...)
+	sw := &execStreamWriter{stream: "stderr", onProgress: onProgress}
+	cmd.Stderr = sw
+	err = cmd.Run()
+	d := time.Since(start)
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return TransferResult{
+			DurationMS: d.Milliseconds(),
+			Protocol:   "rsync",
+		}, m.timeoutOrDeadError(connectionID)
+	}
+	if err != nil {
+		return TransferResult{
+			DurationMS: d.Milliseconds(),
+			Protocol:   "rsync",
+		}, errorsx.New(errorsx.CodeInternal, "rsync failed: "+formatSCPAttemptError(sw.String(), err))
+	}
+
+	return TransferResult{
+		DurationMS: d.Milliseconds(),
+		Protocol:   "rsync",
+	}, nil
+}
+
+func buildRsyncArgs(rshFlag, source, target string) []string {
+	return []string{"--partial", "-e", rshFlag, "--", source, target}
 }
 
 // timeoutOrDeadError is called after a transfer times out. It performs a fast
@@ -1046,6 +1132,9 @@ func (m *Manager) Shutdown() {
 	for id := range m.reconState {
 		delete(m.reconState, id)
 	}
+	for id := range m.rsyncAvail {
+		delete(m.rsyncAvail, id)
+	}
 	m.mu.Unlock()
 	m.wg.Wait()
 }
@@ -1064,6 +1153,7 @@ func (m *Manager) Disconnect(connectionID string) error {
 	delete(m.connections, connectionID)
 	delete(m.masters, connectionID)
 	delete(m.reconState, connectionID)
+	delete(m.rsyncAvail, connectionID)
 	for id, s := range m.sessions {
 		if s.ConnectionID == connectionID {
 			delete(m.sessions, id)

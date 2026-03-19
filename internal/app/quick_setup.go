@@ -36,7 +36,8 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 	if username == "" {
 		username = "ubuntu"
 	}
-	defaultRoot := defaultWorkspaceRoot(purpose, username)
+	securityProfile := normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
+	defaultRoot := defaultWorkspaceRoot(username, securityProfile)
 	defaults := map[string]any{
 		"profile_name":      strings.TrimSpace(purpose),
 		"port":              22,
@@ -44,7 +45,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		"workspace_roots":   []string{defaultRoot},
 		"allow_public_host": true,
 		"key_path":          "~/.ssh/id_ed25519",
-		"security_profile":  normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault),
+		"security_profile":  securityProfile,
 		"allow_root_user":   false,
 		"grant_ttl_sec":     0,
 	}
@@ -60,7 +61,7 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "workspace_roots", "label": "Workspace Roots", "type": "array", "required": false, "default": []string{defaultRoot}},
 		{"name": "key_path", "label": "Private Key Path", "type": "string", "required": false, "default": "~/.ssh/id_ed25519"},
 		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": true},
-		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)},
+		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": securityProfile},
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 		{"name": "grant_ttl_sec", "label": "Grant TTL (seconds)", "type": "integer", "required": false, "default": 0,
 			"description": "Reusable grant lifetime. 0 = valid for entire connection (default). >0 = expires after N seconds."},
@@ -102,8 +103,12 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	if in.Port <= 0 {
 		in.Port = 22
 	}
+	effectiveSecurityProfile := normalizeSecurityProfileDefault(in.SecurityProfile)
+	if effectiveSecurityProfile == "" {
+		effectiveSecurityProfile = normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
+	}
 	if len(in.WorkspaceRoots) == 0 {
-		in.WorkspaceRoots = []string{defaultWorkspaceRoot(in.Purpose, in.Username)}
+		in.WorkspaceRoots = []string{defaultWorkspaceRoot(in.Username, effectiveSecurityProfile)}
 	}
 	for i := range in.WorkspaceRoots {
 		in.WorkspaceRoots[i] = path.Clean(strings.TrimSpace(in.WorkspaceRoots[i]))
@@ -471,19 +476,18 @@ func normalizeAuthMode(v string) string {
 	}
 }
 
-func defaultWorkspaceRoot(purpose, username string) string {
-	p := strings.ToLower(purpose)
+func defaultWorkspaceRoot(username, securityProfile string) string {
+	if strings.EqualFold(strings.TrimSpace(securityProfile), "easy_safe") {
+		return "/"
+	}
 	u := strings.TrimSpace(username)
 	if u == "" {
 		u = "ubuntu"
 	}
-	if strings.Contains(p, "deploy") || strings.Contains(p, "prod") || strings.Contains(p, "ops") {
-		return "/"
+	if strings.EqualFold(u, "root") {
+		return "/root"
 	}
-	if strings.Contains(p, "data") || strings.Contains(p, "ml") || strings.Contains(p, "train") {
-		return "/home/" + u + "/workspace"
-	}
-	return "/home/" + u + "/project"
+	return "/home/" + u
 }
 
 var nonSlug = regexp.MustCompile(`[^a-z0-9-]+`)

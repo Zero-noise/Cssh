@@ -42,24 +42,51 @@ build_local() {
   info "Built binaries in $INSTALL_DIR"
 }
 
+sha256_verify() {
+  local file="$1" expected="$2"
+  local actual
+  if command -v sha256sum &>/dev/null; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum &>/dev/null; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    error "sha256sum or shasum is required for checksum verification"
+  fi
+  if [ "$actual" != "$expected" ]; then
+    error "Checksum verification failed for $(basename "$file")\n  expected: $expected\n  actual:   $actual"
+  fi
+}
+
 install_from_release() {
   detect_platform
-  local url="https://github.com/$REPO/releases/latest/download/cssh-${OS}-${ARCH}.tar.gz"
+  local base_url="https://github.com/$REPO/releases/latest/download"
+  local archive="cssh-${OS}-${ARCH}.tar.gz"
   local tmp
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
   info "Downloading cssh for ${OS}/${ARCH}..."
   if command -v curl &>/dev/null; then
-    curl -fsSL "$url" -o "$tmp/cssh.tar.gz"
+    curl -fsSL "$base_url/$archive" -o "$tmp/$archive"
+    curl -fsSL "$base_url/checksums.txt" -o "$tmp/checksums.txt"
   elif command -v wget &>/dev/null; then
-    wget -qO "$tmp/cssh.tar.gz" "$url"
+    wget -qO "$tmp/$archive" "$base_url/$archive"
+    wget -qO "$tmp/checksums.txt" "$base_url/checksums.txt"
   else
     error "curl or wget is required"
   fi
 
+  info "Verifying checksum..."
+  local expected
+  expected="$(grep "$archive" "$tmp/checksums.txt" | awk '{print $1}')"
+  if [ -z "$expected" ]; then
+    error "No checksum found for $archive in checksums.txt"
+  fi
+  sha256_verify "$tmp/$archive" "$expected"
+  info "Checksum OK"
+
   mkdir -p "$INSTALL_DIR"
-  tar xzf "$tmp/cssh.tar.gz" -C "$tmp"
+  tar xzf "$tmp/$archive" -C "$tmp"
   cp "$tmp"/cssh-mcp-* "$INSTALL_DIR/cssh-mcp"
   cp "$tmp"/csshctl-* "$INSTALL_DIR/csshctl"
   chmod +x "$INSTALL_DIR/cssh-mcp" "$INSTALL_DIR/csshctl"

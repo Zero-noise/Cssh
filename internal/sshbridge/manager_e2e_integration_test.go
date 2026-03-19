@@ -93,7 +93,7 @@ func TestTransferWithDockerOpenSSH(t *testing.T) {
 		t.Fatalf("write upload file: %v", err)
 	}
 	remotePath := "/tmp/cssh-e2e-transfer.txt"
-	upRes, err := m.UploadFile(conn.ID, localUpload, remotePath, 30)
+	upRes, err := m.UploadFile(conn.ID, localUpload, remotePath, 30, false, nil)
 	if err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestTransferWithDockerOpenSSH(t *testing.T) {
 	}
 
 	localDownload := filepath.Join(tmp, "download.txt")
-	downRes, err := m.DownloadFile(conn.ID, remotePath, localDownload, 30)
+	downRes, err := m.DownloadFile(conn.ID, remotePath, localDownload, 30, false, nil)
 	if err != nil {
 		t.Fatalf("download failed: %v", err)
 	}

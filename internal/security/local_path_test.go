@@ -59,3 +59,58 @@ func TestAllowLocalAnywhereBehavior(t *testing.T) {
 		t.Fatalf("outside path should be allowed when allow_local_anywhere is true")
 	}
 }
+
+func TestValidateLocalDirSymlinks_Safe(t *testing.T) {
+	tmp := t.TempDir()
+	sub := filepath.Join(tmp, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(sub, "real.txt")
+	if err := os.WriteFile(target, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Symlink within the directory
+	link := filepath.Join(tmp, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := ValidateLocalDirSymlinks(tmp); err != nil {
+		t.Fatalf("safe symlink should pass validation: %v", err)
+	}
+}
+
+func TestValidateLocalDirSymlinks_Escape(t *testing.T) {
+	tmp := t.TempDir()
+	dir := filepath.Join(tmp, "dir")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Create a file outside the directory
+	outside := filepath.Join(tmp, "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Symlink inside dir pointing outside
+	link := filepath.Join(dir, "escape.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	err := ValidateLocalDirSymlinks(dir)
+	if err == nil {
+		t.Fatalf("escaping symlink should fail validation")
+	}
+	if !filepath.IsAbs(outside) {
+		t.Fatalf("test setup error: outside should be absolute")
+	}
+}
+
+func TestValidateLocalDirSymlinks_NoSymlinks(t *testing.T) {
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := ValidateLocalDirSymlinks(tmp); err != nil {
+		t.Fatalf("dir without symlinks should pass: %v", err)
+	}
+}

@@ -40,7 +40,15 @@ Use ssh_exec with standard shell commands for filesystem exploration:
 - List directories: ls -la, find, tree
 - Search text: grep -rn, find ... -exec grep
 - Tail logs: tail -n, tail -f (with timeout_sec)
-- Check disk usage: df -h, du -sh`
+- Check disk usage: df -h, du -sh
+
+When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.
+
+## ssh_read_file usage
+ssh_read_file returns line-numbered content with metadata. Key response fields:
+- content: numbered lines ("   NR\tline"), size, total_lines, line_start, line_end
+- Use offset + limit for partial reads of large files (default: line 1, 2000 lines)
+- Binary files: returns binary=true + mime_encoding, no content — use ssh_transfer to download`
 
 type Server struct {
 	svc     *app.Service
@@ -338,6 +346,59 @@ func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, 
 			return nil, err
 		}
 		return s.svc.ExecWithProgress(ctx, connID, stringArg(args, "session_id"), cmd, stringArg(args, "cwd"), app.ParseIntAny(args["timeout_sec"], 0), stringArg(args, "approval_token"), onProgress)
+	case "ssh_transfer":
+		direction := stringArg(args, "direction")
+		if direction == "" {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction is required")
+		}
+		connID, err := app.RequireString(args, "connection_id")
+		if err != nil {
+			return nil, err
+		}
+		localPath, err := app.RequireString(args, "local_path")
+		if err != nil {
+			return nil, err
+		}
+		remotePath, err := app.RequireString(args, "remote_path")
+		if err != nil {
+			return nil, err
+		}
+		switch strings.ToLower(direction) {
+		case "upload":
+			return s.svc.UploadFile(
+				connID,
+				localPath,
+				remotePath,
+				stringArg(args, "mode"),
+				stringArg(args, "cwd"),
+				app.ParseIntAny(args["timeout_sec"], 300),
+				app.ParseBoolAny(args["create_parents"], true),
+				app.ParseBoolAny(args["verify_checksum"], true),
+				app.ParseBoolAny(args["allow_local_anywhere"], false),
+				stringArg(args, "approval_token"),
+				app.ParseBoolAny(args["recursive"], false),
+				app.ParseBoolAny(args["resume"], false),
+				onProgress,
+			)
+		case "download":
+			return s.svc.DownloadFile(
+				connID,
+				remotePath,
+				localPath,
+				stringArg(args, "mode"),
+				stringArg(args, "cwd"),
+				app.ParseIntAny(args["timeout_sec"], 300),
+				app.ParseBoolAny(args["create_parents"], true),
+				app.ParseBoolAny(args["verify_checksum"], true),
+				app.ParseBoolAny(args["allow_local_anywhere"], false),
+				stringArg(args, "approval_token"),
+				app.ParseBoolAny(args["recursive"], false),
+				app.ParseBoolAny(args["resume"], false),
+				onProgress,
+			)
+		default:
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction must be one of: upload, download")
+		}
 	default:
 		return s.callCanonicalTool(name, args)
 	}
@@ -402,53 +463,6 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "action must be one of: status, revoke")
 		}
-	case "ssh_transfer":
-		direction := stringArg(args, "direction")
-		if direction == "" {
-			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction is required")
-		}
-		connID, err := app.RequireString(args, "connection_id")
-		if err != nil {
-			return nil, err
-		}
-		localPath, err := app.RequireString(args, "local_path")
-		if err != nil {
-			return nil, err
-		}
-		remotePath, err := app.RequireString(args, "remote_path")
-		if err != nil {
-			return nil, err
-		}
-		switch strings.ToLower(direction) {
-		case "upload":
-			return s.svc.UploadFile(
-				connID,
-				localPath,
-				remotePath,
-				stringArg(args, "mode"),
-				stringArg(args, "cwd"),
-				app.ParseIntAny(args["timeout_sec"], 300),
-				app.ParseBoolAny(args["create_parents"], true),
-				app.ParseBoolAny(args["verify_checksum"], true),
-				app.ParseBoolAny(args["allow_local_anywhere"], false),
-				stringArg(args, "approval_token"),
-			)
-		case "download":
-			return s.svc.DownloadFile(
-				connID,
-				remotePath,
-				localPath,
-				stringArg(args, "mode"),
-				stringArg(args, "cwd"),
-				app.ParseIntAny(args["timeout_sec"], 300),
-				app.ParseBoolAny(args["create_parents"], true),
-				app.ParseBoolAny(args["verify_checksum"], true),
-				app.ParseBoolAny(args["allow_local_anywhere"], false),
-				stringArg(args, "approval_token"),
-			)
-		default:
-			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction must be one of: upload, download")
-		}
 	case "ssh_read_file":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -458,7 +472,13 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		if err != nil {
 			return nil, err
 		}
-		return s.svc.ReadFile(connID, p, app.ParseIntAny(args["max_bytes"], 65536), stringArg(args, "cwd"))
+		return s.svc.ReadFile(
+			connID, p,
+			app.ParseIntAny(args["max_bytes"], 0),
+			app.ParseIntAny(args["offset"], 0),
+			app.ParseIntAny(args["limit"], 0),
+			stringArg(args, "cwd"),
+		)
 	case "ssh_write_file":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -537,15 +557,15 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 				}
 			}
 			in := app.QuickSetupEditInput{
-				ProfileID:    profileID,
-				ProfileName:  stringPtrArg(args, "profile_name"),
-				Host:         stringPtrArg(args, "host"),
-				Port:         intPtrArg(args, "port"),
-				Username:     stringPtrArg(args, "username"),
-				AuthMode:     stringPtrArg(args, "auth_mode"),
-				AuthPriority: app.ParseStringSliceAny(args["auth_priority"]),
-				WorkspaceRoots: editRoots,
-				KeyPath:      stringPtrArg(args, "key_path"),
+				ProfileID:       profileID,
+				ProfileName:     stringPtrArg(args, "profile_name"),
+				Host:            stringPtrArg(args, "host"),
+				Port:            intPtrArg(args, "port"),
+				Username:        stringPtrArg(args, "username"),
+				AuthMode:        stringPtrArg(args, "auth_mode"),
+				AuthPriority:    app.ParseStringSliceAny(args["auth_priority"]),
+				WorkspaceRoots:  editRoots,
+				KeyPath:         stringPtrArg(args, "key_path"),
 				AllowPublicHost: boolPtrArg(args, "allow_public_host"),
 				SecurityProfile: stringPtrArg(args, "security_profile"),
 				AllowRootUser:   boolPtrArg(args, "allow_root_user"),
@@ -628,14 +648,13 @@ var canonicalToolNames = map[string]struct{}{
 	"ssh_read_file":          {},
 	"ssh_write_file":         {},
 	"ssh_apply_patch":        {},
-"ssh_disconnect":         {},
+	"ssh_disconnect":         {},
 	"ssh_profile":            {},
 	"ssh_cnote":              {},
 	"ssh_profile_setup":      {},
 	"ssh_credentials_prompt": {},
 	"ssh_key_setup":          {},
 }
-
 
 func stringArg(args map[string]any, key string) string {
 	v, ok := args[key]
@@ -704,6 +723,8 @@ func toRPCError(id any, err error) response {
 			code = -32008
 		case errorsx.CodeChecksumUnavailable:
 			code = -32009
+		case errorsx.CodeResumeUnavailable:
+			code = -32015
 		case errorsx.CodeContentTooLarge:
 			code = -32012
 		case errorsx.CodeKeyPassphraseRequired:
@@ -759,7 +780,7 @@ func writeMessage(w io.Writer, payload any) error {
 }
 
 func newProgressReporter(s *Server, toolName string, token any) *progressReporter {
-	if s == nil || toolName != "ssh_exec" {
+	if s == nil || (toolName != "ssh_exec" && toolName != "ssh_transfer") {
 		return nil
 	}
 	now := time.Now()
@@ -1069,14 +1090,16 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_transfer",
-			"Transfer file using scp client with existing connection_id. Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token.",
+			"Transfer files or directories using scp client with existing connection_id (remote_path is workspace_roots guarded). Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token. Set recursive=true for directory transfers. Set resume=true only for single-file overwrite transfers when both local and remote have rsync; otherwise retry without resume=true.",
 			transferSchema(),
 			destructiveAnnotations("Transfer File via SCP", true),
 		),
 		tool(
 			"ssh_read_file",
-			"Read remote file content (workspace_roots guarded). Requires connection_id + path; supports max_bytes truncation.",
-			reqSchema([]string{"connection_id", "path"}, "connection_id", "path", "max_bytes", "cwd"),
+			"Read remote file with line numbers. Returns numbered content + metadata (size, total_lines). "+
+				"Use offset/limit for partial reads. Binary files return metadata only — use ssh_transfer to download. "+
+				"Symlinks resolved and checked against workspace_roots.",
+			readFileSchema(),
 			readOnlyAnnotations("Read Remote File", true),
 		),
 		tool(
@@ -1087,7 +1110,7 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_apply_patch",
-			"Apply unified patch via patch(1) on remote host. Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files.",
+			"Apply unified patch via patch(1) on remote host (workspace_roots guarded). Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files.",
 			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir", "dry_run"),
 			destructiveAnnotations("Apply Patch on Remote", true),
 		),
@@ -1167,6 +1190,30 @@ func connectSchema() map[string]any {
 	}
 }
 
+func readFileSchema() map[string]any {
+	props := map[string]any{}
+	for _, k := range []string{"connection_id", "path", "cwd"} {
+		props[k] = paramSchema(k)
+	}
+	props["offset"] = map[string]any{
+		"type":        "integer",
+		"description": "Start line (1-based). Default 1.",
+	}
+	props["limit"] = map[string]any{
+		"type":        "integer",
+		"description": "Maximum lines to return. Default 2000.",
+	}
+	props["max_bytes"] = map[string]any{
+		"type":        "integer",
+		"description": "Byte cap on returned content. Default 524288 (512KB), max 2097152 (2MB).",
+	}
+	return map[string]any{
+		"type":       "object",
+		"properties": props,
+		"required":   []string{"connection_id", "path"},
+	}
+}
+
 func reqSchema(required []string, keys ...string) map[string]any {
 	props := map[string]any{}
 	for _, k := range keys {
@@ -1184,7 +1231,7 @@ func reqSchema(required []string, keys ...string) map[string]any {
 
 func transferSchema() map[string]any {
 	props := map[string]any{}
-	for _, k := range []string{"direction", "connection_id", "local_path", "remote_path", "cwd", "timeout_sec", "create_parents", "verify_checksum", "allow_local_anywhere", "approval_token"} {
+	for _, k := range []string{"direction", "connection_id", "local_path", "remote_path", "cwd", "timeout_sec", "create_parents", "verify_checksum", "allow_local_anywhere", "approval_token", "recursive", "resume"} {
 		props[k] = paramSchema(k)
 	}
 	props["mode"] = map[string]any{
@@ -1306,7 +1353,7 @@ func paramSchema(key string) map[string]any {
 	case "command":
 		return map[string]any{"type": "string", "description": "Shell command to execute on remote host."}
 	case "cwd":
-		return map[string]any{"type": "string", "description": "Working directory for this tool call."}
+		return map[string]any{"type": "string", "description": "Working directory for command execution in this tool call. Does not grant access beyond workspace_roots."}
 	case "shell":
 		return map[string]any{"type": "string", "description": "Shell wrapper, e.g. 'bash -lc'."}
 	case "timeout_sec":
@@ -1320,7 +1367,7 @@ func paramSchema(key string) map[string]any {
 	case "remote_path":
 		return map[string]any{"type": "string", "description": "Remote filesystem path for transfer."}
 	case "max_bytes":
-		return map[string]any{"type": "integer", "description": "Maximum bytes to read from file."}
+		return map[string]any{"type": "integer", "description": "Byte cap on returned content. Default 524288 (512KB), max 2097152 (2MB)."}
 	case "content":
 		return map[string]any{"type": "string", "description": "File content payload for write operation."}
 	case "mode":
@@ -1328,9 +1375,13 @@ func paramSchema(key string) map[string]any {
 	case "create_parents":
 		return map[string]any{"type": "boolean", "description": "Create destination parent directories if missing. Default true."}
 	case "verify_checksum":
-		return map[string]any{"type": "boolean", "description": "Verify SHA-256 between local and remote after transfer. Default true."}
+		return map[string]any{"type": "boolean", "description": "For single files, verify SHA-256 between local and remote after transfer. For directories, verify file-count consistency and return verification_type/result. Default true."}
 	case "allow_local_anywhere":
 		return map[string]any{"type": "boolean", "description": "Allow local path outside current working directory. Default false."}
+	case "recursive":
+		return map[string]any{"type": "boolean", "description": "Transfer entire directory recursively via scp -r. remote_path is the target directory itself (not its parent). Only mode=create is supported for directories (fails if target exists). overwrite is not supported for directories."}
+	case "resume":
+		return map[string]any{"type": "boolean", "description": "Resume interrupted transfer using rsync. Supported only for single-file overwrite transfers when both local and remote have rsync. If unavailable, retry without resume=true."}
 	case "patch_unified":
 		return map[string]any{"type": "string", "description": "Unified diff patch text."}
 	case "base_dir":

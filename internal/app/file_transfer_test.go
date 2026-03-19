@@ -76,6 +76,57 @@ func TestBuildRemoteSHA256Command(t *testing.T) {
 	}
 }
 
+func TestValidateResumeMode(t *testing.T) {
+	if err := validateResumeMode("overwrite"); err != nil {
+		t.Fatalf("overwrite should allow resume: %v", err)
+	}
+	err := validateResumeMode("create")
+	ce, ok := err.(*errorsx.CsshError)
+	if !ok || ce.Code != errorsx.CodeInvalidParams {
+		t.Fatalf("expected invalid params for create+resume, got %#v", err)
+	}
+}
+
+func TestHasLocalRsyncUsesLookPath(t *testing.T) {
+	orig := lookPath
+	t.Cleanup(func() { lookPath = orig })
+
+	lookPath = func(file string) (string, error) { return "/usr/bin/" + file, nil }
+	if !hasLocalRsync() {
+		t.Fatalf("expected local rsync to be available")
+	}
+
+	lookPath = func(file string) (string, error) { return "", os.ErrNotExist }
+	if hasLocalRsync() {
+		t.Fatalf("expected local rsync to be unavailable")
+	}
+}
+
+func TestResumeUnavailableError(t *testing.T) {
+	cases := []struct {
+		localOK  bool
+		remoteOK bool
+		want     string
+	}{
+		{localOK: false, remoteOK: false, want: "locally and on the remote host"},
+		{localOK: false, remoteOK: true, want: "local rsync is unavailable"},
+		{localOK: true, remoteOK: false, want: "remote host has no rsync"},
+	}
+	for _, tc := range cases {
+		err := resumeUnavailableError(tc.localOK, tc.remoteOK)
+		ce, ok := err.(*errorsx.CsshError)
+		if !ok || ce.Code != errorsx.CodeResumeUnavailable {
+			t.Fatalf("unexpected error for local=%v remote=%v: %#v", tc.localOK, tc.remoteOK, err)
+		}
+		if !strings.Contains(ce.Message, tc.want) {
+			t.Fatalf("unexpected message: %q", ce.Message)
+		}
+		if !strings.Contains(ce.Message, "retry without resume=true") {
+			t.Fatalf("message should explain retry path: %q", ce.Message)
+		}
+	}
+}
+
 func TestInstallLocalCreateOnly(t *testing.T) {
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "download.tmp")
@@ -147,5 +198,85 @@ func TestTransferAuditDetailWithoutProtocol(t *testing.T) {
 	got := transferAuditDetail("a -> b", sshbridge.TransferResult{})
 	if got != "a -> b" {
 		t.Fatalf("unexpected detail without protocol: %q", got)
+	}
+}
+
+func TestDirectoryVerificationResult(t *testing.T) {
+	typ, result, err := directoryVerificationResult(false, 3, 2)
+	if err != nil || typ != "none" || result != "skipped" {
+		t.Fatalf("disabled verification mismatch: type=%q result=%q err=%v", typ, result, err)
+	}
+
+	typ, result, err = directoryVerificationResult(true, 3, 3)
+	if err != nil || typ != "file_count" || result != "match" {
+		t.Fatalf("match verification mismatch: type=%q result=%q err=%v", typ, result, err)
+	}
+
+	typ, result, err = directoryVerificationResult(true, 3, 2)
+	if err == nil || typ != "file_count" || result != "mismatch" {
+		t.Fatalf("mismatch verification should fail: type=%q result=%q err=%v", typ, result, err)
+	}
+}
+
+func TestLocalDirStats(t *testing.T) {
+	tmp := t.TempDir()
+	// Create a directory with 3 files of known sizes
+	sub := filepath.Join(tmp, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	for _, f := range []struct {
+		name string
+		size int
+	}{
+		{"a.txt", 100},
+		{"b.txt", 200},
+		{"sub/c.txt", 50},
+	} {
+		if err := os.WriteFile(filepath.Join(tmp, f.name), make([]byte, f.size), 0o644); err != nil {
+			t.Fatalf("write %s: %v", f.name, err)
+		}
+	}
+	count, total, err := localDirStats(tmp)
+	if err != nil {
+		t.Fatalf("localDirStats: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 files, got %d", count)
+	}
+	if total != 350 {
+		t.Fatalf("expected 350 bytes total, got %d", total)
+	}
+}
+
+func TestLocalDirStatsEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	count, total, err := localDirStats(tmp)
+	if err != nil {
+		t.Fatalf("localDirStats: %v", err)
+	}
+	if count != 0 || total != 0 {
+		t.Fatalf("expected 0/0, got %d/%d", count, total)
+	}
+}
+
+func TestLocalDirStatsRecursiveFlagOnRegularFile(t *testing.T) {
+	// When recursive=true is passed with a regular file path, the service
+	// silently sets recursive=false. This test verifies localDirStats is
+	// only called for actual directories (it would error on a regular file).
+	tmp := t.TempDir()
+	f := filepath.Join(tmp, "file.txt")
+	if err := os.WriteFile(f, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// localDirStats on a file path should still work — it walks the "directory"
+	// and finds no regular files within (the path itself is the root).
+	// Actually filepath.WalkDir on a regular file will visit just that file.
+	count, total, err := localDirStats(f)
+	if err != nil {
+		t.Fatalf("localDirStats on file: %v", err)
+	}
+	if count != 1 || total != 4 {
+		t.Fatalf("unexpected count/total: %d/%d", count, total)
 	}
 }

@@ -274,6 +274,7 @@ func TestToRPCErrorAdditionalMappings(t *testing.T) {
 		{errorsx.New(errorsx.CodeFileExists, "exists"), -32007},
 		{errorsx.New(errorsx.CodeChecksumMismatch, "mismatch"), -32008},
 		{errorsx.New(errorsx.CodeChecksumUnavailable, "missing"), -32009},
+		{errorsx.New(errorsx.CodeResumeUnavailable, "resume unavailable"), -32015},
 		{errorsx.New(errorsx.CodeContentTooLarge, "too large"), -32012},
 	}
 	for _, tc := range cases {
@@ -448,7 +449,6 @@ func TestCnoteToolCall(t *testing.T) {
 		t.Fatalf("unexpected recorded content: %#v", out["recorded"])
 	}
 }
-
 
 func TestCancelledNotification(t *testing.T) {
 	s := NewServer(nil)
@@ -731,6 +731,57 @@ func TestReadOnlyToolAnnotations(t *testing.T) {
 		}
 		if ann["destructiveHint"] != false {
 			t.Errorf("%s: destructiveHint should be false", name)
+		}
+	}
+}
+
+func TestReadFileSchemaParameters(t *testing.T) {
+	tool := findToolDef(t, "ssh_read_file")
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	requiredAny := requiredAsAny(t, schema)
+	for _, k := range []string{"connection_id", "path"} {
+		if !containsString(requiredAny, k) {
+			t.Fatalf("required should contain %s: %#v", k, requiredAny)
+		}
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	for _, k := range []string{"connection_id", "path", "cwd", "offset", "limit", "max_bytes"} {
+		prop, exists := props[k]
+		if !exists {
+			t.Fatalf("properties should include %s", k)
+		}
+		pm, ok := prop.(map[string]any)
+		if !ok {
+			t.Fatalf("property %s should be a map", k)
+		}
+		if pm["type"] == nil {
+			t.Fatalf("property %s should have type", k)
+		}
+	}
+	// offset, limit, max_bytes should be integer
+	for _, k := range []string{"offset", "limit", "max_bytes"} {
+		pm := props[k].(map[string]any)
+		if pm["type"] != "integer" {
+			t.Errorf("property %s type should be integer, got %v", k, pm["type"])
+		}
+	}
+}
+
+func TestReadFileSchemaDescription(t *testing.T) {
+	tool := findToolDef(t, "ssh_read_file")
+	desc, ok := tool["description"].(string)
+	if !ok || desc == "" {
+		t.Fatalf("description missing")
+	}
+	for _, keyword := range []string{"line number", "binary", "ssh_transfer", "ymlink"} {
+		if !strings.Contains(strings.ToLower(desc), strings.ToLower(keyword)) {
+			t.Errorf("description should mention %q: %s", keyword, desc)
 		}
 	}
 }

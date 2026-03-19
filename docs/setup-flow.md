@@ -28,7 +28,7 @@ If an operation returns `status=approval_required` (for example from `ssh_exec` 
   "host": "100.88.0.10",
   "username": "ubuntu",
   "auth_mode": "hybrid",
-  "workspace_roots": ["/home/ubuntu/project"],
+  "workspace_roots": ["/"],
   "key_path": "~/.ssh/id_ed25519"
 }
 ```

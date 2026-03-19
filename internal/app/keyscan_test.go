@@ -116,18 +116,15 @@ func TestScanSSHKeys_OutsideHome(t *testing.T) {
 }
 
 func TestScanSSHKeys_EmptyDir(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("cannot determine home dir")
-	}
-	// Create a temp dir under home
-	dir, err := os.MkdirTemp(home, "cssh-test-scan-*")
-	if err != nil {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	scanDir := filepath.Join(tempHome, ".ssh")
+	if err := os.Mkdir(scanDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
 
-	keys, err := ScanSSHKeys(dir)
+	keys, err := ScanSSHKeys(scanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,26 +134,24 @@ func TestScanSSHKeys_EmptyDir(t *testing.T) {
 }
 
 func TestScanSSHKeys_FindsKey(t *testing.T) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		t.Skip("cannot determine home dir")
-	}
-	dir, err := os.MkdirTemp(home, "cssh-test-scan-*")
-	if err != nil {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	scanDir := filepath.Join(tempHome, ".ssh")
+	if err := os.Mkdir(scanDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
 
-	keyPath := filepath.Join(dir, "id_test")
-	err = os.WriteFile(keyPath, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"), 0o600)
+	keyPath := filepath.Join(scanDir, "id_test")
+	err := os.WriteFile(keyPath, []byte("-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"), 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Also create a .pub which should be ignored
-	pubPath := filepath.Join(dir, "id_test.pub")
+	pubPath := filepath.Join(scanDir, "id_test.pub")
 	_ = os.WriteFile(pubPath, []byte("ssh-ed25519 AAAA...\n"), 0o644)
 
-	keys, err := ScanSSHKeys(dir)
+	keys, err := ScanSSHKeys(scanDir)
 	if err != nil {
 		t.Fatal(err)
 	}

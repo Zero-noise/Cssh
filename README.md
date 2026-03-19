@@ -1,7 +1,6 @@
 # Cssh
 
-Cssh is an SSH bridge for MCP-compatible coding agents (Claude Code, Codex, Cursor, VS Code, Windsurf, and more).
-It lets AI agents securely connect, execute commands, transfer files, and manage remote servers over SSH — all through MCP tool calls.
+Cssh - Claude (Codex) SSH, or really, any MCP-compatible agent over SSH. A lightweight MCP server for secure remote command execution, file transfer, and server management.
 
 ## Installation
 
@@ -117,7 +116,7 @@ Or: `codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp`
 - **Auto-reconnect** — if an SSH master dies unexpectedly, Cssh reconnects transparently and notifies the AI agent
 - **Exec progress streaming** — real-time output via MCP progress notifications during long-running commands
 - **Per-profile Cnote** — persistent AI-facing notes per profile (e.g. "download to /mnt/ssd", "don't restart during business hours"); returned automatically on `ssh_connect`
-- **File transfer with verification** — `scp` transport with automatic SFTP/legacy-SCP fallback and SHA-256 checksums
+- **File transfer with verification** — `scp` transport with automatic SFTP/legacy-SCP fallback, SHA-256 checksums for files, and file-count verification for directories
 - **Credential storage** — passwords and key passphrases stored in OS keychain (macOS Keychain / Linux Secret Service), never in config files
 - **Tool annotations** — all tools annotated with MCP spec hints (`readOnlyHint`, `destructiveHint`, etc.)
 
@@ -149,7 +148,7 @@ Additional controls: profile-only connections, `workspace_roots` write restricti
 | `ssh_read_file` | Read remote file |
 | `ssh_write_file` | Write remote file (workspace_roots guarded) |
 | `ssh_apply_patch` | Apply unified diff patch on remote host |
-| `ssh_transfer` | Transfer files via scp (SFTP default, legacy SCP fallback) with SHA-256 verification |
+| `ssh_transfer` | Transfer files via scp (SFTP default, legacy SCP fallback) with file SHA-256 verification and directory file-count verification |
 | `ssh_profile` | List or delete saved profiles |
 | `ssh_cnote` | Read or update per-profile Cnote instructions |
 | `ssh_profile_setup` | Create or edit profiles via guided setup flow |
@@ -174,7 +173,7 @@ csshctl profile add \
   --name rayna-dev \
   --host 100.88.0.10 \
   --user ubuntu \
-  --workspace-roots /home/ubuntu/project \
+  --workspace-roots / \
   --auth-priority key,password \
   --key-path ~/.ssh/id_ed25519 \
   --security-profile easy_safe

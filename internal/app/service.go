@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -49,6 +50,8 @@ type profileDeleteConfirm struct {
 	ProfileID string
 	ExpiresAt time.Time
 }
+
+var lookPath = exec.LookPath
 
 func NewService(cfg model.Config) *Service {
 	svc := &Service{
@@ -523,7 +526,7 @@ func (s *Service) RevokePrivilege(grantID string) (map[string]any, error) {
 	return resp, nil
 }
 
-func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
+func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string, recursive, resume bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -585,14 +588,57 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	if err != nil {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path not found")
 	}
-	if !info.Mode().IsRegular() {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path must be a regular file")
+	isDir := info.IsDir()
+	if isDir && !recursive {
+		return nil, errorsx.New(errorsx.CodeInvalidParams,
+			"local_path is a directory; set recursive=true to transfer directories")
+	}
+	if !isDir && !info.Mode().IsRegular() {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path must be a regular file or directory")
+	}
+	// recursive=true on a regular file: silently ignore, transfer as single file
+	if !isDir {
+		recursive = false
+		if resume {
+			if err := validateResumeMode(mode); err != nil {
+				return nil, err
+			}
+		}
 	}
 
+	if isDir {
+		if mode == "overwrite" {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				"overwrite is not supported for directory transfers; remove the target first with ssh_exec if needed")
+		}
+		if resume {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				"resume is not supported for directory transfers")
+		}
+		fileCount, totalBytes, err := localDirStats(localAbs)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+		}
+		if err := security.ValidateLocalDirSymlinks(localAbs); err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "directory contains unsafe symlinks: "+err.Error())
+		}
+		return s.uploadDirectory(traceID, connectionID, conn, localAbs, remotePath, cwd, timeoutSec, createParents, verifyChecksum, fileCount, totalBytes, onProgress)
+	}
+
+	// --- single file upload ---
 	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
 	if remoteResolved == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
 	}
+
+	// Resume path: use rsync if available
+	if resume {
+		if err := s.ensureResumeAvailable(connectionID); err != nil {
+			return nil, err
+		}
+		return s.uploadFileWithResume(traceID, connectionID, conn, localAbs, remoteResolved, timeoutSec, createParents, verifyChecksum, onProgress)
+	}
+
 	if createParents {
 		if err := s.remoteMkdirAll(connectionID, path.Dir(remoteResolved)); err != nil {
 			return nil, err
@@ -605,7 +651,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		remoteTemp = transferTempPath(remoteResolved)
 		uploadTarget = remoteTemp
 	}
-	transferRes, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec)
+	transferRes, err := s.ssh.UploadFile(connectionID, localAbs, uploadTarget, timeoutSec, false, onProgress)
 	auditDetail := transferAuditDetail(localAbs+" -> "+remoteResolved, transferRes)
 	durationMS := transferRes.DurationMS
 	if err != nil {
@@ -657,7 +703,120 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	return resp, nil
 }
 
-func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
+func (s *Service) uploadDirectory(traceID, connectionID string, conn *model.Connection, localAbs, remotePath, cwd string, timeoutSec int, createParents, verifyChecksum bool, fileCount int, totalBytes int64, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
+	if remoteResolved == "" {
+		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
+	}
+
+	// Ensure target doesn't exist + create parent
+	if err := s.remoteEnsureNewDir(connectionID, remoteResolved, createParents); err != nil {
+		return nil, err
+	}
+
+	transferRes, err := s.ssh.UploadFile(connectionID, localAbs, remoteResolved, timeoutSec, true, onProgress)
+	auditDetail := transferAuditDetail(fmt.Sprintf("%s -> %s (dir, %d files, %d bytes)", localAbs, remoteResolved, fileCount, totalBytes), transferRes)
+	durationMS := transferRes.DurationMS
+	if err != nil {
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
+		return nil, err
+	}
+
+	// Best-effort file count verification
+	verificationType, verificationResult := "none", "skipped"
+	if verifyChecksum {
+		remoteCount, countErr := s.remoteFileCount(connectionID, remoteResolved, timeoutSec)
+		if countErr != nil {
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "verification_failed", auditDetail, durationMS)
+			return nil, countErr
+		}
+		verificationType, verificationResult, err = directoryVerificationResult(true, fileCount, remoteCount)
+		if err != nil {
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "verification_mismatch", auditDetail, durationMS)
+			return nil, err
+		}
+	}
+
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"transfer_type":       "directory",
+		"file_count":          fileCount,
+		"total_bytes":         totalBytes,
+		"bytes":               totalBytes,
+		"verification_type":   verificationType,
+		"verification_result": verificationResult,
+		"local_path":          localAbs,
+		"remote_path":         remoteResolved,
+		"duration_ms":         durationMS,
+		"transfer_protocol":   transferRes.Protocol,
+		"fallback_used":       transferRes.FallbackUsed,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
+}
+
+func (s *Service) uploadFileWithResume(traceID, connectionID string, conn *model.Connection, localAbs, remoteResolved string, timeoutSec int, createParents, verifyChecksum bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+	if createParents {
+		if err := s.remoteMkdirAll(connectionID, path.Dir(remoteResolved)); err != nil {
+			return nil, err
+		}
+	}
+
+	var transferRes sshbridge.TransferResult
+	var err error
+	transferRes, err = s.ssh.RunRsync(connectionID, timeoutSec, localAbs, remoteResolved, true, onProgress)
+
+	auditDetail := transferAuditDetail(localAbs+" -> "+remoteResolved, transferRes)
+	durationMS := transferRes.DurationMS
+	if err != nil {
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
+		return nil, err
+	}
+
+	info, err := os.Stat(localAbs)
+	if err != nil {
+		return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+	}
+
+	localSHA := ""
+	remoteSHA := ""
+	if verifyChecksum {
+		localSHA, err = localFileSHA256(localAbs)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+		remoteSHA, err = s.remoteFileSHA256(connectionID, remoteResolved, timeoutSec)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
+			return nil, err
+		}
+	}
+
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
+}
+
+func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, approvalToken string, recursive, resume bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	timeoutSec = normalizeTransferTimeout(timeoutSec)
 	mode, err := normalizeTransferMode(mode)
@@ -712,12 +871,30 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	if remoteResolved == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
 	}
-	isFile, err := s.remoteRegularFileExists(connectionID, remoteResolved)
+
+	pathType, err := s.remotePathType(connectionID, remoteResolved)
 	if err != nil {
 		return nil, err
 	}
-	if !isFile {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "remote_path not found or not a regular file")
+	switch pathType {
+	case "directory":
+		if !recursive {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				"remote_path is a directory; set recursive=true to transfer directories")
+		}
+		if mode == "overwrite" {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				"overwrite is not supported for directory transfers; remove the target first with ssh_exec if needed")
+		}
+		if resume {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				"resume is not supported for directory transfers")
+		}
+		return s.downloadDirectory(traceID, connectionID, conn, remoteResolved, localPath, timeoutSec, createParents, verifyChecksum, allowLocalAnywhere, onProgress)
+	case "file":
+		// fall through to single-file download
+	default:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "remote_path not found")
 	}
 
 	localAbs, err := security.ResolveLocalPath(localPath)
@@ -727,6 +904,18 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	if err := ensureLocalPathAllowed(localAbs, allowLocalAnywhere); err != nil {
 		return nil, err
 	}
+
+	// Resume path: use rsync if available
+	if resume {
+		if err := validateResumeMode(mode); err != nil {
+			return nil, err
+		}
+		if err := s.ensureResumeAvailable(connectionID); err != nil {
+			return nil, err
+		}
+		return s.downloadFileWithResume(traceID, connectionID, conn, remoteResolved, localAbs, timeoutSec, createParents, verifyChecksum, onProgress)
+	}
+
 	if createParents {
 		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
@@ -746,7 +935,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		localTemp = transferTempPath(localAbs)
 		downloadTarget = localTemp
 	}
-	transferRes, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec)
+	transferRes, err := s.ssh.DownloadFile(connectionID, remoteResolved, downloadTarget, timeoutSec, false, onProgress)
 	auditDetail := transferAuditDetail(remoteResolved+" -> "+localAbs, transferRes)
 	durationMS := transferRes.DurationMS
 	if err != nil {
@@ -805,53 +994,329 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	return resp, nil
 }
 
-func (s *Service) ReadFile(connectionID, filePath string, maxBytes int, cwd string) (map[string]any, error) {
+func (s *Service) downloadDirectory(traceID, connectionID string, conn *model.Connection, remoteResolved, localPath string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+	localAbs, err := security.ResolveLocalPath(localPath)
+	if err != nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path is invalid")
+	}
+	if err := ensureLocalPathAllowed(localAbs, allowLocalAnywhere); err != nil {
+		return nil, err
+	}
+
+	// mode=create: local path must not exist
+	if _, err := os.Stat(localAbs); err == nil {
+		return nil, errorsx.New(errorsx.CodeFileExists, "local target exists")
+	} else if !os.IsNotExist(err) {
+		return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+	}
+	if createParents {
+		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+	}
+
+	remoteCount := 0
+	if verifyChecksum {
+		remoteCount, err = s.remoteFileCount(connectionID, remoteResolved, timeoutSec)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	transferRes, err := s.ssh.DownloadFile(connectionID, remoteResolved, localAbs, timeoutSec, true, onProgress)
+	auditDetail := transferAuditDetail(fmt.Sprintf("%s -> %s (dir)", remoteResolved, localAbs), transferRes)
+	durationMS := transferRes.DurationMS
+	if err != nil {
+		_ = os.RemoveAll(localAbs) // clean up partial download
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
+		return nil, err
+	}
+
+	// Post-download: validate symlinks
+	if symlinkErr := security.ValidateLocalDirSymlinks(localAbs); symlinkErr != nil {
+		_ = os.RemoveAll(localAbs) // remove tainted directory
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "symlink_violation", auditDetail, durationMS)
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "downloaded directory contains unsafe symlinks: "+symlinkErr.Error())
+	}
+
+	localCount, localBytes, _ := localDirStats(localAbs)
+
+	verificationType, verificationResult, err := directoryVerificationResult(verifyChecksum, remoteCount, localCount)
+	if err != nil {
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "verification_mismatch", auditDetail, durationMS)
+		return nil, err
+	}
+
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"transfer_type":       "directory",
+		"file_count":          localCount,
+		"total_bytes":         localBytes,
+		"bytes":               localBytes,
+		"verification_type":   verificationType,
+		"verification_result": verificationResult,
+		"local_path":          localAbs,
+		"remote_path":         remoteResolved,
+		"duration_ms":         durationMS,
+		"transfer_protocol":   transferRes.Protocol,
+		"fallback_used":       transferRes.FallbackUsed,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
+}
+
+func (s *Service) downloadFileWithResume(traceID, connectionID string, conn *model.Connection, remoteResolved, localAbs string, timeoutSec int, createParents, verifyChecksum bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+	if createParents {
+		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+	}
+
+	var transferRes sshbridge.TransferResult
+	var err error
+	transferRes, err = s.ssh.RunRsync(connectionID, timeoutSec, remoteResolved, localAbs, false, onProgress)
+
+	auditDetail := transferAuditDetail(remoteResolved+" -> "+localAbs, transferRes)
+	durationMS := transferRes.DurationMS
+	if err != nil {
+		s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
+		return nil, err
+	}
+
+	info, err := os.Stat(localAbs)
+	if err != nil {
+		return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+	}
+
+	localSHA := ""
+	remoteSHA := ""
+	if verifyChecksum {
+		remoteSHA, err = s.remoteFileSHA256(connectionID, remoteResolved, timeoutSec)
+		if err != nil {
+			return nil, err
+		}
+		localSHA, err = localFileSHA256(localAbs)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+		if err := ensureChecksumsMatch(localSHA, remoteSHA); err != nil {
+			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "checksum_mismatch", auditDetail, durationMS)
+			return nil, err
+		}
+	}
+
+	s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "ok", auditDetail, durationMS)
+	resp := map[string]any{
+		"bytes":             info.Size(),
+		"local_sha256":      localSHA,
+		"remote_sha256":     remoteSHA,
+		"local_path":        localAbs,
+		"remote_path":       remoteResolved,
+		"duration_ms":       durationMS,
+		"transfer_protocol": transferRes.Protocol,
+		"fallback_used":     transferRes.FallbackUsed,
+	}
+	if transferRes.FallbackUsed && transferRes.FallbackReason != "" {
+		resp["fallback_reason"] = transferRes.FallbackReason
+	}
+	s.enrichWithReconnectInfo(resp, connectionID)
+	return resp, nil
+}
+
+const (
+	readFileDefaultMaxBytes = 512 * 1024     // 512KB
+	readFileHardMaxBytes    = 2 * 1024 * 1024 // 2MB
+	readFileDefaultOffset   = 1
+	readFileDefaultLimit    = 2000
+)
+
+type readFileResult struct {
+	RealPath     string
+	Size         int64
+	TotalLines   int
+	Binary       bool
+	MimeEncoding string
+	Content      string
+	LineStart    int
+	LineEnd      int
+	Truncated    bool
+}
+
+func normalizeReadFileParams(maxBytes, offset, limit int) (int, int, int) {
+	if maxBytes <= 0 {
+		maxBytes = readFileDefaultMaxBytes
+	}
+	if maxBytes > readFileHardMaxBytes {
+		maxBytes = readFileHardMaxBytes
+	}
+	if offset <= 0 {
+		offset = readFileDefaultOffset
+	}
+	if limit <= 0 {
+		limit = readFileDefaultLimit
+	}
+	return maxBytes, offset, limit
+}
+
+func buildReadFileCmd(quotedPath string, offset, limit, maxBytes int) string {
+	return fmt.Sprintf(`_p=%s
+_rp="$(realpath -e "$_p" 2>/dev/null || readlink -f "$_p" 2>/dev/null)" || exit 1
+test -f "$_rp" || exit 2
+_sz=$(wc -c < "$_rp") || exit 3
+_sz=${_sz##* }
+_me=""
+_bin=false
+if command -v file >/dev/null 2>&1; then
+  _me="$(file -b --mime-encoding "$_rp" 2>/dev/null)" || true
+  case "$_me" in binary) _bin=true;; esac
+else
+  _n=$(head -c 8192 "$_rp" | tr -cd '\000' | wc -c | tr -d ' ')
+  [ "${_n:-0}" -gt 0 ] 2>/dev/null && _bin=true
+fi
+if [ "$_bin" = true ]; then
+  printf '%%s\n%%s\n0\n%%s\n%%s\n' "$_rp" "$_sz" "$_bin" "$_me"
+  exit 0
+fi
+_lc=$(wc -l < "$_rp") && _lc=${_lc##* } || _lc=0
+printf '%%s\n%%s\n%%s\n%%s\n%%s\n' "$_rp" "$_sz" "$_lc" "$_bin" "$_me"
+awk -v s=%d -v e=%d 'NR>=s&&NR<=e{printf "%%6d\t%%s\n",NR,$0}NR>e{exit}' "$_rp" | head -c %d`,
+		quotedPath, offset, offset+limit-1, maxBytes)
+}
+
+func parseLeadingLineNum(line string) int {
+	idx := strings.IndexByte(line, '\t')
+	if idx < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line[:idx]))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func parseReadFileOutput(stdout string, maxBytes int) (readFileResult, error) {
+	parts := strings.SplitN(stdout, "\n", 6)
+	if len(parts) < 5 {
+		return readFileResult{}, fmt.Errorf("malformed read_file output: expected at least 5 header lines, got %d", len(parts))
+	}
+	var r readFileResult
+	r.RealPath = parts[0]
+	size, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+	if err != nil {
+		return readFileResult{}, fmt.Errorf("invalid size: %q", parts[1])
+	}
+	r.Size = size
+	totalLines, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+	if err != nil {
+		return readFileResult{}, fmt.Errorf("invalid total_lines: %q", parts[2])
+	}
+	r.TotalLines = totalLines
+	r.Binary = strings.TrimSpace(parts[3]) == "true"
+	r.MimeEncoding = strings.TrimSpace(parts[4])
+
+	if r.Binary {
+		return r, nil
+	}
+
+	content := ""
+	if len(parts) == 6 {
+		content = parts[5]
+	}
+
+	if content != "" {
+		lines := strings.Split(content, "\n")
+		// Trim trailing empty line from final newline
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		if len(lines) > 0 {
+			r.LineStart = parseLeadingLineNum(lines[0])
+			r.LineEnd = parseLeadingLineNum(lines[len(lines)-1])
+		}
+	}
+
+	r.Content = content
+	r.Truncated = len(content) >= maxBytes
+	return r, nil
+}
+
+func buildReadFileResponse(parsed readFileResult) map[string]any {
+	resp := map[string]any{
+		"size": parsed.Size,
+	}
+	if parsed.Binary {
+		resp["binary"] = true
+		resp["content"] = ""
+		if parsed.MimeEncoding != "" {
+			resp["mime_encoding"] = parsed.MimeEncoding
+		}
+		resp["note"] = "use ssh_transfer to download"
+		return resp
+	}
+	resp["content"] = parsed.Content
+	resp["total_lines"] = parsed.TotalLines
+	resp["line_start"] = parsed.LineStart
+	resp["line_end"] = parsed.LineEnd
+	resp["truncated"] = parsed.Truncated
+	return resp
+}
+
+func (s *Service) ReadFile(connectionID, filePath string, maxBytes, offset, limit int, cwd string) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
 	}
-	if maxBytes <= 0 {
-		maxBytes = 65536
-	}
+	maxBytes, offset, limit = normalizeReadFileParams(maxBytes, offset, limit)
+
+	// Text-level pre-check (fast fail for obviously bad paths)
 	resolved := s.resolveAndCheckPath(conn, filePath, cwd)
 	if resolved == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "path is outside workspace_roots")
 	}
-	isFile, err := s.remoteRegularFileExists(connectionID, resolved)
+
+	cmd := buildReadFileCmd(util.ShellQuote(resolved), offset, limit, maxBytes)
+	res, err := s.ssh.Exec(connectionID, "", cmd, "", 60)
 	if err != nil {
 		return nil, err
 	}
-	if !isFile {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "path not found or not a regular file")
+	switch res.ExitCode {
+	case 0:
+		// success
+	case 1:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "path not found or cannot resolve symlink")
+	case 2:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "path is not a regular file")
+	case 3:
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "cannot read file (permission denied or I/O error)")
+	default:
+		return nil, commandResultError(res, "read file failed")
 	}
 
-	sizeRes, err := s.ssh.Exec(connectionID, "", "wc -c < "+util.ShellQuote(resolved), "", 60)
+	parsed, err := parseReadFileOutput(res.Stdout, maxBytes)
 	if err != nil {
-		return nil, err
+		return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
 	}
-	if sizeRes.ExitCode != 0 {
-		return nil, commandResultError(sizeRes, "read file size failed")
+
+	// Security-critical: check the resolved real path against workspace_roots
+	if !security.IsWithinRoots(parsed.RealPath, conn.WorkspaceRoots) {
+		return nil, errorsx.New(errorsx.CodePathForbidden, "resolved path is outside workspace_roots")
 	}
-	sizeStr := strings.TrimSpace(sizeRes.Stdout)
-	size, _ := strconv.Atoi(sizeStr)
-	res, err := s.ssh.Exec(connectionID, "", "head -c "+strconv.Itoa(maxBytes)+" "+util.ShellQuote(resolved), "", 60)
-	if err != nil {
-		return nil, err
-	}
-	if res.ExitCode != 0 {
-		return nil, commandResultError(res, "read file content failed")
-	}
-	truncated := size > maxBytes
+
+	resp := buildReadFileResponse(parsed)
+
 	_ = s.audit.Write(model.AuditEvent{
 		Timestamp:    time.Now().UTC(),
 		TraceID:      traceID,
 		Type:         "ssh_read_file",
 		ConnectionID: connectionID,
-		FilePath:     resolved,
+		FilePath:     parsed.RealPath,
 		Status:       "ok",
 	})
-	resp := map[string]any{"content": res.Stdout, "truncated": truncated}
 	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
 }
@@ -1107,6 +1572,38 @@ func normalizeTransferMode(mode string) (string, error) {
 	return v, nil
 }
 
+func validateResumeMode(mode string) error {
+	if mode == "overwrite" {
+		return nil
+	}
+	return errorsx.New(errorsx.CodeInvalidParams, "resume requires mode=overwrite; retry with mode=overwrite or remove resume=true")
+}
+
+func hasLocalRsync() bool {
+	_, err := lookPath("rsync")
+	return err == nil
+}
+
+func resumeUnavailableError(localOK, remoteOK bool) error {
+	switch {
+	case !localOK && !remoteOK:
+		return errorsx.New(errorsx.CodeResumeUnavailable, "resume requested but rsync is unavailable locally and on the remote host; retry without resume=true")
+	case !localOK:
+		return errorsx.New(errorsx.CodeResumeUnavailable, "resume requested but local rsync is unavailable; retry without resume=true")
+	default:
+		return errorsx.New(errorsx.CodeResumeUnavailable, "resume requested but remote host has no rsync; retry without resume=true")
+	}
+}
+
+func (s *Service) ensureResumeAvailable(connectionID string) error {
+	localOK := hasLocalRsync()
+	remoteOK := s.ssh.HasRsync(connectionID)
+	if localOK && remoteOK {
+		return nil
+	}
+	return resumeUnavailableError(localOK, remoteOK)
+}
+
 func ensureLocalPathAllowed(localPath string, allowLocalAnywhere bool) error {
 	if allowLocalAnywhere {
 		return nil
@@ -1135,6 +1632,97 @@ func (s *Service) remoteRegularFileExists(connectionID, remotePath string) (bool
 		return false, err
 	}
 	return res.ExitCode == 0, nil
+}
+
+// remotePathType returns "directory", "file", or "missing" for a remote path.
+func (s *Service) remotePathType(connectionID, remotePath string) (string, error) {
+	cmd := "if [ -d " + util.ShellQuote(remotePath) + " ]; then echo directory; elif [ -f " + util.ShellQuote(remotePath) + " ]; then echo file; else echo missing; fi"
+	res, err := s.ssh.Exec(connectionID, "", cmd, "", 30)
+	if err != nil {
+		return "", err
+	}
+	if res.ExitCode != 0 {
+		return "", commandResultError(res, "remote path type check failed")
+	}
+	return strings.TrimSpace(res.Stdout), nil
+}
+
+// remoteEnsureNewDir checks that the target doesn't exist, then creates its parent.
+// Exit 17 = target exists (maps to CodeFileExists).
+func (s *Service) remoteEnsureNewDir(connectionID, targetPath string, createParents bool) error {
+	q := util.ShellQuote(targetPath)
+	var cmd string
+	if createParents {
+		parentQ := util.ShellQuote(path.Dir(targetPath))
+		cmd = "test -e " + q + " && exit 17 || mkdir -p " + parentQ
+	} else {
+		// "|| true" prevents exit code 1 (target doesn't exist) from being treated as error
+		cmd = "test -e " + q + " && exit 17 || true"
+	}
+	res, err := s.ssh.Exec(connectionID, "", cmd, "", 30)
+	if err != nil {
+		return err
+	}
+	if res.ExitCode == 17 {
+		return errorsx.New(errorsx.CodeFileExists, "remote target already exists")
+	}
+	if res.ExitCode != 0 {
+		return commandResultError(res, "remote directory preparation failed")
+	}
+	return nil
+}
+
+// localDirStats walks a local directory, counting regular files and summing sizes.
+// Enforces limits: max 100k files, max 10GB total.
+func localDirStats(dirPath string) (fileCount int, totalBytes int64, err error) {
+	const maxFiles = 100_000
+	const maxBytes = 10 * 1024 * 1024 * 1024 // 10GB
+	err = filepath.WalkDir(dirPath, func(_ string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil // skip symlinks, devices etc for counting
+		}
+		fileCount++
+		if fileCount > maxFiles {
+			return fmt.Errorf("directory exceeds maximum file count (%d)", maxFiles)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		totalBytes += info.Size()
+		if totalBytes > maxBytes {
+			return fmt.Errorf("directory exceeds maximum total size (10 GB)")
+		}
+		return nil
+	})
+	return fileCount, totalBytes, err
+}
+
+// remoteFileCount counts regular files in a remote directory.
+func (s *Service) remoteFileCount(connectionID, dirPath string, timeoutSec int) (int, error) {
+	cmd := "find " + util.ShellQuote(dirPath) + " -type f | wc -l"
+	sec := timeoutSec
+	if sec <= 0 {
+		sec = 300
+	}
+	res, err := s.ssh.Exec(connectionID, "", cmd, "", sec)
+	if err != nil {
+		return 0, err
+	}
+	if res.ExitCode != 0 {
+		return 0, commandResultError(res, "remote file count failed")
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
+	if err != nil {
+		return 0, fmt.Errorf("parse remote file count: %w", err)
+	}
+	return count, nil
 }
 
 func (s *Service) remoteMkdirAll(connectionID, remoteDir string) error {
@@ -1312,6 +1900,17 @@ func ensureChecksumsMatch(localSHA, remoteSHA string) error {
 		return nil
 	}
 	return errorsx.New(errorsx.CodeChecksumMismatch, "sha256 mismatch between local and remote file")
+}
+
+func directoryVerificationResult(enabled bool, expectedCount, actualCount int) (string, string, error) {
+	if !enabled {
+		return "none", "skipped", nil
+	}
+	if expectedCount == actualCount {
+		return "file_count", "match", nil
+	}
+	return "file_count", "mismatch", errorsx.New(errorsx.CodeInternal,
+		fmt.Sprintf("directory verification mismatch: expected %d files, got %d", expectedCount, actualCount))
 }
 
 func transferAuditDetail(base string, tr sshbridge.TransferResult) string {
