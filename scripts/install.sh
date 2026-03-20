@@ -165,11 +165,15 @@ CSSH_TOOLS=(
   "mcp__cssh__ssh_connection_status"
   "mcp__cssh__ssh_privilege"
   "mcp__cssh__ssh_read_file"
+  "mcp__cssh__ssh_write_file"
+  "mcp__cssh__ssh_apply_patch"
+  "mcp__cssh__ssh_transfer"
   "mcp__cssh__ssh_disconnect"
   "mcp__cssh__ssh_profile"
   "mcp__cssh__ssh_cnote"
   "mcp__cssh__ssh_profile_setup"
   "mcp__cssh__ssh_credentials_prompt"
+  "mcp__cssh__ssh_key_setup"
 )
 
 inject_permissions() {

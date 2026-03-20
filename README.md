@@ -138,22 +138,41 @@ Additional controls: profile-only connections, `workspace_roots` write restricti
 
 ## Tools
 
+### Core — daily operations
+
 | Tool | Description |
 |------|-------------|
-| `ssh_connect` | Profile-based SSH connection, returns `connection_id` |
-| `ssh_open_session` | Create a reusable shell session |
+| `ssh_connect` | Connect to a saved profile, returns `connection_id` |
 | `ssh_exec` | Run a command with real-time progress streaming |
-| `ssh_connection_status` | Inspect connection health |
-| `ssh_disconnect` | Close a connection |
-| `ssh_read_file` | Read remote file |
-| `ssh_write_file` | Write remote file (workspace_roots guarded) |
+| `ssh_read_file` | Read remote file (line-numbered, supports offset/limit for large files) |
+| `ssh_write_file` | Write remote file — create, overwrite, or append (workspace-guarded) |
 | `ssh_apply_patch` | Apply unified diff patch on remote host |
-| `ssh_transfer` | Transfer files via scp (SFTP default, legacy SCP fallback) with file SHA-256 verification and directory file-count verification |
+| `ssh_transfer` | Upload/download files via scp with SHA-256 verification; supports directories and rsync resume |
+| `ssh_disconnect` | Close a connection |
+
+### Session & connection management
+
+| Tool | Description |
+|------|-------------|
+| `ssh_open_session` | Create a persistent shell session (shared cwd/env across exec calls) |
+| `ssh_connection_status` | Inspect connection health (single or all connections) |
+
+### First-time setup flow
+
+These tools are used once per profile. After setup, only `ssh_connect` is needed.
+
+| Tool | Step | Description |
+|------|------|-------------|
+| `ssh_profile_setup` | 1 | Create or edit profiles — template, save, or edit existing |
+| `ssh_key_setup` | 2 | Select SSH key and store passphrase via local web form |
+| `ssh_credentials_prompt` | 3 | Store password / sudo credentials securely via local web form |
+
+### Profile & privilege management
+
+| Tool | Description |
+|------|-------------|
 | `ssh_profile` | List or delete saved profiles |
-| `ssh_cnote` | Read or update per-profile Cnote instructions |
-| `ssh_profile_setup` | Create or edit profiles via guided setup flow |
-| `ssh_credentials_prompt` | Securely store credentials via local web form |
-| `ssh_key_setup` | Select SSH key and store passphrase via local web form |
+| `ssh_cnote` | Read or update per-profile Cnote (persistent AI-facing notes) |
 | `ssh_privilege` | Inspect or revoke privilege grants |
 
 ## Build

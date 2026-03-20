@@ -506,7 +506,8 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 		if baseDir == "" {
 			baseDir = "/"
 		}
-		return s.svc.ApplyPatch(connID, patch, baseDir, app.ParseBoolAny(args["dry_run"], false))
+		strip := app.ParseIntAny(args["strip"], 0)
+		return s.svc.ApplyPatch(connID, patch, baseDir, app.ParseBoolAny(args["dry_run"], false), strip)
 	case "ssh_disconnect":
 		connID, err := app.RequireString(args, "connection_id")
 		if err != nil {
@@ -1110,8 +1111,8 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_apply_patch",
-			"Apply unified patch via patch(1) on remote host (workspace_roots guarded). Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files.",
-			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir", "dry_run"),
+			"Apply unified patch via patch(1) on remote host (workspace_roots guarded). Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files. strip controls leading path component removal (patch -pN): 0 (default) for absolute/relative paths, 1 for standard git diff with a/ b/ prefixes.",
+			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir", "dry_run", "strip"),
 			destructiveAnnotations("Apply Patch on Remote", true),
 		),
 		tool(
@@ -1388,6 +1389,8 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "description": "Base directory to apply patch in."}
 	case "dry_run":
 		return map[string]any{"type": "boolean", "description": "Dry-run mode: validate patch without applying. Default false."}
+	case "strip":
+		return map[string]any{"type": "integer", "description": "Strip N leading path components from file names (patch -pN). 0 for absolute/relative paths (default), 1 for standard git diff a/b/ prefix format."}
 	case "depth":
 		return map[string]any{"type": "integer", "description": "Directory listing recursion depth."}
 	case "pattern":

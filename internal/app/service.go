@@ -663,6 +663,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	}
 	if mode == "create" {
 		if err := s.remoteInstallCreateOnly(connectionID, remoteTemp, remoteResolved); err != nil {
+			s.remoteRemoveFile(connectionID, remoteTemp)
 			s.writeTransferAudit(traceID, "ssh_transfer", connectionID, conn.Host, remoteResolved, "nonzero_exit", auditDetail, durationMS)
 			return nil, err
 		}
@@ -1241,6 +1242,9 @@ func parseReadFileOutput(stdout string, maxBytes int) (readFileResult, error) {
 
 	r.Content = content
 	r.Truncated = len(content) >= maxBytes
+	if r.LineEnd > r.TotalLines {
+		r.TotalLines = r.LineEnd
+	}
 	return r, nil
 }
 
@@ -1388,7 +1392,7 @@ func buildWriteFileCmd(resolved, mode string) (string, error) {
 	case "overwrite":
 		// Atomic: write to temp file in same directory, then mv.
 		// trap ensures temp file cleanup on any failure.
-		return mkdir + ` && _t="$(mktemp "` + util.ShellQuote(dir) + `"/tmp.XXXXXX)" && ` +
+		return mkdir + ` && _t="$(mktemp ` + util.ShellQuote(dir) + `/tmp.XXXXXX)" && ` +
 			`trap 'rm -f "$_t"' EXIT && ` +
 			`base64 -d > "$_t" && ` +
 			`{ [ -e ` + q + ` ] && chmod --reference=` + q + ` "$_t" 2>/dev/null; true; } && ` +
@@ -1444,7 +1448,7 @@ func (s *Service) WriteFile(connectionID, filePath, content, mode, cwd string) (
 	return resp, nil
 }
 
-func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun bool) (map[string]any, error) {
+func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun bool, strip int) (map[string]any, error) {
 	traceID := util.NewID("trace")
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
@@ -1456,7 +1460,7 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun 
 	}
 	enc := base64.StdEncoding.EncodeToString([]byte(patchUnified))
 
-	patchFlags := "--batch --fuzz=0 -p0"
+	patchFlags := fmt.Sprintf("--batch --fuzz=0 -p%d", strip)
 	if dryRun {
 		patchFlags += " --dry-run"
 	}
@@ -1468,26 +1472,23 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun 
 	}
 	out := res.Stdout + "\n" + res.Stderr
 
+	totalHunks := countPatchHunks(patchUnified)
 	var filesPatched []string
-	hunksOK := 0
 	hunksFailed := 0
 	for _, line := range strings.Split(out, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "patching file ") {
 			filesPatched = append(filesPatched, strings.TrimPrefix(l, "patching file "))
 		}
-		if strings.HasPrefix(l, "Hunk #") {
-			if strings.Contains(l, "FAILED") {
-				hunksFailed++
-			} else {
-				hunksOK++
-			}
+		if strings.HasPrefix(l, "Hunk #") && strings.Contains(l, "FAILED") {
+			hunksFailed++
 		}
 	}
+	hunksApplied := totalHunks - hunksFailed
 
 	if res.ExitCode != 0 {
 		summary := fmt.Sprintf("patch failed: %d hunk(s) applied, %d hunk(s) FAILED across %d file(s)\n%s",
-			hunksOK, hunksFailed, len(filesPatched), strings.TrimSpace(out))
+			hunksApplied, hunksFailed, len(filesPatched), strings.TrimSpace(out))
 		return nil, errorsx.New(errorsx.CodeInternal, summary)
 	}
 
@@ -1505,7 +1506,7 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun 
 
 	resp := map[string]any{
 		"files_changed": len(filesPatched),
-		"hunks_applied": hunksOK,
+		"hunks_applied": hunksApplied,
 		"dry_run":       dryRun,
 	}
 	if dryRun {
@@ -1513,6 +1514,16 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun 
 	}
 	s.enrichWithReconnectInfo(resp, connectionID)
 	return resp, nil
+}
+
+func countPatchHunks(patch string) int {
+	n := 0
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Service) Disconnect(connectionID string) (map[string]any, error) {
@@ -1758,7 +1769,7 @@ func (s *Service) remoteInstallCreateOnly(connectionID, tempPath, targetPath str
 		"if [ -e " + util.ShellQuote(targetPath) + " ]; then exit 17; fi",
 		"exit $rc",
 		"fi",
-	}, "; ")
+	}, "\n")
 	res, err := s.ssh.Exec(connectionID, "", cmd, "", 30)
 	if err != nil {
 		return err

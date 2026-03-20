@@ -679,6 +679,7 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 	go func() {
 		probeCmd := exec.CommandContext(probeCtx, "ssh",
 			"-S", conn.ControlPath,
+			"-o", "ControlMaster=no",
 			"-p", strconv.Itoa(conn.Port),
 			target, "true",
 		)
@@ -693,6 +694,7 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 
 	args := []string{
 		"-S", conn.ControlPath,
+		"-o", "ControlMaster=no",
 		"-p", strconv.Itoa(conn.Port),
 		target,
 		remoteCmd,
@@ -929,6 +931,7 @@ func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, lega
 	args := []string{
 		"-P", strconv.Itoa(conn.Port),
 		"-o", "ControlPath=" + conn.ControlPath,
+		"-o", "ControlMaster=no",
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 	}
@@ -988,7 +991,7 @@ func (m *Manager) RunRsync(connectionID string, timeoutSec int, source, target s
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	rshFlag := fmt.Sprintf("ssh -o ControlPath=%s -o BatchMode=yes -p %d",
+	rshFlag := fmt.Sprintf("ssh -o ControlPath=%s -o ControlMaster=no -o BatchMode=yes -p %d",
 		conn.ControlPath, conn.Port)
 	remote := fmt.Sprintf("%s@%s", conn.Username, normalizeSCPHost(conn.Host))
 
