@@ -19,7 +19,6 @@ type Profile struct {
 	AuthPriority      []string `json:"auth_priority"`
 	KeyPath           string   `json:"key_path,omitempty"`
 	WorkspaceRoots    []string `json:"workspace_roots"`
-	AllowPublicHost   bool     `json:"allow_public_host"`
 	SecurityProfile   string   `json:"security_profile,omitempty"`
 	AllowRootUser     bool     `json:"allow_root_user,omitempty"`
 	ToolPolicyVersion int      `json:"tool_policy_version,omitempty"`
@@ -27,6 +26,7 @@ type Profile struct {
 	AllowReboot       bool     `json:"allow_reboot,omitempty"`
 	AllowDiskOps      bool     `json:"allow_disk_ops,omitempty"`
 	DenyPatterns      []string `json:"deny_patterns,omitempty"`
+	AllowedLocalPaths []string `json:"allowed_local_paths,omitempty"`
 	GrantTTLSec       int      `json:"grant_ttl_sec,omitempty"` // 0 = session-scoped (default), >0 = TTL in seconds
 }
 
@@ -46,7 +46,6 @@ type ConnectionInput struct {
 	ProfileID       string `json:"profile_id,omitempty"`
 	ProfileName     string `json:"profile_name,omitempty"`
 	LimitDir        string `json:"limit_dir,omitempty"`
-	AllowPublicHost *bool  `json:"allow_public_host,omitempty"`
 }
 
 type Connection struct {
@@ -62,15 +61,15 @@ type Connection struct {
 	SudoPassword    string
 	WorkspaceRoots  []string
 	LimitDir        string
-	AllowPublicHost bool
 	SecurityProfile string
 	AllowRootUser   bool
 	MaxAutoRisk     string
 	AllowReboot     bool
 	AllowDiskOps    bool
-	DenyPatterns    []string
-	GrantTTLSec     int
-	CnotePath       string
+	DenyPatterns      []string
+	AllowedLocalPaths []string
+	GrantTTLSec       int
+	CnotePath         string
 	Cnote           string
 	ControlPath     string
 	AuthMethod      string

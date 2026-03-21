@@ -25,6 +25,7 @@ type KeySetupInput struct {
 	ProfileID string
 	ScanDir   string // default "~/.ssh/"
 	Mode      string // auto|terminal|web
+	Notify    func(string) // optional; called with user-facing messages (e.g. web URL)
 }
 
 // KeySetup opens a web form (or returns manual instructions) for selecting
@@ -71,7 +72,7 @@ func (s *Service) KeySetup(in KeySetupInput) (map[string]any, error) {
 	mode := normalizePromptMode(in.Mode)
 	if mode == "web" || mode == "auto" {
 		if hasDisplay() {
-			result, err := s.keySetupWeb(profile, scanDir)
+			result, err := s.keySetupWeb(profile, scanDir, in.Notify)
 			if err == nil {
 				writeAudit("ok", "method=web profile_id="+profile.ID)
 				return result, nil
@@ -98,7 +99,7 @@ func manualKeySetupResult(profileID string) map[string]any {
 	}
 }
 
-func (s *Service) keySetupWeb(profile *model.Profile, scanDir string) (map[string]any, error) {
+func (s *Service) keySetupWeb(profile *model.Profile, scanDir string, notify func(string)) (map[string]any, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -249,6 +250,9 @@ func (s *Service) keySetupWeb(profile *model.Profile, scanDir string) (map[strin
 	url := fmt.Sprintf("http://127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port)
 	if err := openBrowser(url); err != nil {
 		return nil, fmt.Errorf("open browser: %w", err)
+	}
+	if notify != nil {
+		notify("Key setup page opened at " + url)
 	}
 
 	select {

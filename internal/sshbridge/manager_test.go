@@ -162,6 +162,48 @@ func TestExecWithInputRejectsSessionFromOtherConnection(t *testing.T) {
 	}
 }
 
+func TestOpenSessionRejectsEffectiveCWDOutsideRoots(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	m.connections["conn_a"] = &model.Connection{
+		ID:             "conn_a",
+		WorkspaceRoots: []string{"/opt/app"},
+	}
+
+	if _, err := m.OpenSession("conn_a", "", ""); err == nil {
+		t.Fatal("expected empty cwd to resolve to / and be rejected outside workspace_roots")
+	}
+
+	sess, err := m.OpenSession("conn_a", "/opt/app/sub", "")
+	if err != nil {
+		t.Fatalf("unexpected error for valid cwd: %v", err)
+	}
+	if sess.CWD != "/opt/app/sub" {
+		t.Fatalf("expected normalized cwd, got %q", sess.CWD)
+	}
+}
+
+func TestExecWithInputRejectsEffectiveCWDOutsideRoots(t *testing.T) {
+	m := NewManager(t.TempDir(), "bash -lc", 30)
+	m.connections["conn_a"] = &model.Connection{
+		ID:             "conn_a",
+		WorkspaceRoots: []string{"/opt/app"},
+	}
+
+	if _, err := m.ExecWithInput("conn_a", "", "echo hi", "", 10, ""); err == nil {
+		t.Fatal("expected default effective cwd / to be rejected outside workspace_roots")
+	}
+
+	m.sessions["sess_a"] = &model.Session{
+		ID:           "sess_a",
+		ConnectionID: "conn_a",
+		CWD:          "/opt/app",
+		Shell:        "bash -lc",
+	}
+	if _, err := m.ExecWithInput("conn_a", "sess_a", "echo hi", "../etc", 10, ""); err == nil {
+		t.Fatal("expected relative cwd escaping workspace_roots to be rejected")
+	}
+}
+
 func TestExecStreamWriterCopiesAndReports(t *testing.T) {
 	var got strings.Builder
 	writer := &execStreamWriter{

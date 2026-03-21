@@ -55,14 +55,54 @@ func TestEnsureLocalPathAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve outside: %v", err)
 	}
-	if err := ensureLocalPathAllowed(inside, false); err != nil {
+	if err := ensureLocalPathAllowed(inside, nil, false); err != nil {
 		t.Fatalf("inside path should be allowed: %v", err)
 	}
-	if err := ensureLocalPathAllowed(outside, false); err == nil {
+	if err := ensureLocalPathAllowed(outside, nil, false); err == nil {
 		t.Fatalf("outside path should be denied when allow_local_anywhere=false")
 	}
-	if err := ensureLocalPathAllowed(outside, true); err != nil {
+	if err := ensureLocalPathAllowed(outside, nil, true); err != nil {
 		t.Fatalf("outside path should be allowed when allow_local_anywhere=true: %v", err)
+	}
+}
+
+func TestEnsureLocalPathAllowed_Whitelist(t *testing.T) {
+	tmp := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir tmp: %v", err)
+	}
+
+	// Create an allowed directory outside cwd
+	allowed := t.TempDir()
+	allowedFile, err := security.ResolveLocalPath(filepath.Join(allowed, "data.txt"))
+	if err != nil {
+		t.Fatalf("resolve allowed: %v", err)
+	}
+	outside, err := security.ResolveLocalPath(filepath.Join(filepath.Dir(tmp), "secret.key"))
+	if err != nil {
+		t.Fatalf("resolve outside: %v", err)
+	}
+
+	allowedPaths := []string{allowed}
+
+	// Path in whitelist should pass without allow_local_anywhere
+	if err := ensureLocalPathAllowed(allowedFile, allowedPaths, false); err != nil {
+		t.Fatalf("whitelisted path should be allowed: %v", err)
+	}
+
+	// Path NOT in whitelist and NOT in cwd should be rejected
+	if err := ensureLocalPathAllowed(outside, allowedPaths, false); err == nil {
+		t.Fatalf("non-whitelisted outside path should be denied")
+	}
+
+	// Empty whitelist falls back to cwd-only
+	if err := ensureLocalPathAllowed(allowedFile, nil, false); err == nil {
+		t.Fatalf("should be denied with empty whitelist")
 	}
 }
 

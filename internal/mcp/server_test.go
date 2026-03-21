@@ -302,7 +302,7 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties missing")
 	}
-	for _, key := range []string{"profile_id", "profile_name", "limit_dir", "allow_public_host"} {
+	for _, key := range []string{"profile_id", "profile_name", "limit_dir"} {
 		if _, exists := props[key]; !exists {
 			t.Fatalf("properties should include %s", key)
 		}
@@ -390,9 +390,6 @@ func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 	if _, ok := props["key_passphrase"]; ok {
 		t.Fatalf("key_passphrase should not be exposed in profile setup schema")
 	}
-	if _, ok := props["allow_public_host"]; !ok {
-		t.Fatalf("allow_public_host should stay available in profile setup schema")
-	}
 	stepProp, ok := props["step"].(map[string]any)
 	if !ok {
 		t.Fatalf("step should be exposed in profile setup schema")
@@ -400,6 +397,25 @@ func TestProfileSetupSchemaDoesNotAcceptCredentialValues(t *testing.T) {
 	stepEnum := toAnySlice(stepProp["enum"])
 	if !containsString(stepEnum, "template") || !containsString(stepEnum, "save") {
 		t.Fatalf("step enum should include template/save: %#v", stepEnum)
+	}
+}
+
+func TestProfileSetupSchemaIncludesAllowedLocalPaths(t *testing.T) {
+	tool := findToolDef(t, "ssh_profile_setup")
+	schema, ok := tool["inputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("inputSchema missing")
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties missing")
+	}
+	alp, ok := props["allowed_local_paths"].(map[string]any)
+	if !ok {
+		t.Fatalf("allowed_local_paths should be in profile setup schema")
+	}
+	if alp["type"] != "array" {
+		t.Fatalf("allowed_local_paths should be array type, got %v", alp["type"])
 	}
 }
 

@@ -19,7 +19,7 @@ Auto-generated with sensible defaults on first run. Key fields:
 
 ```toml
 security_profile_default = "easy_safe"
-allow_public_host = true
+allow_public_host = true   # global-only switch; cannot be overridden per-profile
 sudo_enabled = true
 ```
 

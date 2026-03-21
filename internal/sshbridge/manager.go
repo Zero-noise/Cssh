@@ -16,6 +16,7 @@ import (
 
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
+	"cssh/internal/security"
 	"cssh/internal/util"
 )
 
@@ -516,13 +517,18 @@ func (m *Manager) OpenSession(connectionID, cwd, shell string) (*model.Session, 
 	if shell == "" {
 		shell = m.defaultShell
 	}
-	if _, err := m.GetConnection(connectionID); err != nil {
+	conn, err := m.GetConnection(connectionID)
+	if err != nil {
+		return nil, err
+	}
+	resolvedCWD, err := validateExecCWD(conn, "/", cwd)
+	if err != nil {
 		return nil, err
 	}
 	s := &model.Session{
 		ID:           util.NewID("sess"),
 		ConnectionID: connectionID,
-		CWD:          cwd,
+		CWD:          resolvedCWD,
 		Shell:        shell,
 		CreatedAt:    time.Now().UTC(),
 	}
@@ -639,8 +645,14 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 			return ExecResult{}, errorsx.New(errorsx.CodeInvalidParams, "session_id does not belong to connection_id")
 		}
 		shell = s.Shell
-		if cwd == "" {
-			cwd = s.CWD
+		cwd, err = validateExecCWD(conn, s.CWD, cwd)
+		if err != nil {
+			return ExecResult{}, err
+		}
+	} else {
+		cwd, err = validateExecCWD(conn, "/", cwd)
+		if err != nil {
+			return ExecResult{}, err
 		}
 	}
 	if timeoutSec <= 0 {
@@ -755,6 +767,20 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 		return res, errorsx.New(errorsx.CodeExecTimeout, "command execution finished but output pipes did not close before wait delay elapsed")
 	}
 	return res, errorsx.New(errorsx.CodeInternal, err.Error())
+}
+
+func validateExecCWD(conn *model.Connection, base, cwd string) (string, error) {
+	if strings.TrimSpace(base) == "" {
+		base = "/"
+	}
+	resolved := security.NormalizeRemotePath(strings.TrimSpace(cwd), base)
+	if strings.TrimSpace(cwd) == "" {
+		resolved = security.NormalizeRemotePath("", base)
+	}
+	if len(conn.WorkspaceRoots) > 0 && !security.IsWithinRoots(resolved, conn.WorkspaceRoots) {
+		return "", errorsx.New(errorsx.CodePathForbidden, "effective cwd outside workspace_roots: "+resolved)
+	}
+	return resolved, nil
 }
 
 func (w *execStreamWriter) Write(p []byte) (int, error) {

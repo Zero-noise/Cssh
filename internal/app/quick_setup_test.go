@@ -207,6 +207,23 @@ func TestQuickSetupSaveDefaultsWorkspaceRootForOpsStrict(t *testing.T) {
 	}
 }
 
+func TestQuickSetupRejectsUnknownSecurityProfile(t *testing.T) {
+	svc := newTestService(t)
+	_, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:         "test",
+		Host:            "10.0.0.1",
+		Username:        "ubuntu",
+		AuthMode:        "password",
+		SecurityProfile: "typo_safe",
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown security_profile")
+	}
+	if !strings.Contains(err.Error(), "unknown security_profile") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestCnoteSetAndResolveConnectionInput(t *testing.T) {
 	svc := newTestService(t)
 	out, err := svc.QuickSetupSave(QuickSetupInput{
@@ -393,5 +410,112 @@ func TestProfileDeleteRemovesProfileAndSecrets(t *testing.T) {
 	}
 	if _, err := os.Stat(cnotePath); !os.IsNotExist(err) {
 		t.Fatalf("cnote file should be deleted, got err=%v", err)
+	}
+}
+
+func TestQuickSetupSaveDefaultAllowedLocalPaths(t *testing.T) {
+	svc := newTestService(t)
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "test local paths",
+		Host:     "10.0.0.11",
+		Username: "ubuntu",
+	})
+	if err != nil {
+		t.Fatalf("quick save: %v", err)
+	}
+	paths, ok := out["allowed_local_paths"].([]string)
+	if !ok || len(paths) == 0 {
+		t.Fatalf("expected non-empty allowed_local_paths in response, got %v", out["allowed_local_paths"])
+	}
+	profileID, _ := out["profile_id"].(string)
+	p, err := svc.ProfileStore().Get(profileID)
+	if err != nil || p == nil {
+		t.Fatalf("get profile: %v", err)
+	}
+	if len(p.AllowedLocalPaths) == 0 {
+		t.Fatalf("profile should have default allowed_local_paths")
+	}
+}
+
+func TestQuickSetupSaveExplicitEmptyAllowedLocalPaths(t *testing.T) {
+	svc := newTestService(t)
+	empty := []string{}
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:           "no whitelist",
+		Host:              "10.0.0.13",
+		Username:          "ubuntu",
+		AllowedLocalPaths: &empty,
+	})
+	if err != nil {
+		t.Fatalf("quick save: %v", err)
+	}
+	profileID, _ := out["profile_id"].(string)
+	p, err := svc.ProfileStore().Get(profileID)
+	if err != nil || p == nil {
+		t.Fatalf("get profile: %v", err)
+	}
+	if len(p.AllowedLocalPaths) != 0 {
+		t.Fatalf("explicit empty should result in no allowed paths, got %v", p.AllowedLocalPaths)
+	}
+}
+
+func TestQuickSetupEditAllowedLocalPaths(t *testing.T) {
+	svc := newTestService(t)
+	// Create profile with defaults
+	_, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "edit test",
+		Host:     "10.0.0.12",
+		Username: "ubuntu",
+	})
+	if err != nil {
+		t.Fatalf("quick save: %v", err)
+	}
+	profileID := "edit-test-10-0-0-12"
+
+	// Verify defaults exist
+	p, _ := svc.ProfileStore().Get(profileID)
+	if len(p.AllowedLocalPaths) == 0 {
+		t.Fatalf("expected defaults after save")
+	}
+
+	// Edit with nil -> should NOT change
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:         profileID,
+		AllowedLocalPaths: nil,
+	})
+	if err != nil {
+		t.Fatalf("edit nil: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if len(p.AllowedLocalPaths) == 0 {
+		t.Fatalf("nil edit should preserve existing paths")
+	}
+
+	// Edit with empty slice -> should clear
+	empty := []string{}
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:         profileID,
+		AllowedLocalPaths: &empty,
+	})
+	if err != nil {
+		t.Fatalf("edit clear: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if len(p.AllowedLocalPaths) != 0 {
+		t.Fatalf("empty slice edit should clear paths, got %v", p.AllowedLocalPaths)
+	}
+
+	// Edit with new paths -> should set
+	newPaths := []string{t.TempDir()}
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:         profileID,
+		AllowedLocalPaths: &newPaths,
+	})
+	if err != nil {
+		t.Fatalf("edit set: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if len(p.AllowedLocalPaths) != 1 {
+		t.Fatalf("expected 1 path after edit, got %v", p.AllowedLocalPaths)
 	}
 }

@@ -233,7 +233,11 @@ func (s *Server) handleToolCall(ctx context.Context, req request, id any) respon
 	if reporter != nil {
 		onProgress = reporter.OnProgress
 	}
-	result, err := s.callToolWithContext(ctx, p.Name, p.Arguments, onProgress)
+	var emitFn func(string)
+	if reporter != nil {
+		emitFn = reporter.emit
+	}
+	result, err := s.callToolWithContext(ctx, p.Name, p.Arguments, onProgress, emitFn)
 	if ctx.Err() != nil {
 		if reporter != nil {
 			reporter.Discard()
@@ -316,20 +320,20 @@ func (s *Server) waitInflight(timeout time.Duration) {
 }
 
 // callToolWithContext is the context-aware entry point for tool calls.
-func (s *Server) callToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+func (s *Server) callToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn, notify func(string)) (map[string]any, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
 	if _, ok := canonicalToolNames[name]; !ok {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
-	return s.callCanonicalToolWithContext(ctx, name, args, onProgress)
+	return s.callCanonicalToolWithContext(ctx, name, args, onProgress, notify)
 }
 
 // callCanonicalToolWithContext dispatches to the appropriate service method.
 // For ssh_exec, ctx is propagated for cancellation support.
 // For other tools, ctx.Err() is checked at entry as a fast-fail.
-func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
+func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, args map[string]any, onProgress sshbridge.ExecProgressFn, notify func(string)) (map[string]any, error) {
 	// Fast-fail if already cancelled (covers all tools)
 	if ctx.Err() != nil {
 		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
@@ -399,6 +403,30 @@ func (s *Server) callCanonicalToolWithContext(ctx context.Context, name string, 
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "direction must be one of: upload, download")
 		}
+	case "ssh_credentials_prompt":
+		profileID, err := app.RequireString(args, "profile_id")
+		if err != nil {
+			return nil, err
+		}
+		in := app.CredentialPromptInput{
+			ProfileID: profileID,
+			Fields:    app.ParseStringSliceAny(args["fields"]),
+			Mode:      stringArg(args, "prompt_mode"),
+			Notify:    notify,
+		}
+		return s.svc.CredentialPrompt(in)
+	case "ssh_key_setup":
+		profileID, err := app.RequireString(args, "profile_id")
+		if err != nil {
+			return nil, err
+		}
+		in := app.KeySetupInput{
+			ProfileID: profileID,
+			ScanDir:   stringArg(args, "scan_dir"),
+			Mode:      stringArg(args, "prompt_mode"),
+			Notify:    notify,
+		}
+		return s.svc.KeySetup(in)
 	default:
 		return s.callCanonicalTool(name, args)
 	}
@@ -422,10 +450,6 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 			ProfileID:   stringArg(args, "profile_id"),
 			ProfileName: stringArg(args, "profile_name"),
 			LimitDir:    stringArg(args, "limit_dir"),
-		}
-		if v, ok := args["allow_public_host"]; ok {
-			b := app.ParseBoolAny(v, false)
-			in.AllowPublicHost = &b
 		}
 		return s.svc.Connect(in)
 	case "ssh_open_session":
@@ -557,20 +581,25 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 					editRoots = []string{single}
 				}
 			}
+			var editAllowedLocal *[]string
+			if v, ok := args["allowed_local_paths"]; ok {
+				parsed := app.ParseStringSliceAny(v)
+				editAllowedLocal = &parsed
+			}
 			in := app.QuickSetupEditInput{
-				ProfileID:       profileID,
-				ProfileName:     stringPtrArg(args, "profile_name"),
-				Host:            stringPtrArg(args, "host"),
-				Port:            intPtrArg(args, "port"),
-				Username:        stringPtrArg(args, "username"),
-				AuthMode:        stringPtrArg(args, "auth_mode"),
-				AuthPriority:    app.ParseStringSliceAny(args["auth_priority"]),
-				WorkspaceRoots:  editRoots,
-				KeyPath:         stringPtrArg(args, "key_path"),
-				AllowPublicHost: boolPtrArg(args, "allow_public_host"),
-				SecurityProfile: stringPtrArg(args, "security_profile"),
-				AllowRootUser:   boolPtrArg(args, "allow_root_user"),
-				GrantTTLSec:     intPtrArg(args, "grant_ttl_sec"),
+				ProfileID:         profileID,
+				ProfileName:       stringPtrArg(args, "profile_name"),
+				Host:              stringPtrArg(args, "host"),
+				Port:              intPtrArg(args, "port"),
+				Username:          stringPtrArg(args, "username"),
+				AuthMode:          stringPtrArg(args, "auth_mode"),
+				AuthPriority:      app.ParseStringSliceAny(args["auth_priority"]),
+				WorkspaceRoots:    editRoots,
+				AllowedLocalPaths: editAllowedLocal,
+				KeyPath:           stringPtrArg(args, "key_path"),
+				SecurityProfile:   stringPtrArg(args, "security_profile"),
+				AllowRootUser:     boolPtrArg(args, "allow_root_user"),
+				GrantTTLSec:       intPtrArg(args, "grant_ttl_sec"),
 			}
 			return s.svc.QuickSetupEdit(in)
 		case "save":
@@ -593,47 +622,30 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 					roots = []string{single}
 				}
 			}
+			var saveAllowedLocal *[]string
+			if v, ok := args["allowed_local_paths"]; ok {
+				parsed := app.ParseStringSliceAny(v)
+				saveAllowedLocal = &parsed
+			}
 			in := app.QuickSetupInput{
-				Purpose:         purpose,
-				ProfileID:       stringArg(args, "profile_id"),
-				ProfileName:     stringArg(args, "profile_name"),
-				Host:            host,
-				Port:            app.ParseIntAny(args["port"], 22),
-				Username:        username,
-				AuthMode:        stringArg(args, "auth_mode"),
-				WorkspaceRoots:  roots,
-				KeyPath:         stringArg(args, "key_path"),
-				AllowPublicHost: app.ParseBoolAny(args["allow_public_host"], true),
-				SecurityProfile: stringArg(args, "security_profile"),
-				AllowRootUser:   app.ParseBoolAny(args["allow_root_user"], false),
-				GrantTTLSec:     app.ParseIntAny(args["grant_ttl_sec"], 0),
+				Purpose:           purpose,
+				ProfileID:         stringArg(args, "profile_id"),
+				ProfileName:       stringArg(args, "profile_name"),
+				Host:              host,
+				Port:              app.ParseIntAny(args["port"], 22),
+				Username:          username,
+				AuthMode:          stringArg(args, "auth_mode"),
+				WorkspaceRoots:    roots,
+				AllowedLocalPaths: saveAllowedLocal,
+				KeyPath:           stringArg(args, "key_path"),
+				SecurityProfile:   stringArg(args, "security_profile"),
+				AllowRootUser:     app.ParseBoolAny(args["allow_root_user"], false),
+				GrantTTLSec:       app.ParseIntAny(args["grant_ttl_sec"], 0),
 			}
 			return s.svc.QuickSetupSave(in)
 		default:
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "step must be one of: template, save, edit")
 		}
-	case "ssh_credentials_prompt":
-		profileID, err := app.RequireString(args, "profile_id")
-		if err != nil {
-			return nil, err
-		}
-		in := app.CredentialPromptInput{
-			ProfileID: profileID,
-			Fields:    app.ParseStringSliceAny(args["fields"]),
-			Mode:      stringArg(args, "prompt_mode"),
-		}
-		return s.svc.CredentialPrompt(in)
-	case "ssh_key_setup":
-		profileID, err := app.RequireString(args, "profile_id")
-		if err != nil {
-			return nil, err
-		}
-		in := app.KeySetupInput{
-			ProfileID: profileID,
-			ScanDir:   stringArg(args, "scan_dir"),
-			Mode:      stringArg(args, "prompt_mode"),
-		}
-		return s.svc.KeySetup(in)
 	default:
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "unknown tool: "+name)
 	}
@@ -781,7 +793,7 @@ func writeMessage(w io.Writer, payload any) error {
 }
 
 func newProgressReporter(s *Server, toolName string, token any) *progressReporter {
-	if s == nil || (toolName != "ssh_exec" && toolName != "ssh_transfer") {
+	if s == nil || (toolName != "ssh_exec" && toolName != "ssh_transfer" && toolName != "ssh_credentials_prompt" && toolName != "ssh_key_setup") {
 		return nil
 	}
 	now := time.Now()
@@ -1091,7 +1103,7 @@ func toolDefs(ctlPath string) []map[string]any {
 		),
 		tool(
 			"ssh_transfer",
-			"Transfer files or directories using scp client with existing connection_id (remote_path is workspace_roots guarded). Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token. Set recursive=true for directory transfers. Set resume=true only for single-file overwrite transfers when both local and remote have rsync; otherwise retry without resume=true.",
+			"Transfer files or directories using scp client with existing connection_id (remote_path is workspace_roots guarded). Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token. Set recursive=true for directory transfers. Set resume=true only for single-file overwrite transfers when both local and remote have rsync; otherwise retry without resume=true. Local path access: paths within cwd and the profile's allowed_local_paths (e.g. /tmp) are auto-allowed; paths outside both require allow_local_anywhere=true which triggers L2 approval showing the exact local and remote paths.",
 			transferSchema(),
 			destructiveAnnotations("Transfer File via SCP", true),
 		),
@@ -1181,7 +1193,7 @@ func credentialPromptSchema() map[string]any {
 
 func connectSchema() map[string]any {
 	props := map[string]any{}
-	for _, key := range []string{"profile_id", "profile_name", "limit_dir", "allow_public_host"} {
+	for _, key := range []string{"profile_id", "profile_name", "limit_dir"} {
 		props[key] = paramSchema(key)
 	}
 	return map[string]any{
@@ -1280,7 +1292,7 @@ func cnoteSchema() map[string]any {
 }
 
 func profileSetupSchema() map[string]any {
-	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "auth_priority", "workspace_roots", "workspace_root", "key_path", "allow_public_host", "security_profile", "allow_root_user", "grant_ttl_sec")
+	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "auth_priority", "workspace_roots", "workspace_root", "allowed_local_paths", "key_path", "security_profile", "allow_root_user", "grant_ttl_sec")
 }
 
 func keySetupSchema() map[string]any {
@@ -1311,12 +1323,12 @@ func paramSchema(key string) map[string]any {
 		return map[string]any{"type": "string", "enum": []string{"hybrid", "key", "password"}, "description": "Authentication strategy: key, password, or hybrid fallback."}
 	case "workspace_roots":
 		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Allowed remote root paths for read/write operations."}
+	case "allowed_local_paths":
+		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Local directories allowed for ssh_transfer without approval. Paths within these dirs and cwd are auto-allowed; paths outside require allow_local_anywhere + L2 approval. Defaults to system temp dirs (/tmp). Pass empty array to clear."}
 	case "limit_dir":
 		return map[string]any{"type": "string", "description": "Optional runtime restriction directory. When set, effective workspace_roots become this directory only (must be within configured roots)."}
 	case "workspace_root":
 		return map[string]any{"type": "string", "description": "Single workspace root (shortcut if not using workspace_roots array)."}
-	case "allow_public_host":
-		return map[string]any{"type": "boolean", "description": "Allow public internet host. Effective default comes from profile/global policy."}
 	case "security_profile":
 		return map[string]any{"type": "string", "enum": []string{"easy_safe", "ops_strict"}, "description": "Security profile for privilege approval behavior."}
 	case "allow_root_user":
@@ -1354,7 +1366,7 @@ func paramSchema(key string) map[string]any {
 	case "command":
 		return map[string]any{"type": "string", "description": "Shell command to execute on remote host."}
 	case "cwd":
-		return map[string]any{"type": "string", "description": "Working directory for command execution in this tool call. Does not grant access beyond workspace_roots."}
+		return map[string]any{"type": "string", "description": "Working directory for command execution. Validated against workspace_roots for write commands."}
 	case "shell":
 		return map[string]any{"type": "string", "description": "Shell wrapper, e.g. 'bash -lc'."}
 	case "timeout_sec":
@@ -1378,7 +1390,7 @@ func paramSchema(key string) map[string]any {
 	case "verify_checksum":
 		return map[string]any{"type": "boolean", "description": "For single files, verify SHA-256 between local and remote after transfer. For directories, verify file-count consistency and return verification_type/result. Default true."}
 	case "allow_local_anywhere":
-		return map[string]any{"type": "boolean", "description": "Allow local path outside current working directory. Default false."}
+		return map[string]any{"type": "boolean", "description": "Allow local path outside cwd and the profile's allowed_local_paths. Triggers L2 approval showing the exact local/remote paths. Default false."}
 	case "recursive":
 		return map[string]any{"type": "boolean", "description": "Transfer entire directory recursively via scp -r. remote_path is the target directory itself (not its parent). Only mode=create is supported for directories (fails if target exists). overwrite is not supported for directories."}
 	case "resume":

@@ -60,6 +60,57 @@ func TestAllowLocalAnywhereBehavior(t *testing.T) {
 	}
 }
 
+func TestNormalizeAllowedLocalPaths(t *testing.T) {
+	tmp := t.TempDir()
+	sub := filepath.Join(tmp, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Duplicates should be deduped
+	paths, err := NormalizeAllowedLocalPaths([]string{tmp, tmp})
+	if err != nil {
+		t.Fatalf("normalize dedup: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 deduped path, got %d: %v", len(paths), paths)
+	}
+
+	// Traversal variants should canonicalize to same path
+	variant := filepath.Join(tmp, "sub", "..")
+	paths, err = NormalizeAllowedLocalPaths([]string{tmp, variant})
+	if err != nil {
+		t.Fatalf("normalize traversal: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("expected 1 path after traversal dedup, got %d: %v", len(paths), paths)
+	}
+
+	// Empty string should error
+	_, err = NormalizeAllowedLocalPaths([]string{""})
+	if err == nil {
+		t.Fatalf("empty path should cause error")
+	}
+
+	// Multiple valid distinct paths
+	paths, err = NormalizeAllowedLocalPaths([]string{tmp, sub})
+	if err != nil {
+		t.Fatalf("normalize distinct: %v", err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("expected 2 distinct paths, got %d", len(paths))
+	}
+
+	// Empty slice is valid
+	paths, err = NormalizeAllowedLocalPaths([]string{})
+	if err != nil {
+		t.Fatalf("empty slice should succeed: %v", err)
+	}
+	if len(paths) != 0 {
+		t.Fatalf("expected 0 paths, got %d", len(paths))
+	}
+}
+
 func TestValidateLocalDirSymlinks_Safe(t *testing.T) {
 	tmp := t.TempDir()
 	sub := filepath.Join(tmp, "sub")

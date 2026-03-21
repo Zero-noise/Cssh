@@ -57,8 +57,8 @@ func main() {
 
 func usage() {
 	fmt.Print(`csshctl commands:
-  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false] [--max-auto-risk L2] [--allow-reboot=false] [--allow-disk-ops=false] [--deny-patterns pat1,pat2]
-  profile edit --id ID [--name NAME] [--host HOST] [--user USER] [--port 22] [--key-path PATH] [--auth-priority key,password] [--workspace-roots /a,/b] [--allow-public=false] [--security-profile easy_safe] [--allow-root-user=false] [--grant-ttl-sec 0]
+  profile add --id ID --name NAME --host HOST --user USER [--port 22] [--workspace-roots /a,/b] [--auth-priority key,password] [--key-path PATH] [--security-profile easy_safe] [--allow-root-user=false] [--max-auto-risk L2] [--allow-reboot=false] [--allow-disk-ops=false] [--deny-patterns pat1,pat2]
+  profile edit --id ID [--name NAME] [--host HOST] [--user USER] [--port 22] [--key-path PATH] [--auth-priority key,password] [--workspace-roots /a,/b] [--security-profile easy_safe] [--allow-root-user=false] [--grant-ttl-sec 0]
   profile list
   profile show --id ID
   profile remove --id ID
@@ -97,7 +97,6 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		workspaceRoots := fs.String("workspace-roots", "/", "comma separated roots")
 		authPriority := fs.String("auth-priority", "key,password", "auth priority")
 		keyPath := fs.String("key-path", "~/.ssh/id_rsa", "ssh private key path")
-		allowPublic := fs.Bool("allow-public", false, "allow public host")
 		securityProfile := fs.String("security-profile", cfg.SecurityProfileDefault, "security profile (easy_safe|ops_strict)")
 		allowRootUser := fs.Bool("allow-root-user", false, "allow root username in this profile")
 		maxAutoRisk := fs.String("max-auto-risk", "", "max risk level to auto-execute (L1 or L2)")
@@ -107,6 +106,10 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		_ = fs.Parse(args[1:])
 		if *id == "" || *host == "" || *user == "" {
 			fatal(fmt.Errorf("id, host, user are required"))
+		}
+		sp, err := config.NormalizeSecurityProfile(*securityProfile)
+		if err != nil {
+			fatal(err)
 		}
 		roots := splitCSV(*workspaceRoots)
 		if len(roots) == 0 {
@@ -121,8 +124,7 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 			AuthPriority:      splitCSV(*authPriority),
 			KeyPath:           config.ExpandHome(*keyPath),
 			WorkspaceRoots:    roots,
-			AllowPublicHost:   *allowPublic,
-			SecurityProfile:   normalizeSecurityProfile(*securityProfile, cfg.SecurityProfileDefault),
+			SecurityProfile:   sp,
 			AllowRootUser:     *allowRootUser,
 			MaxAutoRisk:       strings.TrimSpace(*maxAutoRisk),
 			AllowReboot:       *allowReboot,
@@ -169,10 +171,13 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		keyPath := fs.String("key-path", "", "ssh private key path")
 		authPriority := fs.String("auth-priority", "", "auth priority (comma separated)")
 		workspaceRoots := fs.String("workspace-roots", "", "comma separated roots")
-		allowPublic := fs.String("allow-public", "", "allow public host (true/false)")
 		securityProfile := fs.String("security-profile", "", "security profile")
 		allowRootUser := fs.String("allow-root-user", "", "allow root user (true/false)")
 		grantTTLSec := fs.Int("grant-ttl-sec", -1, "grant TTL in seconds")
+		maxAutoRisk := fs.String("max-auto-risk", "", "max risk level to auto-execute (L1 or L2)")
+		allowReboot := fs.String("allow-reboot", "", "allow shutdown/reboot commands (true/false)")
+		allowDiskOps := fs.String("allow-disk-ops", "", "allow disk operations (true/false)")
+		denyPatternsStr := fs.String("deny-patterns", "", "comma separated regex patterns to deny")
 		_ = fs.Parse(args[1:])
 		if *id == "" {
 			fatal(fmt.Errorf("--id is required"))
@@ -205,17 +210,30 @@ func handleProfile(svc *app.Service, cfg model.Config, args []string) {
 		if *workspaceRoots != "" {
 			p.WorkspaceRoots = splitCSV(*workspaceRoots)
 		}
-		if *allowPublic != "" {
-			p.AllowPublicHost = strings.EqualFold(*allowPublic, "true")
-		}
 		if *securityProfile != "" {
-			p.SecurityProfile = normalizeSecurityProfile(*securityProfile, cfg.SecurityProfileDefault)
+			sp, err := config.NormalizeSecurityProfile(*securityProfile)
+			if err != nil {
+				fatal(err)
+			}
+			p.SecurityProfile = sp
 		}
 		if *allowRootUser != "" {
 			p.AllowRootUser = strings.EqualFold(*allowRootUser, "true")
 		}
 		if *grantTTLSec >= 0 {
 			p.GrantTTLSec = *grantTTLSec
+		}
+		if *maxAutoRisk != "" {
+			p.MaxAutoRisk = strings.TrimSpace(*maxAutoRisk)
+		}
+		if *allowReboot != "" {
+			p.AllowReboot = strings.EqualFold(*allowReboot, "true")
+		}
+		if *allowDiskOps != "" {
+			p.AllowDiskOps = strings.EqualFold(*allowDiskOps, "true")
+		}
+		if *denyPatternsStr != "" {
+			p.DenyPatterns = splitCSV(*denyPatternsStr)
 		}
 		applySecurityProfileDefaults(p)
 		if err := store.Upsert(*p); err != nil {
@@ -452,7 +470,11 @@ func handleMigrate(svc *app.Service, cfg model.Config, args []string) {
 	for _, p := range items {
 		changed := false
 		if strings.TrimSpace(p.SecurityProfile) == "" {
-			p.SecurityProfile = normalizeSecurityProfile("", cfg.SecurityProfileDefault)
+			sp, err := config.NormalizeSecurityProfile(cfg.SecurityProfileDefault)
+			if err != nil {
+				fatal(err)
+			}
+			p.SecurityProfile = sp
 			changed = true
 		}
 		if p.ToolPolicyVersion == 0 {
@@ -470,9 +492,6 @@ func handleMigrate(svc *app.Service, cfg model.Config, args []string) {
 		}
 		if p.AllowRootUser {
 			warnings = append(warnings, map[string]any{"profile_id": p.ID, "warning": "allow_root_user=true"})
-		}
-		if p.AllowPublicHost {
-			warnings = append(warnings, map[string]any{"profile_id": p.ID, "warning": "allow_public_host=true"})
 		}
 	}
 	printJSON(map[string]any{
@@ -492,20 +511,6 @@ func applySecurityProfileDefaults(p *model.Profile) {
 	}
 }
 
-func normalizeSecurityProfile(v, fallback string) string {
-	mode := strings.ToLower(strings.TrimSpace(v))
-	if mode == "" {
-		mode = strings.ToLower(strings.TrimSpace(fallback))
-	}
-	switch mode {
-	case "", "easy_safe":
-		return "easy_safe"
-	case "ops_strict":
-		return "ops_strict"
-	default:
-		return mode
-	}
-}
 
 func hasRootPath(roots []string) bool {
 	for _, r := range roots {

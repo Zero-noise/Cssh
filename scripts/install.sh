@@ -7,7 +7,85 @@ MARKER="# cssh-path-inject"
 
 info()  { printf '\033[1;34m[cssh]\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m[cssh]\033[0m %s\n' "$*"; }
-error() { printf '\033[1;31m[cssh]\033[0m %s\n' "$*" >&2; exit 1; }
+error() { printf '\033[1;31m[cssh]\033[0m %b\n' "$*" >&2; exit 1; }
+
+set_cleanup_trap() {
+  local target="$1"
+  local cleanup_cmd
+  printf -v cleanup_cmd 'rm -rf -- %q' "$target"
+  trap "$cleanup_cmd" EXIT
+}
+
+clear_cleanup_trap() {
+  trap - EXIT
+}
+
+cleanup_path() {
+  local target="$1"
+  rm -rf -- "$target"
+  clear_cleanup_trap
+}
+
+release_error() {
+  error "$1\nManual fallback:\n  Download the matching archive from https://github.com/$REPO/releases/latest\n  or clone the repo and run ./scripts/install.sh from the checkout."
+}
+
+first_existing_file() {
+  local candidate
+  for candidate in "$@"; do
+    if [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_rc_file() {
+  local rc_file
+  case "${SHELL:-}" in
+    */zsh)
+      printf '%s\n' "$HOME/.zshrc"
+      ;;
+    */bash)
+      if [ "$(uname -s)" = "Darwin" ]; then
+        # macOS: terminals open login shells → prioritize login rc files
+        if rc_file="$(first_existing_file \
+          "$HOME/.bash_profile" \
+          "$HOME/.bash_login" \
+          "$HOME/.profile" \
+          "$HOME/.bashrc")"; then
+          printf '%s\n' "$rc_file"
+        else
+          printf '%s\n' "$HOME/.bash_profile"
+        fi
+      else
+        # Linux: terminals open non-login shells → prioritize .bashrc
+        if rc_file="$(first_existing_file \
+          "$HOME/.bashrc" \
+          "$HOME/.bash_profile" \
+          "$HOME/.bash_login" \
+          "$HOME/.profile")"; then
+          printf '%s\n' "$rc_file"
+        else
+          printf '%s\n' "$HOME/.bashrc"
+        fi
+      fi
+      ;;
+    *)
+      if rc_file="$(first_existing_file \
+        "$HOME/.zshrc" \
+        "$HOME/.bash_profile" \
+        "$HOME/.bash_login" \
+        "$HOME/.profile" \
+        "$HOME/.bashrc")"; then
+        printf '%s\n' "$rc_file"
+      else
+        printf '%s\n' "$HOME/.profile"
+      fi
+      ;;
+  esac
+}
 
 detect_mode() {
   if [ -f go.mod ] && grep -q '^module cssh$' go.mod 2>/dev/null; then
@@ -63,71 +141,54 @@ install_from_release() {
   local archive="cssh-${OS}-${ARCH}.tar.gz"
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  set_cleanup_trap "$tmp"
 
   info "Downloading cssh for ${OS}/${ARCH}..."
   if command -v curl &>/dev/null; then
-    curl -fsSL "$base_url/$archive" -o "$tmp/$archive"
-    curl -fsSL "$base_url/checksums.txt" -o "$tmp/checksums.txt"
+    if ! curl -fsSL "$base_url/$archive" -o "$tmp/$archive"; then
+      release_error "Failed to download $archive from GitHub Releases"
+    fi
+    if ! curl -fsSL "$base_url/checksums.txt" -o "$tmp/checksums.txt"; then
+      release_error "Failed to download checksums.txt from GitHub Releases"
+    fi
   elif command -v wget &>/dev/null; then
-    wget -qO "$tmp/$archive" "$base_url/$archive"
-    wget -qO "$tmp/checksums.txt" "$base_url/checksums.txt"
+    if ! wget -qO "$tmp/$archive" "$base_url/$archive"; then
+      release_error "Failed to download $archive from GitHub Releases"
+    fi
+    if ! wget -qO "$tmp/checksums.txt" "$base_url/checksums.txt"; then
+      release_error "Failed to download checksums.txt from GitHub Releases"
+    fi
   else
-    error "curl or wget is required"
+    release_error "curl or wget is required to download release binaries"
   fi
 
   info "Verifying checksum..."
   local expected
-  expected="$(grep "$archive" "$tmp/checksums.txt" | awk '{print $1}')"
+  expected="$(awk -v name="$archive" '$2 == name { print $1 }' "$tmp/checksums.txt")"
   if [ -z "$expected" ]; then
-    error "No checksum found for $archive in checksums.txt"
+    release_error "No checksum found for $archive in checksums.txt"
   fi
   sha256_verify "$tmp/$archive" "$expected"
   info "Checksum OK"
 
   mkdir -p "$INSTALL_DIR"
-  tar xzf "$tmp/$archive" -C "$tmp"
+  if ! tar xzf "$tmp/$archive" -C "$tmp"; then
+    release_error "Failed to extract $archive"
+  fi
   cp "$tmp"/cssh-mcp-* "$INSTALL_DIR/cssh-mcp"
   cp "$tmp"/csshctl-* "$INSTALL_DIR/csshctl"
   chmod +x "$INSTALL_DIR/cssh-mcp" "$INSTALL_DIR/csshctl"
+  cleanup_path "$tmp"
   info "Installed binaries to $INSTALL_DIR"
 }
 
 install_user_mode() {
-  if command -v go &>/dev/null; then
-    info "Go detected — cloning and building from source..."
-    local tmp
-    tmp="$(mktemp -d)"
-    trap 'rm -rf "$tmp"' EXIT
-    git clone --depth 1 "https://github.com/$REPO.git" "$tmp/cssh"
-    mkdir -p "$INSTALL_DIR"
-    (cd "$tmp/cssh" && go build -o "$INSTALL_DIR/cssh-mcp" ./cmd/cssh-mcp)
-    (cd "$tmp/cssh" && go build -o "$INSTALL_DIR/csshctl" ./cmd/csshctl)
-    info "Built binaries in $INSTALL_DIR"
-  else
-    install_from_release
-  fi
+  install_from_release
 }
 
 inject_path() {
-  local rc_file=""
-  case "${SHELL:-}" in
-    */zsh)  rc_file="$HOME/.zshrc" ;;
-    */bash) rc_file="$HOME/.bashrc" ;;
-    *)
-      if [ -f "$HOME/.zshrc" ]; then
-        rc_file="$HOME/.zshrc"
-      elif [ -f "$HOME/.bashrc" ]; then
-        rc_file="$HOME/.bashrc"
-      fi
-      ;;
-  esac
-
-  if [ -z "$rc_file" ]; then
-    warn "Could not detect shell RC file. Add this to your shell profile manually:"
-    warn "  export PATH=\"$INSTALL_DIR:\$PATH\" $MARKER"
-    return
-  fi
+  local rc_file
+  rc_file="$(detect_rc_file)"
 
   if grep -qF "$MARKER" "$rc_file" 2>/dev/null; then
     info "PATH already configured in $rc_file"
@@ -188,15 +249,33 @@ inject_permissions() {
     warn "$SETTINGS_FILE is not valid JSON — skipping permission injection"
     return
   fi
+  if ! jq -e '
+    if .permissions? == null then true
+    elif (.permissions | type) != "object" then false
+    elif .permissions.allow? == null then true
+    else (.permissions.allow | type) == "array"
+    end
+  ' "$SETTINGS_FILE" >/dev/null; then
+    warn "$SETTINGS_FILE has unexpected permissions.allow format — skipping permission injection"
+    return
+  fi
   local tools_json
   tools_json=$(printf '%s\n' "${CSSH_TOOLS[@]}" | jq -R . | jq -s .)
-  local tmp; tmp="$(mktemp)"
-  jq --argjson t "$tools_json" '
+  local tmp
+  tmp="$(mktemp)"
+  set_cleanup_trap "$tmp"
+  if jq --argjson t "$tools_json" '
     .permissions //= {} |
     .permissions.allow //= [] |
     .permissions.allow = (.permissions.allow + ($t - .permissions.allow))
-  ' "$SETTINGS_FILE" > "$tmp" && mv "$tmp" "$SETTINGS_FILE"
-  info "Auto-approved ${#CSSH_TOOLS[@]} cssh tools in Claude Code settings"
+  ' "$SETTINGS_FILE" > "$tmp"; then
+    mv "$tmp" "$SETTINGS_FILE"
+    clear_cleanup_trap
+    info "Auto-approved ${#CSSH_TOOLS[@]} cssh tools in Claude Code settings"
+  else
+    cleanup_path "$tmp"
+    warn "Failed to update $SETTINGS_FILE — skipping permission injection"
+  fi
 }
 
 verify() {
@@ -216,7 +295,7 @@ main() {
     info "Developer mode (building from local source)"
     build_local
   else
-    info "User mode"
+    info "User mode (installing latest release binary)"
     install_user_mode
   fi
 

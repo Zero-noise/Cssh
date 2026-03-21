@@ -33,14 +33,15 @@ import (
 )
 
 type Service struct {
-	cfg       model.Config
-	profiles  *store.ProfileStore
-	cnotes    *store.ProfileNoteStore
-	secrets   store.SecretStore
-	approvals *approvals.Store
-	grants    *approvals.GrantStore
-	audit     *audit.Logger
-	ssh       *sshbridge.Manager
+	cfg            model.Config
+	profiles       *store.ProfileStore
+	cnotes         *store.ProfileNoteStore
+	secrets        store.SecretStore
+	approvals      *approvals.Store
+	grants         *approvals.GrantStore
+	audit          *audit.Logger
+	ssh            *sshbridge.Manager
+	preflightCheck func(connectionID string) error
 
 	deleteMu     sync.Mutex
 	deleteTokens map[string]profileDeleteConfirm
@@ -65,6 +66,7 @@ func NewService(cfg model.Config) *Service {
 		ssh:          sshbridge.NewManager(cfg.RuntimeDir, cfg.DefaultShell, cfg.DefaultTimeoutSec),
 		deleteTokens: map[string]profileDeleteConfirm{},
 	}
+	svc.preflightCheck = svc.ssh.PreFlightCheck
 	svc.ssh.SetOnReconnect(func(connectionID, reason string) {
 		_ = svc.grants.RevokeByConnection(connectionID)
 		_ = svc.audit.Write(model.AuditEvent{
@@ -164,8 +166,8 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !connModel.AllowPublicHost && !security.IsPrivateOrLoopbackHost(connModel.Host) {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "public host denied by policy; use VPN/Tailscale address or enable allow_public_host")
+	if !s.cfg.AllowPublicHost && !security.IsPrivateOrLoopbackHost(connModel.Host) {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, "public host denied by global policy; set allow_public_host=true in config or use VPN/Tailscale address")
 	}
 
 	conn, err := s.ssh.Connect(connModel)
@@ -201,15 +203,31 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 	if strings.TrimSpace(conn.LimitDir) != "" {
 		resp["limit_dir"] = conn.LimitDir
 	}
-	if conn.AllowPublicHost && !security.IsPrivateOrLoopbackHost(conn.Host) {
-		resp["warnings"] = []string{"connected to a public host because allow_public_host=true; verify profile and remote host trust"}
+	if s.cfg.AllowPublicHost && !security.IsPrivateOrLoopbackHost(conn.Host) {
+		resp["warnings"] = []string{"connected to a public host because global allow_public_host=true; verify remote host trust"}
 	}
 	return resp, nil
 }
 
 func (s *Service) OpenSession(connectionID, cwd, shell string) (map[string]any, error) {
 	traceID := util.NewID("trace")
-	session, err := s.ssh.OpenSession(connectionID, cwd, shell)
+	conn, err := s.ssh.GetConnection(connectionID)
+	if err != nil {
+		return nil, err
+	}
+	resolvedCWD, err := s.resolveSessionCWD(conn, cwd)
+	if err != nil {
+		_ = s.audit.Write(model.AuditEvent{
+			Timestamp:    time.Now().UTC(),
+			TraceID:      traceID,
+			Type:         "ssh_open_session",
+			ConnectionID: connectionID,
+			Status:       "denied_cwd",
+		})
+		return nil, err
+	}
+
+	session, err := s.ssh.OpenSession(connectionID, resolvedCWD, shell)
 	if err != nil {
 		return nil, err
 	}
@@ -237,12 +255,17 @@ func (s *Service) ExecWithProgress(ctx context.Context, connectionID, sessionID,
 		return nil, errorsx.New(errorsx.CodeCancelled, "request cancelled")
 	}
 	traceID := util.NewID("trace")
-	auditCommand := sanitizeCommandForAudit(command)
 	conn, err := s.ssh.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
 	}
-	policy := security.EvaluateExecPolicyWithProfile(command, conn.MaxAutoRisk, conn.AllowReboot, conn.AllowDiskOps, conn.DenyPatterns, conn.WorkspaceRoots, conn.SecurityProfile)
+	effectiveCwd, err := s.resolveEffectiveExecCWD(conn, sessionID, cwd)
+	if err != nil {
+		return nil, err
+	}
+	policy := security.EvaluateExecPolicyWithContext(command, effectiveCwd, conn.MaxAutoRisk, conn.AllowReboot, conn.AllowDiskOps, conn.DenyPatterns, conn.WorkspaceRoots, conn.SecurityProfile)
+	evalCmd := "cd " + util.ShellQuote(effectiveCwd) + " && " + command
+	auditCommand := sanitizeCommandForAudit(evalCmd)
 	authz := privilegeAuthz{}
 
 	// DenyAlways: hard deny, no override possible
@@ -268,12 +291,15 @@ func (s *Service) ExecWithProgress(ctx context.Context, connectionID, sessionID,
 	}
 
 	// DenyNeedApprove: requires out-of-band human approval via csshctl approve
-	if policy.DenyClass == model.DenyNeedApprove {
-		authz, err = s.authorizePrivilege(connectionID, sessionID, policy.Capability, command, policy.Template, policy.TemplateHash, policy.RiskLevel, policy.Reason, approvalToken, conn.Host, conn.Username, policy.Reusable, conn.GrantTTLSec)
+	runCommand := command
+	runInput := ""
+	if policy.DenyClass == model.DenyNeedApprove || (policy.Capability == "sudo_exec" && s.cfg.SudoEnabled) {
+		var statusResp map[string]any
+		authz, runCommand, runInput, statusResp, err = s.authorizeExecStart(connectionID, sessionID, conn, policy, command, evalCmd, approvalToken)
 		if err != nil {
 			return nil, err
 		}
-		if !authz.Allowed {
+		if !authz.Allowed && policy.DenyClass == model.DenyNeedApprove {
 			_ = s.audit.Write(model.AuditEvent{
 				Timestamp:       time.Now().UTC(),
 				TraceID:         traceID,
@@ -290,22 +316,12 @@ func (s *Service) ExecWithProgress(ctx context.Context, connectionID, sessionID,
 			})
 			return authz.StatusResp, nil
 		}
-	}
-
-	runCommand := command
-	runInput := ""
-	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled {
-		var statusResp map[string]any
-		runCommand, runInput, statusResp, err = s.prepareSudoCommand(*conn, command)
-		if err != nil {
-			return nil, err
-		}
 		if statusResp != nil {
 			return statusResp, nil
 		}
 	}
 
-	res, err := s.ssh.ExecWithProgressCtx(ctx, connectionID, sessionID, runCommand, cwd, timeoutSec, runInput, onProgress)
+	res, err := s.ssh.ExecWithProgressCtx(ctx, connectionID, sessionID, runCommand, effectiveCwd, timeoutSec, runInput, onProgress)
 	if err != nil {
 		return nil, err
 	}
@@ -538,50 +554,12 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	if err != nil {
 		return nil, err
 	}
-	authz := privilegeAuthz{}
-	if allowLocalAnywhere {
-		template := "ssh_transfer direction=upload allow_local_anywhere"
-		authz, err = s.authorizePrivilege(
-			connectionID,
-			"",
-			"local_anywhere_transfer",
-			template,
-			template,
-			security.HashCommandTemplate(template),
-			model.RiskL2,
-			"allow_local_anywhere requires explicit approval",
-			approvalToken,
-			conn.Host,
-			conn.Username,
-			false, // not reusable: explicit privilege escalation
-			conn.GrantTTLSec,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if !authz.Allowed {
-			_ = s.audit.Write(model.AuditEvent{
-				Timestamp:       time.Now().UTC(),
-				TraceID:         traceID,
-				Type:            "ssh_transfer",
-				ConnectionID:    connectionID,
-				Host:            conn.Host,
-				RiskLevel:       string(model.RiskL2),
-				Status:          "approval_required",
-				SecurityProfile: conn.SecurityProfile,
-				Capability:      "local_anywhere_transfer",
-				CommandHash:     security.HashCommandTemplate(template),
-				ConfirmMode:     authz.ConfirmMode,
-			})
-			return authz.StatusResp, nil
-		}
-	}
 
 	localAbs, err := security.ResolveLocalPath(localPath)
 	if err != nil {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path is invalid")
 	}
-	if err := ensureLocalPathAllowed(localAbs, allowLocalAnywhere); err != nil {
+	if err := ensureLocalPathAllowed(localAbs, conn.AllowedLocalPaths, allowLocalAnywhere); err != nil {
 		return nil, err
 	}
 	info, err := os.Stat(localAbs)
@@ -595,6 +573,10 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	}
 	if !isDir && !info.Mode().IsRegular() {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path must be a regular file or directory")
+	}
+	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
+	if remoteResolved == "" {
+		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
 	}
 	// recursive=true on a regular file: silently ignore, transfer as single file
 	if !isDir {
@@ -622,13 +604,14 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		if err := security.ValidateLocalDirSymlinks(localAbs); err != nil {
 			return nil, errorsx.New(errorsx.CodeInvalidParams, "directory contains unsafe symlinks: "+err.Error())
 		}
-		return s.uploadDirectory(traceID, connectionID, conn, localAbs, remotePath, cwd, timeoutSec, createParents, verifyChecksum, fileCount, totalBytes, onProgress)
-	}
-
-	// --- single file upload ---
-	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
-	if remoteResolved == "" {
-		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
+		approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "upload", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+		if err != nil {
+			return nil, err
+		}
+		if approvalResp != nil {
+			return approvalResp, nil
+		}
+		return s.uploadDirectory(traceID, connectionID, conn, localAbs, remoteResolved, timeoutSec, createParents, verifyChecksum, fileCount, totalBytes, onProgress)
 	}
 
 	// Resume path: use rsync if available
@@ -636,7 +619,22 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 		if err := s.ensureResumeAvailable(connectionID); err != nil {
 			return nil, err
 		}
+		approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "upload", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+		if err != nil {
+			return nil, err
+		}
+		if approvalResp != nil {
+			return approvalResp, nil
+		}
 		return s.uploadFileWithResume(traceID, connectionID, conn, localAbs, remoteResolved, timeoutSec, createParents, verifyChecksum, onProgress)
+	}
+
+	approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "upload", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+	if err != nil {
+		return nil, err
+	}
+	if approvalResp != nil {
+		return approvalResp, nil
 	}
 
 	if createParents {
@@ -704,12 +702,7 @@ func (s *Service) UploadFile(connectionID, localPath, remotePath, mode, cwd stri
 	return resp, nil
 }
 
-func (s *Service) uploadDirectory(traceID, connectionID string, conn *model.Connection, localAbs, remotePath, cwd string, timeoutSec int, createParents, verifyChecksum bool, fileCount int, totalBytes int64, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
-	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
-	if remoteResolved == "" {
-		return nil, errorsx.New(errorsx.CodePathForbidden, "remote_path is outside workspace_roots")
-	}
-
+func (s *Service) uploadDirectory(traceID, connectionID string, conn *model.Connection, localAbs, remoteResolved string, timeoutSec int, createParents, verifyChecksum bool, fileCount int, totalBytes int64, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	// Ensure target doesn't exist + create parent
 	if err := s.remoteEnsureNewDir(connectionID, remoteResolved, createParents); err != nil {
 		return nil, err
@@ -829,44 +822,6 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	if err != nil {
 		return nil, err
 	}
-	authz := privilegeAuthz{}
-	if allowLocalAnywhere {
-		template := "ssh_transfer direction=download allow_local_anywhere"
-		authz, err = s.authorizePrivilege(
-			connectionID,
-			"",
-			"local_anywhere_transfer",
-			template,
-			template,
-			security.HashCommandTemplate(template),
-			model.RiskL2,
-			"allow_local_anywhere requires explicit approval",
-			approvalToken,
-			conn.Host,
-			conn.Username,
-			false, // not reusable: explicit privilege escalation
-			conn.GrantTTLSec,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if !authz.Allowed {
-			_ = s.audit.Write(model.AuditEvent{
-				Timestamp:       time.Now().UTC(),
-				TraceID:         traceID,
-				Type:            "ssh_transfer",
-				ConnectionID:    connectionID,
-				Host:            conn.Host,
-				RiskLevel:       string(model.RiskL2),
-				Status:          "approval_required",
-				SecurityProfile: conn.SecurityProfile,
-				Capability:      "local_anywhere_transfer",
-				CommandHash:     security.HashCommandTemplate(template),
-				ConfirmMode:     authz.ConfirmMode,
-			})
-			return authz.StatusResp, nil
-		}
-	}
 
 	remoteResolved := s.resolveAndCheckPath(conn, remotePath, cwd)
 	if remoteResolved == "" {
@@ -891,7 +846,33 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 			return nil, errorsx.New(errorsx.CodeInvalidParams,
 				"resume is not supported for directory transfers")
 		}
-		return s.downloadDirectory(traceID, connectionID, conn, remoteResolved, localPath, timeoutSec, createParents, verifyChecksum, allowLocalAnywhere, onProgress)
+		localAbs, err := security.ResolveLocalPath(localPath)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path is invalid")
+		}
+		if err := ensureLocalPathAllowed(localAbs, conn.AllowedLocalPaths, allowLocalAnywhere); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(localAbs); err == nil {
+			return nil, errorsx.New(errorsx.CodeFileExists, "local target exists")
+		} else if !os.IsNotExist(err) {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+		remoteCount := 0
+		if verifyChecksum {
+			remoteCount, err = s.remoteFileCount(connectionID, remoteResolved, timeoutSec)
+			if err != nil {
+				return nil, err
+			}
+		}
+		approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "download", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+		if err != nil {
+			return nil, err
+		}
+		if approvalResp != nil {
+			return approvalResp, nil
+		}
+		return s.downloadDirectory(traceID, connectionID, conn, remoteResolved, localAbs, timeoutSec, createParents, verifyChecksum, remoteCount, onProgress)
 	case "file":
 		// fall through to single-file download
 	default:
@@ -902,7 +883,7 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	if err != nil {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path is invalid")
 	}
-	if err := ensureLocalPathAllowed(localAbs, allowLocalAnywhere); err != nil {
+	if err := ensureLocalPathAllowed(localAbs, conn.AllowedLocalPaths, allowLocalAnywhere); err != nil {
 		return nil, err
 	}
 
@@ -914,18 +895,34 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 		if err := s.ensureResumeAvailable(connectionID); err != nil {
 			return nil, err
 		}
+		approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "download", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+		if err != nil {
+			return nil, err
+		}
+		if approvalResp != nil {
+			return approvalResp, nil
+		}
 		return s.downloadFileWithResume(traceID, connectionID, conn, remoteResolved, localAbs, timeoutSec, createParents, verifyChecksum, onProgress)
 	}
 
-	if createParents {
-		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
-			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
-		}
-	}
 	if mode == "create" {
 		if _, err := os.Stat(localAbs); err == nil {
 			return nil, errorsx.New(errorsx.CodeFileExists, "local target exists")
 		} else if !os.IsNotExist(err) {
+			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
+		}
+	}
+
+	approvalResp, err := s.authorizeTransferStart(traceID, connectionID, conn, "download", localAbs, remoteResolved, allowLocalAnywhere, approvalToken)
+	if err != nil {
+		return nil, err
+	}
+	if approvalResp != nil {
+		return approvalResp, nil
+	}
+
+	if createParents {
+		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
 		}
 	}
@@ -995,32 +992,10 @@ func (s *Service) DownloadFile(connectionID, remotePath, localPath, mode, cwd st
 	return resp, nil
 }
 
-func (s *Service) downloadDirectory(traceID, connectionID string, conn *model.Connection, remoteResolved, localPath string, timeoutSec int, createParents, verifyChecksum, allowLocalAnywhere bool, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
-	localAbs, err := security.ResolveLocalPath(localPath)
-	if err != nil {
-		return nil, errorsx.New(errorsx.CodeInvalidParams, "local_path is invalid")
-	}
-	if err := ensureLocalPathAllowed(localAbs, allowLocalAnywhere); err != nil {
-		return nil, err
-	}
-
-	// mode=create: local path must not exist
-	if _, err := os.Stat(localAbs); err == nil {
-		return nil, errorsx.New(errorsx.CodeFileExists, "local target exists")
-	} else if !os.IsNotExist(err) {
-		return nil, errorsx.New(errorsx.CodeInternal, err.Error())
-	}
+func (s *Service) downloadDirectory(traceID, connectionID string, conn *model.Connection, remoteResolved, localAbs string, timeoutSec int, createParents, verifyChecksum bool, remoteCount int, onProgress sshbridge.ExecProgressFn) (map[string]any, error) {
 	if createParents {
 		if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
 			return nil, errorsx.New(errorsx.CodeInternal, err.Error())
-		}
-	}
-
-	remoteCount := 0
-	if verifyChecksum {
-		remoteCount, err = s.remoteFileCount(connectionID, remoteResolved, timeoutSec)
-		if err != nil {
-			return nil, err
 		}
 	}
 
@@ -1128,7 +1103,7 @@ func (s *Service) downloadFileWithResume(traceID, connectionID string, conn *mod
 }
 
 const (
-	readFileDefaultMaxBytes = 512 * 1024     // 512KB
+	readFileDefaultMaxBytes = 512 * 1024      // 512KB
 	readFileHardMaxBytes    = 2 * 1024 * 1024 // 2MB
 	readFileDefaultOffset   = 1
 	readFileDefaultLimit    = 2000
@@ -1458,6 +1433,9 @@ func (s *Service) ApplyPatch(connectionID, patchUnified, baseDir string, dryRun 
 	if base == "" {
 		return nil, errorsx.New(errorsx.CodePathForbidden, "base_dir is outside workspace_roots")
 	}
+	if err := validatePatchTargets(base, patchUnified, strip, conn.WorkspaceRoots); err != nil {
+		return nil, err
+	}
 	enc := base64.StdEncoding.EncodeToString([]byte(patchUnified))
 
 	patchFlags := fmt.Sprintf("--batch --fuzz=0 -p%d", strip)
@@ -1565,6 +1543,39 @@ func (s *Service) resolveAndCheckPath(conn *model.Connection, input, cwd string)
 	return resolved
 }
 
+func validateExecCWDWithinRoots(conn *model.Connection, cwd string, noun string) (string, error) {
+	resolved := security.NormalizeRemotePath("", cwd)
+	if len(conn.WorkspaceRoots) > 0 && !security.IsWithinRoots(resolved, conn.WorkspaceRoots) {
+		return "", errorsx.New(errorsx.CodePathForbidden, noun+" outside workspace_roots: "+resolved)
+	}
+	return resolved, nil
+}
+
+func (s *Service) resolveSessionCWD(conn *model.Connection, cwd string) (string, error) {
+	return validateExecCWDWithinRoots(conn, security.NormalizeRemotePath(strings.TrimSpace(cwd), "/"), "session cwd")
+}
+
+func (s *Service) resolveEffectiveExecCWD(conn *model.Connection, sessionID, cwd string) (string, error) {
+	base := "/"
+	if sessionID != "" {
+		sess, err := s.ssh.GetSession(sessionID)
+		if err != nil {
+			return "", err
+		}
+		if sess.ConnectionID != conn.ID {
+			return "", errorsx.New(errorsx.CodeInvalidParams, "session_id does not belong to connection_id")
+		}
+		if strings.TrimSpace(sess.CWD) != "" {
+			base = security.NormalizeRemotePath("", sess.CWD)
+		}
+	}
+	resolved := security.NormalizeRemotePath(strings.TrimSpace(cwd), base)
+	if strings.TrimSpace(cwd) == "" {
+		resolved = base
+	}
+	return validateExecCWDWithinRoots(conn, resolved, "effective cwd")
+}
+
 func normalizeTransferTimeout(timeoutSec int) int {
 	if timeoutSec <= 0 {
 		return 300
@@ -1615,7 +1626,7 @@ func (s *Service) ensureResumeAvailable(connectionID string) error {
 	return resumeUnavailableError(localOK, remoteOK)
 }
 
-func ensureLocalPathAllowed(localPath string, allowLocalAnywhere bool) error {
+func ensureLocalPathAllowed(localPath string, allowedPaths []string, allowLocalAnywhere bool) error {
 	if allowLocalAnywhere {
 		return nil
 	}
@@ -1623,10 +1634,15 @@ func ensureLocalPathAllowed(localPath string, allowLocalAnywhere bool) error {
 	if err != nil {
 		return errorsx.New(errorsx.CodeInternal, err.Error())
 	}
-	if !security.IsWithinLocalRoot(localPath, wd) {
-		return errorsx.New(errorsx.CodePathForbidden, "local_path is outside current working directory; set allow_local_anywhere=true to override")
+	if security.IsWithinLocalRoot(localPath, wd) {
+		return nil
 	}
-	return nil
+	for _, allowed := range allowedPaths {
+		if security.IsWithinLocalRoot(localPath, allowed) {
+			return nil
+		}
+	}
+	return errorsx.New(errorsx.CodePathForbidden, "local_path is outside allowed directories; set allow_local_anywhere=true to override")
 }
 
 func (s *Service) remotePathExists(connectionID, remotePath string) (bool, error) {
@@ -1986,6 +2002,16 @@ func grantExpiry(now time.Time, ttlSec int) time.Time {
 }
 
 func (s *Service) authorizePrivilege(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string, reusable bool, grantTTLSec int) (privilegeAuthz, error) {
+	var connGeneration uint64
+	generationKnown := false
+	if conn, err := s.ssh.GetConnection(connectionID); err == nil {
+		connGeneration = conn.Generation
+		generationKnown = true
+	}
+	return s.authorizePrivilegeWithGeneration(connectionID, sessionID, capability, command, commandTpl, commandHash, risk, reason, token, host, username, reusable, grantTTLSec, connGeneration, generationKnown)
+}
+
+func (s *Service) authorizePrivilegeWithGeneration(connectionID, sessionID, capability, command, commandTpl, commandHash string, risk model.RiskLevel, reason, token, host, username string, reusable bool, grantTTLSec int, connGeneration uint64, generationKnown bool) (privilegeAuthz, error) {
 	now := time.Now().UTC()
 	statusResp := func(approvalID string, reqReason string) map[string]any {
 		return map[string]any{
@@ -2026,7 +2052,7 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token does not match current capability")
 		}
 		// Reject tokens from before a reconnect (generation mismatch).
-		if conn, err := s.ssh.GetConnection(connectionID); err == nil && req.Generation != conn.Generation {
+		if generationKnown && req.Generation != connGeneration {
 			return privilegeAuthz{}, errorsx.New(errorsx.CodeApprovalRejected, "approval token invalidated by connection reconnect")
 		}
 		// Atomically mark as used. MarkUsed returns nil if already consumed
@@ -2078,10 +2104,6 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		}
 	}
 
-	var connGeneration uint64
-	if conn, err := s.ssh.GetConnection(connectionID); err == nil {
-		connGeneration = conn.Generation
-	}
 	req := model.ApprovalRequest{
 		ID:           util.NewID("apr"),
 		CreatedAt:    now,
@@ -2109,6 +2131,129 @@ func (s *Service) authorizePrivilege(connectionID, sessionID, capability, comman
 		StatusResp:  statusResp(req.ID, req.Reason),
 		ConfirmMode: "approval_queue",
 	}, nil
+}
+
+func transferApprovalTemplate(direction, localPath, remotePath string) string {
+	return "ssh_transfer direction=" + direction + " local=" + localPath + " remote=" + remotePath
+}
+
+// authorizeExecStart runs connection preflight before touching an approval
+// token, and keeps sudo credential prompting on the no-side-effect side of the
+// boundary when a token is already present.
+func (s *Service) authorizeExecStart(connectionID, sessionID string, conn *model.Connection, policy security.ExecPolicyDecision, command, evalCmd, approvalToken string) (privilegeAuthz, string, string, map[string]any, error) {
+	preflight := s.preflightCheck
+	if preflight == nil {
+		preflight = s.ssh.PreFlightCheck
+	}
+	if err := preflight(connectionID); err != nil {
+		return privilegeAuthz{}, "", "", nil, err
+	}
+
+	runCommand := command
+	runInput := ""
+	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled && approvalToken != "" {
+		var statusResp map[string]any
+		var err error
+		runCommand, runInput, statusResp, err = s.prepareSudoCommand(*conn, command)
+		if err != nil || statusResp != nil {
+			return privilegeAuthz{}, "", "", statusResp, err
+		}
+	}
+
+	authz := privilegeAuthz{Allowed: true}
+	if policy.DenyClass == model.DenyNeedApprove {
+		var err error
+		authz, err = s.authorizePrivilegeWithGeneration(
+			connectionID,
+			sessionID,
+			policy.Capability,
+			evalCmd,
+			policy.Template,
+			policy.TemplateHash,
+			policy.RiskLevel,
+			policy.Reason,
+			approvalToken,
+			conn.Host,
+			conn.Username,
+			policy.Reusable,
+			conn.GrantTTLSec,
+			conn.Generation,
+			true,
+		)
+		if err != nil || !authz.Allowed {
+			return authz, "", "", nil, err
+		}
+	}
+
+	if policy.Capability == "sudo_exec" && s.cfg.SudoEnabled && approvalToken == "" {
+		var statusResp map[string]any
+		var err error
+		runCommand, runInput, statusResp, err = s.prepareSudoCommand(*conn, command)
+		if err != nil || statusResp != nil {
+			return authz, "", "", statusResp, err
+		}
+	}
+
+	return authz, runCommand, runInput, nil, nil
+}
+
+// authorizeTransferStart runs connection preflight before touching the
+// local_anywhere approval token so pre-execution failures do not consume it.
+// localPath and remotePath must be the already-normalized (abs/resolved) forms
+// so the approval template matches on both the initial request and the retry.
+func (s *Service) authorizeTransferStart(traceID, connectionID string, conn *model.Connection, direction, localPath, remotePath string, allowLocalAnywhere bool, approvalToken string) (map[string]any, error) {
+	preflight := s.preflightCheck
+	if preflight == nil {
+		preflight = s.ssh.PreFlightCheck
+	}
+	if err := preflight(connectionID); err != nil {
+		return nil, err
+	}
+	if !allowLocalAnywhere {
+		return nil, nil
+	}
+
+	template := transferApprovalTemplate(direction, localPath, remotePath)
+	commandHash := security.HashCommandTemplate(template)
+	reason := fmt.Sprintf("%s local=%s remote=%s — local path is outside allowed directories", direction, localPath, remotePath)
+	authz, err := s.authorizePrivilegeWithGeneration(
+		connectionID,
+		"",
+		"local_anywhere_transfer",
+		template,
+		template,
+		commandHash,
+		model.RiskL2,
+		reason,
+		approvalToken,
+		conn.Host,
+		conn.Username,
+		false, // not reusable: explicit privilege escalation
+		conn.GrantTTLSec,
+		conn.Generation,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if authz.Allowed {
+		return nil, nil
+	}
+
+	_ = s.audit.Write(model.AuditEvent{
+		Timestamp:       time.Now().UTC(),
+		TraceID:         traceID,
+		Type:            "ssh_transfer",
+		ConnectionID:    connectionID,
+		Host:            conn.Host,
+		RiskLevel:       string(model.RiskL2),
+		Status:          "approval_required",
+		SecurityProfile: conn.SecurityProfile,
+		Capability:      "local_anywhere_transfer",
+		CommandHash:     commandHash,
+		ConfirmMode:     authz.ConfirmMode,
+	})
+	return authz.StatusResp, nil
 }
 
 func (s *Service) issueProfileDeleteToken(profileID string) string {
@@ -2215,10 +2360,6 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 	if strings.EqualFold(strings.TrimSpace(p.Username), "root") && !p.AllowRootUser && !s.cfg.AllowRootLogin {
 		return model.Connection{}, errorsx.New(errorsx.CodeInvalidParams, "root user is denied by policy; enable allow_root_user in profile to override")
 	}
-	allowPublic := p.AllowPublicHost || s.cfg.AllowPublicHost
-	if input.AllowPublicHost != nil {
-		allowPublic = *input.AllowPublicHost
-	}
 	password, _ := s.secrets.Get(p.ID, "password")
 	keyPassphrase, _ := s.secrets.Get(p.ID, "key_passphrase")
 	sudoPassword, _ := s.secrets.Get(p.ID, "sudo_password")
@@ -2296,16 +2437,16 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		SudoPassword:    sudoPassword,
 		WorkspaceRoots:  roots,
 		LimitDir:        limitDir,
-		AllowPublicHost: allowPublic,
 		SecurityProfile: securityProfile,
 		AllowRootUser:   p.AllowRootUser,
 		MaxAutoRisk:     maxAutoRisk,
 		AllowReboot:     p.AllowReboot,
 		AllowDiskOps:    p.AllowDiskOps,
-		DenyPatterns:    append([]string{}, p.DenyPatterns...),
-		GrantTTLSec:     p.GrantTTLSec,
-		CnotePath:       cnotePath,
-		Cnote:           cnote,
+		DenyPatterns:      append([]string{}, p.DenyPatterns...),
+		AllowedLocalPaths: append([]string{}, p.AllowedLocalPaths...),
+		GrantTTLSec:       p.GrantTTLSec,
+		CnotePath:         cnotePath,
+		Cnote:             cnote,
 	}, nil
 }
 

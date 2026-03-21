@@ -1,8 +1,19 @@
-# Cssh
+<p align="center">
+  <img src="assets/redstone_B_flat_duotone.svg" width="128" alt="Cssh">
+</p>
 
-Cssh - Claude (Codex) SSH, or really, any MCP-compatible agent over SSH. A lightweight MCP server for secure remote command execution, file transfer, and server management.
+<h1 align="center">Cssh</h1>
 
-## Installation
+<p align="center">
+  <b>Your local AI, on any remote server.</b><br>
+  <sub>No deployment needed — SSH bridges the gap</sub>
+</p>
+
+<p align="center">
+  Lightweight MCP server for Claude · Codex · any MCP-compatible agent over SSH.
+</p>
+
+## Installation(macOS & Linux; Windows coming later)
 
 ### One-line install (recommended)
 
@@ -10,13 +21,17 @@ Cssh - Claude (Codex) SSH, or really, any MCP-compatible agent over SSH. A light
 curl -sSL https://raw.githubusercontent.com/Zero-noise/Cssh/main/scripts/install.sh | bash
 ```
 
+Installs the latest release binary for your platform from GitHub Releases.
+
 ### Developer install
 
 ```bash
 git clone https://github.com/Zero-noise/Cssh.git && cd Cssh && ./scripts/install.sh
 ```
 
-The installer builds binaries to `~/.csbridge/bin/`, adds them to your PATH, registers the MCP server with Claude Code, and auto-approves tool permissions.
+Builds `cssh-mcp` and `csshctl` from the local checkout with your installed Go toolchain.
+
+The installer places binaries in `~/.csbridge/bin/`, adds them to your PATH, registers the MCP server with Claude Code, and auto-approves tool permissions.
 
 Open Claude Code and tell the AI: "Help me connect to my SSH server", and it will guide you through profile setup and connection.
 
@@ -45,7 +60,11 @@ claude mcp add --transport stdio --scope user cssh -- ~/.csbridge/bin/cssh-mcp
 
 The install script registers cssh with **Claude Code** automatically. For other clients, add the config manually.
 
-Binary path: `~/.csbridge/bin/cssh-mcp` — if your client does not expand `~`, use the full absolute path.
+Binary path: `~/.csbridge/bin/cssh-mcp`. Some clients don't expand `~` — get your absolute path with:
+
+```bash
+echo ~/.csbridge/bin/cssh-mcp
+```
 
 <details>
 <summary><b>Cursor</b></summary>
@@ -55,7 +74,10 @@ Binary path: `~/.csbridge/bin/cssh-mcp` — if your client does not expand `~`, 
 ```json
 {
   "mcpServers": {
-    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
+    "cssh": {
+      "type": "stdio",
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
   }
 }
 ```
@@ -69,23 +91,27 @@ Binary path: `~/.csbridge/bin/cssh-mcp` — if your client does not expand `~`, 
 ```json
 {
   "servers": {
-    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
+    "cssh": {
+      "command": "${userHome}/.csbridge/bin/cssh-mcp"
+    }
   }
 }
 ```
 
-> VS Code uses `"servers"` as the root key, not `"mcpServers"`.
+> VS Code uses `"servers"` as the root key, not `"mcpServers"`. Use `${userHome}` instead of `~`.
 </details>
 
 <details>
 <summary><b>Windsurf</b></summary>
 
-`~/.codeium/windsurf/mcp_config.json`:
+`~/.codeium/windsurf/mcp_config.json` — use an absolute path for the command:
 
 ```json
 {
   "mcpServers": {
-    "cssh": { "command": "~/.csbridge/bin/cssh-mcp" }
+    "cssh": {
+      "command": "/Users/you/.csbridge/bin/cssh-mcp"
+    }
   }
 }
 ```
@@ -98,10 +124,28 @@ Binary path: `~/.csbridge/bin/cssh-mcp` — if your client does not expand `~`, 
 
 ```toml
 [mcp_servers.cssh]
-command = "~/.csbridge/bin/cssh-mcp"
+command = ["~/.csbridge/bin/cssh-mcp"]
 ```
 
 Or: `codex mcp add cssh -- ~/.csbridge/bin/cssh-mcp`
+</details>
+
+<details>
+<summary><b>Amp Code</b></summary>
+
+`~/.config/amp/settings.json` (global) or `.amp/settings.json` (project):
+
+```json
+{
+  "amp.mcpServers": {
+    "cssh": {
+      "command": "~/.csbridge/bin/cssh-mcp"
+    }
+  }
+}
+```
+
+Or: `amp mcp add cssh -- ~/.csbridge/bin/cssh-mcp`
 </details>
 
 <details>
@@ -211,6 +255,21 @@ csshctl secret set-sudo-password --profile devbox
 # Manage approvals
 csshctl approvals list --status pending
 csshctl approve apr_xxx --by yourname
+```
+
+## Approval Flow
+
+High-risk commands (reboot, mkfs, sudo in ops_strict, etc.) require human approval. When the AI hits one, it pauses and shows an `approval_id` — you approve it in another terminal:
+
+```
+  ssh_exec("reboot")
+    → approval_required (id: apr_abc123)
+
+  ┌─ You, in another terminal ───────────────────────┐
+  │  $ csshctl approve apr_abc123 --by yourname      │
+  └──────────────────────────────────────────────────┘
+
+  AI retries automatically → ✓ command executes
 ```
 
 ## AI Workflow

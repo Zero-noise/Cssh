@@ -80,6 +80,27 @@ func ValidateLocalDirSymlinks(dirPath string) error {
 	})
 }
 
+// NormalizeAllowedLocalPaths resolves, canonicalizes, and deduplicates a list
+// of allowed local paths. Each entry is run through ResolveLocalPath (abs +
+// clean + symlink resolution) so that "/tmp", "/private/tmp", "/tmp/../tmp"
+// all collapse to the same canonical value. Empty or invalid entries cause an
+// error.
+func NormalizeAllowedLocalPaths(paths []string) ([]string, error) {
+	seen := map[string]bool{}
+	result := make([]string, 0, len(paths))
+	for _, p := range paths {
+		resolved, err := ResolveLocalPath(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid allowed_local_path %q: %w", p, err)
+		}
+		if !seen[resolved] {
+			seen[resolved] = true
+			result = append(result, resolved)
+		}
+	}
+	return result, nil
+}
+
 func canonicalLocalPath(p string) string {
 	clean := filepath.Clean(p)
 	cur := clean

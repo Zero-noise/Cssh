@@ -26,6 +26,7 @@ type CredentialPromptInput struct {
 	ProfileID string
 	Fields    []string // "password", "key_passphrase", "sudo_password"
 	Mode      string   // auto|terminal|web
+	Notify    func(string) // optional; called with user-facing messages (e.g. web URL)
 }
 
 var allowedCredentialFields = map[string]struct{}{
@@ -101,7 +102,7 @@ func (s *Service) CredentialPrompt(in CredentialPromptInput) (map[string]any, er
 	}
 	if mode == "web" || mode == "auto" {
 		if hasDisplay() {
-			result, err := s.credentialPromptWeb(profile, fields)
+			result, err := s.credentialPromptWeb(profile, fields, in.Notify)
 			if err == nil {
 				writeAudit("ok", "method=web profile_id="+profile.ID)
 				return result, nil
@@ -208,7 +209,7 @@ func manualCredentialPromptResult(profileID string, fields []string) map[string]
 	}
 }
 
-func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (map[string]any, error) {
+func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string, notify func(string)) (map[string]any, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen: %w", err)
@@ -299,6 +300,9 @@ func (s *Service) credentialPromptWeb(profile *model.Profile, fields []string) (
 	url := fmt.Sprintf("http://127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port)
 	if err := openBrowser(url); err != nil {
 		return nil, fmt.Errorf("open browser: %w", err)
+	}
+	if notify != nil {
+		notify("Credential prompt opened at " + url)
 	}
 
 	select {
@@ -440,6 +444,7 @@ func openBrowser(url string) error {
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
 }
+
 
 type credFormData struct {
 	Profile *model.Profile

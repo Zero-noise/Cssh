@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"regexp"
 	"strings"
@@ -15,19 +16,19 @@ import (
 )
 
 type QuickSetupInput struct {
-	Purpose         string
-	ProfileID       string
-	ProfileName     string
-	Host            string
-	Port            int
-	Username        string
-	AuthMode        string
-	WorkspaceRoots  []string
-	KeyPath         string
-	AllowPublicHost bool
-	SecurityProfile string
-	AllowRootUser   bool
-	GrantTTLSec     int
+	Purpose           string
+	ProfileID         string
+	ProfileName       string
+	Host              string
+	Port              int
+	Username          string
+	AuthMode          string
+	WorkspaceRoots    []string
+	AllowedLocalPaths *[]string // nil = use defaults, &[]string{} = explicitly empty
+	KeyPath           string
+	SecurityProfile   string
+	AllowRootUser     bool
+	GrantTTLSec       int
 }
 
 func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[string]any, error) {
@@ -36,18 +37,21 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 	if username == "" {
 		username = "ubuntu"
 	}
-	securityProfile := normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
+	securityProfile, err := config.NormalizeSecurityProfile(s.cfg.SecurityProfileDefault)
+	if err != nil {
+		return nil, err
+	}
 	defaultRoot := defaultWorkspaceRoot(username, securityProfile)
 	defaults := map[string]any{
-		"profile_name":      strings.TrimSpace(purpose),
-		"port":              22,
-		"auth_mode":         authMode,
-		"workspace_roots":   []string{defaultRoot},
-		"allow_public_host": true,
-		"key_path":          "~/.ssh/id_ed25519",
-		"security_profile":  securityProfile,
-		"allow_root_user":   false,
-		"grant_ttl_sec":     0,
+		"profile_name":        strings.TrimSpace(purpose),
+		"port":                22,
+		"auth_mode":           authMode,
+		"workspace_roots":     []string{defaultRoot},
+		"allowed_local_paths": defaultAllowedLocalPaths(),
+		"key_path":            "~/.ssh/id_ed25519",
+		"security_profile":    securityProfile,
+		"allow_root_user":     false,
+		"grant_ttl_sec":       0,
 	}
 
 	fields := []map[string]any{
@@ -59,8 +63,9 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "username", "label": "SSH User", "type": "string", "required": true, "default": username},
 		{"name": "auth_mode", "label": "Auth Mode", "type": "string", "required": false, "enum": []string{"hybrid", "key", "password"}, "default": authMode},
 		{"name": "workspace_roots", "label": "Workspace Roots", "type": "array", "required": false, "default": []string{defaultRoot}},
+		{"name": "allowed_local_paths", "label": "Allowed Local Paths", "type": "array", "required": false, "default": defaultAllowedLocalPaths(),
+			"description": "Local directories allowed for ssh_transfer without approval. Paths outside this list and cwd require allow_local_anywhere + approval."},
 		{"name": "key_path", "label": "Private Key Path", "type": "string", "required": false, "default": "~/.ssh/id_ed25519"},
-		{"name": "allow_public_host", "label": "Allow Public Host", "type": "boolean", "required": false, "default": true},
 		{"name": "security_profile", "label": "Security Profile", "type": "string", "required": false, "enum": []string{"easy_safe", "ops_strict"}, "default": securityProfile},
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 		{"name": "grant_ttl_sec", "label": "Grant TTL (seconds)", "type": "integer", "required": false, "default": 0,
@@ -103,15 +108,30 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	if in.Port <= 0 {
 		in.Port = 22
 	}
-	effectiveSecurityProfile := normalizeSecurityProfileDefault(in.SecurityProfile)
-	if effectiveSecurityProfile == "" {
-		effectiveSecurityProfile = normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
+	spInput := in.SecurityProfile
+	if strings.TrimSpace(spInput) == "" {
+		spInput = s.cfg.SecurityProfileDefault
+	}
+	effectiveSecurityProfile, err := config.NormalizeSecurityProfile(spInput)
+	if err != nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
 	}
 	if len(in.WorkspaceRoots) == 0 {
 		in.WorkspaceRoots = []string{defaultWorkspaceRoot(in.Username, effectiveSecurityProfile)}
 	}
 	for i := range in.WorkspaceRoots {
 		in.WorkspaceRoots[i] = path.Clean(strings.TrimSpace(in.WorkspaceRoots[i]))
+	}
+
+	var allowedLocal []string
+	if in.AllowedLocalPaths == nil {
+		allowedLocal = defaultAllowedLocalPaths()
+	} else {
+		normalized, err := security.NormalizeAllowedLocalPaths(*in.AllowedLocalPaths)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+		}
+		allowedLocal = normalized
 	}
 
 	if authMode != "password" && strings.TrimSpace(in.KeyPath) == "" {
@@ -146,17 +166,11 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		AuthPriority:      authPriority,
 		KeyPath:           config.ExpandHome(strings.TrimSpace(in.KeyPath)),
 		WorkspaceRoots:    in.WorkspaceRoots,
-		AllowPublicHost:   in.AllowPublicHost,
-		SecurityProfile:   normalizeSecurityProfileDefault(in.SecurityProfile),
+		AllowedLocalPaths: allowedLocal,
+		SecurityProfile:   effectiveSecurityProfile,
 		AllowRootUser:     in.AllowRootUser,
 		GrantTTLSec:       in.GrantTTLSec,
 		ToolPolicyVersion: 2,
-	}
-	if profile.SecurityProfile == "" {
-		profile.SecurityProfile = normalizeSecurityProfileDefault(s.cfg.SecurityProfileDefault)
-	}
-	if profile.SecurityProfile == "" {
-		profile.SecurityProfile = "easy_safe"
 	}
 	applyProfileSecurityDefaults(&profile)
 	if in.ProfileID == "" {
@@ -182,20 +196,21 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 	}
 
 	warnings := []string{}
-	if !profile.AllowPublicHost && !security.IsPrivateOrLoopbackHost(profile.Host) {
-		warnings = append(warnings, "host looks public; connection will be blocked unless allow_public_host=true or VPN address is used")
+	if !s.cfg.AllowPublicHost && !security.IsPrivateOrLoopbackHost(profile.Host) {
+		warnings = append(warnings, "host looks public; connection will be blocked by global allow_public_host=false; use VPN address or change global config")
 	}
 
 	result := map[string]any{
-		"saved":            true,
-		"profile_id":       profileID,
-		"profile_name":     profileName,
-		"cnote_path":       profile.NotePath,
-		"auth_priority":    authPriority,
-		"workspace_roots":  profile.WorkspaceRoots,
-		"security_profile": profile.SecurityProfile,
-		"secrets_saved":    secretsSaved,
-		"warnings":         warnings,
+		"saved":               true,
+		"profile_id":          profileID,
+		"profile_name":        profileName,
+		"cnote_path":          profile.NotePath,
+		"auth_priority":       authPriority,
+		"workspace_roots":     profile.WorkspaceRoots,
+		"allowed_local_paths": profile.AllowedLocalPaths,
+		"security_profile":    profile.SecurityProfile,
+		"secrets_saved":       secretsSaved,
+		"warnings":            warnings,
 		"connect_hint": map[string]any{
 			"tool":      "ssh_connect",
 			"arguments": map[string]any{"profile_id": profileID},
@@ -234,19 +249,19 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 
 // QuickSetupEditInput uses pointer types to distinguish "not provided" from "zero value".
 type QuickSetupEditInput struct {
-	ProfileID       string
-	ProfileName     *string
-	Host            *string
-	Port            *int
-	Username        *string
-	AuthMode        *string
-	AuthPriority    []string
-	WorkspaceRoots  []string
-	KeyPath         *string
-	AllowPublicHost *bool
-	SecurityProfile *string
-	AllowRootUser   *bool
-	GrantTTLSec     *int
+	ProfileID         string
+	ProfileName       *string
+	Host              *string
+	Port              *int
+	Username          *string
+	AuthMode          *string
+	AuthPriority      []string
+	WorkspaceRoots    []string
+	AllowedLocalPaths *[]string // nil = not provided, &[]string{} = clear to empty
+	KeyPath           *string
+	SecurityProfile   *string
+	AllowRootUser     *bool
+	GrantTTLSec       *int
 }
 
 func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error) {
@@ -277,11 +292,12 @@ func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error)
 	if in.KeyPath != nil {
 		p.KeyPath = config.ExpandHome(strings.TrimSpace(*in.KeyPath))
 	}
-	if in.AllowPublicHost != nil {
-		p.AllowPublicHost = *in.AllowPublicHost
-	}
 	if in.SecurityProfile != nil {
-		p.SecurityProfile = normalizeSecurityProfileDefault(*in.SecurityProfile)
+		sp, err := config.NormalizeSecurityProfile(*in.SecurityProfile)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+		}
+		p.SecurityProfile = sp
 	}
 	if in.AllowRootUser != nil {
 		p.AllowRootUser = *in.AllowRootUser
@@ -294,6 +310,13 @@ func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error)
 			in.WorkspaceRoots[i] = path.Clean(strings.TrimSpace(in.WorkspaceRoots[i]))
 		}
 		p.WorkspaceRoots = in.WorkspaceRoots
+	}
+	if in.AllowedLocalPaths != nil {
+		normalized, err := security.NormalizeAllowedLocalPaths(*in.AllowedLocalPaths)
+		if err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+		}
+		p.AllowedLocalPaths = normalized
 	}
 
 	// auth_priority takes precedence over auth_mode
@@ -317,19 +340,19 @@ func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error)
 	}
 
 	result := map[string]any{
-		"edited":           true,
-		"profile_id":       p.ID,
-		"profile_name":     p.Name,
-		"host":             p.Host,
-		"port":             p.Port,
-		"username":         p.Username,
-		"auth_priority":    p.AuthPriority,
-		"key_path":         p.KeyPath,
-		"workspace_roots":  p.WorkspaceRoots,
-		"allow_public_host": p.AllowPublicHost,
-		"security_profile": p.SecurityProfile,
-		"allow_root_user":  p.AllowRootUser,
-		"grant_ttl_sec":    p.GrantTTLSec,
+		"edited":              true,
+		"profile_id":         p.ID,
+		"profile_name":       p.Name,
+		"host":               p.Host,
+		"port":               p.Port,
+		"username":           p.Username,
+		"auth_priority":      p.AuthPriority,
+		"key_path":           p.KeyPath,
+		"workspace_roots":    p.WorkspaceRoots,
+		"allowed_local_paths": p.AllowedLocalPaths,
+		"security_profile":   p.SecurityProfile,
+		"allow_root_user":    p.AllowRootUser,
+		"grant_ttl_sec":      p.GrantTTLSec,
 	}
 
 	_ = s.audit.Write(model.AuditEvent{
@@ -364,20 +387,24 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			content = ""
 		}
 		out = append(out, map[string]any{
-			"id":                p.ID,
-			"name":              p.Name,
-			"cnote_path":        path,
-			"host":              p.Host,
-			"port":              p.Port,
-			"username":          p.Username,
-			"auth_priority":     p.AuthPriority,
-			"workspace_roots":   p.WorkspaceRoots,
-			"allow_public_host": p.AllowPublicHost,
-			"security_profile":  p.SecurityProfile,
-			"allow_root_user":   p.AllowRootUser,
-			"grant_ttl_sec":     p.GrantTTLSec,
-			"has_cnote":         strings.TrimSpace(content) != "",
-			"cnote_preview":     cnotePreview(content),
+			"id":                  p.ID,
+			"name":                p.Name,
+			"cnote_path":          path,
+			"host":                p.Host,
+			"port":                p.Port,
+			"username":            p.Username,
+			"auth_priority":       p.AuthPriority,
+			"workspace_roots":     p.WorkspaceRoots,
+			"allowed_local_paths": p.AllowedLocalPaths,
+			"security_profile":    p.SecurityProfile,
+			"allow_root_user":     p.AllowRootUser,
+			"grant_ttl_sec":       p.GrantTTLSec,
+			"max_auto_risk":       p.MaxAutoRisk,
+			"allow_reboot":        p.AllowReboot,
+			"allow_disk_ops":      p.AllowDiskOps,
+			"deny_patterns":       p.DenyPatterns,
+			"has_cnote":           strings.TrimSpace(content) != "",
+			"cnote_preview":       cnotePreview(content),
 		})
 	}
 	resp := map[string]any{"profiles": out}
@@ -454,16 +481,16 @@ func (s *Service) ProfileDelete(profileID string, deleteSecrets bool, confirmTok
 	return resp, nil
 }
 
-func normalizeSecurityProfileDefault(v string) string {
-	mode := strings.ToLower(strings.TrimSpace(v))
-	switch mode {
-	case "", "easy_safe":
-		return "easy_safe"
-	case "ops_strict":
-		return "ops_strict"
-	default:
-		return mode
+func defaultAllowedLocalPaths() []string {
+	raw := []string{"/tmp"}
+	if td := os.TempDir(); td != "" && td != "/tmp" {
+		raw = append(raw, td)
 	}
+	paths, err := security.NormalizeAllowedLocalPaths(raw)
+	if err != nil {
+		return []string{"/tmp"}
+	}
+	return paths
 }
 
 func normalizeAuthMode(v string) string {

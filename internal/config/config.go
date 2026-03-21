@@ -22,6 +22,20 @@ sudo_enabled = true
 allow_root_login = false
 `
 
+// NormalizeSecurityProfile validates and normalizes a security_profile value.
+// Empty string returns "easy_safe". Unknown values return an error.
+func NormalizeSecurityProfile(v string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(v))
+	switch mode {
+	case "", "easy_safe":
+		return "easy_safe", nil
+	case "ops_strict":
+		return "ops_strict", nil
+	default:
+		return "", fmt.Errorf("unknown security_profile %q; valid values: easy_safe, ops_strict", v)
+	}
+}
+
 func ExpandHome(p string) string {
 	if p == "" {
 		return p
@@ -135,9 +149,11 @@ func Load(configPath string) (model.Config, error) {
 	if err := s.Err(); err != nil {
 		return cfg, fmt.Errorf("scan config: %w", err)
 	}
-	if strings.TrimSpace(cfg.SecurityProfileDefault) == "" {
-		cfg.SecurityProfileDefault = "easy_safe"
+	normalized, err := NormalizeSecurityProfile(cfg.SecurityProfileDefault)
+	if err != nil {
+		return cfg, fmt.Errorf("config: %w", err)
 	}
+	cfg.SecurityProfileDefault = normalized
 
 	if err := os.MkdirAll(cfg.RuntimeDir, 0o700); err != nil {
 		return cfg, err

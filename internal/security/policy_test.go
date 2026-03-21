@@ -1,6 +1,7 @@
 package security
 
 import (
+	"strings"
 	"testing"
 
 	"cssh/internal/model"
@@ -201,9 +202,9 @@ func TestContainsParentTraversal(t *testing.T) {
 		{"rm /opt/app/file", false},
 	}
 	for _, tc := range cases {
-		got := containsParentTraversal(tc.cmd)
+		got := ContainsParentTraversal(tc.cmd)
 		if got != tc.want {
-			t.Errorf("containsParentTraversal(%q) = %v, want %v", tc.cmd, got, tc.want)
+			t.Errorf("ContainsParentTraversal(%q) = %v, want %v", tc.cmd, got, tc.want)
 		}
 	}
 }
@@ -357,5 +358,82 @@ func TestIsPipedSudo(t *testing.T) {
 	}
 	if IsPipedSudo("echo sudoku") {
 		t.Fatal("expected IsPipedSudo=false for 'echo sudoku'")
+	}
+}
+
+// TestCwdComposedCommandWorkspaceRoots verifies that when cwd is composed into
+// the command string (as "cd <cwd> && <command>"), workspace_roots checks
+// correctly detect absolute paths in the cwd portion.
+func TestCwdComposedCommandWorkspaceRoots(t *testing.T) {
+	roots := []string{"/opt/app"}
+
+	// cd /etc && rm file → /etc is outside roots → DenyNeedApprove
+	d := EvaluateExecPolicyWithProfile("cd /etc && rm file", "L2", false, false, nil, roots, "")
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("cd /etc outside roots: expected DenyNeedApprove, got: %s", d.DenyClass)
+	}
+	if !strings.Contains(d.Reason, "/etc") {
+		t.Fatalf("expected reason to mention /etc, got: %s", d.Reason)
+	}
+
+	// cd /opt/app/sub && rm file → within roots → DenyNone
+	d = EvaluateExecPolicyWithProfile("cd /opt/app/sub && rm file", "L2", false, false, nil, roots, "")
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("cd /opt/app/sub within roots: expected DenyNone, got: %s", d.DenyClass)
+	}
+
+	// cd /opt/app/../../etc && rm file → /etc after path.Clean, but extractAbsolutePaths
+	// sees the raw path which includes /opt/app/../../etc → IsWithinRoots checks it
+	d = EvaluateExecPolicyWithProfile("cd /opt/app/../../etc && rm file", "L2", false, false, nil, roots, "")
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("cd traversal escaping roots: expected DenyNeedApprove, got: %s", d.DenyClass)
+	}
+
+	// easy_safe → workspace_roots skipped
+	d = EvaluateExecPolicyWithProfile("cd /etc && rm file", "L2", false, false, nil, roots, "easy_safe")
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("cd /etc in easy_safe: expected DenyNone, got: %s", d.DenyClass)
+	}
+
+	// Template for composed command includes cd prefix
+	d = EvaluateExecPolicyWithProfile("cd /etc && rm file", "L2", false, false, nil, roots, "")
+	tpl := BuildCommandTemplate("cd /etc && rm file")
+	if !strings.HasPrefix(tpl, "cd") {
+		t.Fatalf("expected template to start with 'cd', got: %s", tpl)
+	}
+
+	// Different absolute cwds collapse to the same template (paths → /PATH)
+	tpl2 := BuildCommandTemplate("cd /var && rm file")
+	if tpl != tpl2 {
+		t.Fatalf("expected same template for different cwds (both /PATH), got %q vs %q", tpl, tpl2)
+	}
+}
+
+func TestEvaluateExecPolicyWithContextResolvesRelativePaths(t *testing.T) {
+	roots := []string{"/opt/app"}
+
+	d := EvaluateExecPolicyWithContext("rm ../file", "/opt/app/sub", "L2", false, false, nil, roots, "ops_strict")
+	if d.DenyClass != model.DenyNone {
+		t.Fatalf("expected DenyNone for relative path resolved within roots, got: %s", d.DenyClass)
+	}
+
+	d = EvaluateExecPolicyWithContext("rm ../../etc/passwd", "/opt/app/sub", "L2", false, false, nil, roots, "ops_strict")
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for resolved path outside roots, got: %s", d.DenyClass)
+	}
+	if !strings.Contains(d.Reason, "/opt/etc/passwd") {
+		t.Fatalf("expected resolved outside path in reason, got: %s", d.Reason)
+	}
+}
+
+func TestEvaluateExecPolicyWithContextOpsStrictUnknownNeedsApproval(t *testing.T) {
+	roots := []string{"/opt/app"}
+
+	d := EvaluateExecPolicyWithContext(`git commit -m "x"`, "/opt/app", "L1", false, false, nil, roots, "ops_strict")
+	if d.DenyClass != model.DenyNeedApprove {
+		t.Fatalf("expected DenyNeedApprove for ops_strict unknown write target, got: %s", d.DenyClass)
+	}
+	if !strings.Contains(d.Reason, "cannot prove write targets stay within workspace_roots") {
+		t.Fatalf("unexpected reason: %s", d.Reason)
 	}
 }
