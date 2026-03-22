@@ -19,8 +19,8 @@ Trusts the AI. Maximizes convenience. Only irreversible operations gate executio
   (disk ops grants are reusable — approve once, valid for the connection session; configurable via `grant_ttl_sec`)
 
 **Everything else auto-executes**:
-- `workspace_roots` enforcement is **skipped on command execution and cwd validation**
-  (file tools like `ssh_write_file` still enforce it)
+- `workspace_roots` enforcement is **skipped on command execution**
+  (file tools like `ssh_write_file` still enforce it; session cwd is always validated)
 - User deny patterns are still honored
 
 ### `ops_strict` — Production Environment
@@ -35,7 +35,7 @@ Strict security. Every high-risk action requires individual human approval.
 - All `sudo` commands require approval
 - `workspace_roots` violations require approval (including `..` traversal and `cwd` outside roots)
 - `cwd` violations use directory-isolated grants: the grant hash includes the literal resolved cwd path, so approving `/etc` does not auto-approve `/var` (relative `..` traversal stays one-shot)
-- Sessions (`ssh_open_session`) cannot be created with `cwd` outside `workspace_roots`
+- Sessions (`ssh_open_session`) cannot be created with `cwd` outside `workspace_roots` (applies to all profiles, including `easy_safe`)
 - No reusable grants — every execution requires fresh approval
 
 ## Approval Flow
@@ -58,7 +58,7 @@ Grants are always revoked on disconnect via `RevokeByConnection`. In `ops_strict
 - **Profile-only connect**: remote connections require a pre-configured profile (`profile_id` or `profile_name`). Direct host/username connect is not supported.
 - **Public host policy**: public internet hosts are allowed by default (`allow_public_host=true` in global config). This is a global-only switch — it cannot be overridden per-profile or at connect time. When set to `false`, all connections to auto-detected public hosts are blocked.
 - **Write scope**: remote file writes (`ssh_write_file`, `ssh_apply_patch`) are restricted to directories listed in `workspace_roots`.
-- **CWD enforcement**: The `cwd` parameter in `ssh_exec` is validated against `workspace_roots` for write commands (L1/L2). Grants are directory-isolated: the hash includes the literal cwd, so approving one directory does not auto-approve others. Relative `..` traversal in cwd is always one-shot (non-reusable). Sessions cannot be created with `cwd` outside `workspace_roots` (except in `easy_safe`).
+- **CWD enforcement**: The `cwd` parameter in `ssh_exec` is validated against `workspace_roots` for write commands (L1/L2). Grants are directory-isolated: the hash includes the literal cwd, so approving one directory does not auto-approve others. Relative `..` traversal in cwd is always one-shot (non-reusable). Sessions cannot be created with `cwd` outside `workspace_roots` (all profiles, including `easy_safe`).
 - **Runtime narrowing**: `ssh_connect(limit_dir=...)` can further narrow effective runtime scope to a subdirectory (must be inside configured `workspace_roots`).
 - **Root user**: root login is denied by default. A profile can allow it with `allow_root_user: true`; global `allow_root_login: true` also permits root and has higher priority.
 

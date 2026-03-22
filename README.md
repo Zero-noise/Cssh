@@ -164,6 +164,16 @@ Or: `amp mcp add cssh -- ~/.csbridge/bin/cssh-mcp`
 - **Credential storage** — passwords and key passphrases stored in OS keychain (macOS Keychain / Linux Secret Service), never in config files
 - **Tool annotations** — all tools annotated with MCP spec hints (`readOnlyHint`, `destructiveHint`, etc.)
 
+## How It Works
+
+Cssh follows a simple five-step loop:
+
+**1. Setup** → create profile, store credentials securely\
+**2. Connect** → establish and verify the SSH session\
+**3. Operate** → read, write, patch, transfer, execute\
+**4. Evaluate risk** → classify the action as safe or sensitive\
+**5. Resolve** → allow, deny, or require explicit approval
+
 ## Security Model
 
 Two built-in security profiles control command approval:

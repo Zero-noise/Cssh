@@ -8,7 +8,7 @@ All runtime artifacts are auto-created — no manual setup needed.
 |------|------|---------|
 | Config | `~/.csbridge/config.toml` | Global settings (approval TTL, security defaults) |
 | Profiles | `~/.csbridge/profiles.json` | Saved SSH profile definitions |
-| Cnotes | `~/.csbridge/runtime/profiles/<profile>/cnote.md` | Per-profile AI instructions and operating notes |
+| Cnotes | `~/.csbridge/runtime/profiles/<id>-<hash>/cnote.md` | Per-profile AI instructions and operating notes |
 | Approvals | `~/.csbridge/runtime/approvals.jsonl` | Pending/resolved approval requests |
 | Grants | `~/.csbridge/runtime/grants.json` | Active reusable privilege grants |
 | Audit logs | `~/.csbridge/logs/audit-YYYYMMDD.jsonl` | Per-day audit trail of all operations |
@@ -19,8 +19,9 @@ Auto-generated with sensible defaults on first run. Key fields:
 
 ```toml
 security_profile_default = "easy_safe"
-allow_public_host = true   # global-only switch; cannot be overridden per-profile
+allow_public_host = true    # global-only switch; cannot be overridden per-profile
 sudo_enabled = true
+allow_root_login = false    # permit root user login (global override; per-profile: allow_root_user)
 ```
 
 ## Audit Logs
