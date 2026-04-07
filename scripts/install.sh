@@ -5,9 +5,50 @@ INSTALL_DIR="$HOME/.csbridge/bin"
 REPO="Zero-noise/Cssh"
 MARKER="# cssh-path-inject"
 
-info()  { printf '\033[1;34m[cssh]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[1;33m[cssh]\033[0m %s\n' "$*"; }
-error() { printf '\033[1;31m[cssh]\033[0m %b\n' "$*" >&2; exit 1; }
+# ── Output ────────────────────────────────────────────
+
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+  BOLD='\033[1m'
+  CYAN='\033[1;36m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  RED='\033[0;31m'
+  DIM='\033[0;90m'
+  RESET='\033[0m'
+else
+  BOLD='' CYAN='' GREEN='' YELLOW='' RED='' DIM='' RESET=''
+fi
+
+header()    { printf '\n  %b◆ cssh%b\n\n' "$CYAN" "$RESET"; }
+meta()      { printf '    %-14s %b%s%b\n' "$1" "$DIM" "$2" "$RESET"; }
+ok()        { printf '    %b✓%b  %s\n' "$GREEN" "$RESET" "$*"; }
+skip()      { printf '    %b·%b  %s\n' "$DIM" "$RESET" "$*"; }
+warn_step() { printf '    %b⚠%b  %s\n' "$YELLOW" "$RESET" "$*"; }
+tildify()   { printf '%s' "${1/#$HOME/~}"; }
+
+strip_ansi() { sed $'s/\033\\[[0-9;]*m//g'; }
+
+hint() {
+  local text="$*"
+  while IFS= read -r line; do
+    printf '       %b%s%b\n' "$DIM" "$line" "$RESET"
+  done <<< "$text"
+}
+
+die() {
+  local msg="$1"; shift
+  printf '    %b✗%b  %s\n' "$RED" "$RESET" "$msg"
+  for arg in "$@"; do [ -n "$arg" ] && hint "$arg"; done
+  printf '\n'
+  exit 1
+}
+
+footer() {
+  printf '\n  %bReady — open Claude Code and say:%b\n' "$BOLD" "$RESET"
+  printf '  "Help me connect to my SSH server"\n\n'
+}
+
+# ── Helpers ───────────────────────────────────────────
 
 set_cleanup_trap() {
   local target="$1"
@@ -16,25 +57,18 @@ set_cleanup_trap() {
   trap "$cleanup_cmd" EXIT
 }
 
-clear_cleanup_trap() {
-  trap - EXIT
-}
+clear_cleanup_trap() { trap - EXIT; }
 
 cleanup_path() {
-  local target="$1"
-  rm -rf -- "$target"
+  rm -rf -- "$1"
   clear_cleanup_trap
 }
 
-release_error() {
-  error "$1\nManual fallback:\n  Download the matching archive from https://github.com/$REPO/releases/latest\n  or clone the repo and run ./scripts/install.sh from the checkout."
-}
-
 first_existing_file() {
-  local candidate
-  for candidate in "$@"; do
-    if [ -f "$candidate" ]; then
-      printf '%s\n' "$candidate"
+  local f
+  for f in "$@"; do
+    if [ -f "$f" ]; then
+      printf '%s\n' "$f"
       return 0
     fi
   done
@@ -49,7 +83,6 @@ detect_rc_file() {
       ;;
     */bash)
       if [ "$(uname -s)" = "Darwin" ]; then
-        # macOS: terminals open login shells → prioritize login rc files
         if rc_file="$(first_existing_file \
           "$HOME/.bash_profile" \
           "$HOME/.bash_login" \
@@ -60,7 +93,6 @@ detect_rc_file() {
           printf '%s\n' "$HOME/.bash_profile"
         fi
       else
-        # Linux: terminals open non-login shells → prioritize .bashrc
         if rc_file="$(first_existing_file \
           "$HOME/.bashrc" \
           "$HOME/.bash_profile" \
@@ -95,126 +127,112 @@ detect_mode() {
   fi
 }
 
-detect_platform() {
-  OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  ARCH="$(uname -m)"
-  case "$ARCH" in
-    x86_64|amd64) ARCH="amd64" ;;
-    arm64|aarch64) ARCH="arm64" ;;
-    *) error "Unsupported architecture: $ARCH" ;;
-  esac
-  case "$OS" in
-    darwin|linux) ;;
-    *) error "Unsupported OS: $OS" ;;
-  esac
-}
+# ── Build / Download ─────────────────────────────────
 
 build_local() {
-  if ! command -v go &>/dev/null; then
-    error "Go is required for developer install. Install from https://go.dev/dl/"
-  fi
-  info "Building cssh-mcp and csshctl..."
+  command -v go &>/dev/null \
+    || die "Go toolchain not found" "Install from https://go.dev/dl/"
   mkdir -p "$INSTALL_DIR"
-  go build -o "$INSTALL_DIR/cssh-mcp" ./cmd/cssh-mcp
-  go build -o "$INSTALL_DIR/csshctl" ./cmd/csshctl
-  info "Built binaries in $INSTALL_DIR"
+  local err
+  err="$(go build -o "$INSTALL_DIR/cssh-mcp" ./cmd/cssh-mcp 2>&1)" \
+    || die "Build failed: cssh-mcp" "$err"
+  ok "Built cssh-mcp"
+  err="$(go build -o "$INSTALL_DIR/csshctl" ./cmd/csshctl 2>&1)" \
+    || die "Build failed: csshctl" "$err"
+  ok "Built csshctl"
+  ok "Installed to $(tildify "$INSTALL_DIR")/"
 }
 
 sha256_verify() {
-  local file="$1" expected="$2"
-  local actual
+  local file="$1" expected="$2" actual
   if command -v sha256sum &>/dev/null; then
     actual="$(sha256sum "$file" | awk '{print $1}')"
   elif command -v shasum &>/dev/null; then
     actual="$(shasum -a 256 "$file" | awk '{print $1}')"
   else
-    error "sha256sum or shasum is required for checksum verification"
+    die "Checksum tool not found" "sha256sum or shasum is required"
   fi
-  if [ "$actual" != "$expected" ]; then
-    error "Checksum verification failed for $(basename "$file")\n  expected: $expected\n  actual:   $actual"
-  fi
+  [ "$actual" = "$expected" ] || die "Checksum mismatch" \
+    "expected  $expected" \
+    "got       $actual"
 }
 
 install_from_release() {
-  detect_platform
   local base_url="https://github.com/$REPO/releases/latest/download"
   local archive="cssh-${OS}-${ARCH}.tar.gz"
   local tmp
   tmp="$(mktemp -d)"
   set_cleanup_trap "$tmp"
 
-  info "Downloading cssh for ${OS}/${ARCH}..."
+  local err
   if command -v curl &>/dev/null; then
-    if ! curl -fsSL "$base_url/$archive" -o "$tmp/$archive"; then
-      release_error "Failed to download $archive from GitHub Releases"
-    fi
-    if ! curl -fsSL "$base_url/checksums.txt" -o "$tmp/checksums.txt"; then
-      release_error "Failed to download checksums.txt from GitHub Releases"
-    fi
+    err="$(curl -fsSL "$base_url/$archive" -o "$tmp/$archive" 2>&1)" \
+      || die "Download failed: $archive" "$err" \
+           "https://github.com/$REPO/releases/latest" \
+           "Or clone the repo and run ./scripts/install.sh"
+    err="$(curl -fsSL "$base_url/checksums.txt" -o "$tmp/checksums.txt" 2>&1)" \
+      || die "Download failed: checksums.txt" "$err" \
+           "https://github.com/$REPO/releases/latest" \
+           "Or clone the repo and run ./scripts/install.sh"
   elif command -v wget &>/dev/null; then
-    if ! wget -qO "$tmp/$archive" "$base_url/$archive"; then
-      release_error "Failed to download $archive from GitHub Releases"
-    fi
-    if ! wget -qO "$tmp/checksums.txt" "$base_url/checksums.txt"; then
-      release_error "Failed to download checksums.txt from GitHub Releases"
-    fi
+    err="$(wget -qO "$tmp/$archive" "$base_url/$archive" 2>&1)" \
+      || die "Download failed: $archive" "$err" \
+           "https://github.com/$REPO/releases/latest" \
+           "Or clone the repo and run ./scripts/install.sh"
+    err="$(wget -qO "$tmp/checksums.txt" "$base_url/checksums.txt" 2>&1)" \
+      || die "Download failed: checksums.txt" "$err" \
+           "https://github.com/$REPO/releases/latest" \
+           "Or clone the repo and run ./scripts/install.sh"
   else
-    release_error "curl or wget is required to download release binaries"
+    die "No download tool found" "curl or wget is required"
   fi
+  ok "Downloaded $archive"
 
-  info "Verifying checksum..."
   local expected
   expected="$(awk -v name="$archive" '$2 == name { print $1 }' "$tmp/checksums.txt")"
-  if [ -z "$expected" ]; then
-    release_error "No checksum found for $archive in checksums.txt"
-  fi
+  [ -n "$expected" ] || die "No checksum found for $archive"
   sha256_verify "$tmp/$archive" "$expected"
-  info "Checksum OK"
+  ok "Checksum verified (sha256)"
 
   mkdir -p "$INSTALL_DIR"
-  if ! tar xzf "$tmp/$archive" -C "$tmp"; then
-    release_error "Failed to extract $archive"
-  fi
+  err="$(tar xzf "$tmp/$archive" -C "$tmp" 2>&1)" \
+    || die "Extraction failed: $archive" "$err"
   cp "$tmp"/cssh-mcp-* "$INSTALL_DIR/cssh-mcp"
   cp "$tmp"/csshctl-* "$INSTALL_DIR/csshctl"
   chmod +x "$INSTALL_DIR/cssh-mcp" "$INSTALL_DIR/csshctl"
   cleanup_path "$tmp"
-  info "Installed binaries to $INSTALL_DIR"
+  ok "Installed to $(tildify "$INSTALL_DIR")/"
 }
 
-install_user_mode() {
-  install_from_release
-}
+# ── Post-install ─────────────────────────────────────
 
 inject_path() {
   local rc_file
   rc_file="$(detect_rc_file)"
-
   if grep -qF "$MARKER" "$rc_file" 2>/dev/null; then
-    info "PATH already configured in $rc_file"
+    skip "PATH already in $(tildify "$rc_file")"
   else
     printf '\nexport PATH="%s:$PATH" %s\n' "$INSTALL_DIR" "$MARKER" >> "$rc_file"
-    info "Added PATH entry to $rc_file"
+    ok "PATH added to $(tildify "$rc_file")"
   fi
-
-  # Refresh current session
   export PATH="$INSTALL_DIR:$PATH"
 }
 
 register_mcp() {
   if ! command -v claude &>/dev/null; then
-    warn "Claude Code CLI not found. Register MCP manually:"
-    warn "  claude mcp add --transport stdio --scope user cssh -- $INSTALL_DIR/cssh-mcp"
+    warn_step "Claude CLI not found — register manually:"
+    hint "claude mcp add --transport stdio --scope user cssh -- $INSTALL_DIR/cssh-mcp"
     return
   fi
-
-  info "Registering cssh as MCP server..."
-  claude mcp add --transport stdio --scope user cssh -- "$INSTALL_DIR/cssh-mcp" || true
-
+  local mcp_out
+  mcp_out="$(claude mcp add --transport stdio --scope user cssh -- "$INSTALL_DIR/cssh-mcp" 2>&1 | strip_ansi)" || true
+  if [ -n "$mcp_out" ]; then
+    hint "$mcp_out"
+  fi
   if claude mcp list 2>/dev/null | grep -q cssh; then
-    info "MCP registration verified"
+    ok "MCP server registered"
   else
-    warn "MCP registration may need manual verification: claude mcp list"
+    warn_step "MCP registration may need verification: claude mcp list"
   fi
 }
 
@@ -239,14 +257,13 @@ CSSH_TOOLS=(
 
 inject_permissions() {
   if ! command -v jq &>/dev/null; then
-    warn "jq not found — skipping permission setup"
-    warn "You can manually allow cssh tools in ~/.claude/settings.json"
+    warn_step "jq not found — approve tools manually in ~/.claude/settings.json"
     return
   fi
   mkdir -p "$(dirname "$SETTINGS_FILE")"
   [ -f "$SETTINGS_FILE" ] || echo '{}' > "$SETTINGS_FILE"
   if ! jq empty "$SETTINGS_FILE" 2>/dev/null; then
-    warn "$SETTINGS_FILE is not valid JSON — skipping permission injection"
+    warn_step "settings.json is not valid JSON — skipping permission setup"
     return
   fi
   if ! jq -e '
@@ -255,8 +272,8 @@ inject_permissions() {
     elif .permissions.allow? == null then true
     else (.permissions.allow | type) == "array"
     end
-  ' "$SETTINGS_FILE" >/dev/null; then
-    warn "$SETTINGS_FILE has unexpected permissions.allow format — skipping permission injection"
+  ' "$SETTINGS_FILE" >/dev/null 2>&1; then
+    warn_step "Unexpected settings format — skipping permission setup"
     return
   fi
   local tools_json
@@ -271,43 +288,64 @@ inject_permissions() {
   ' "$SETTINGS_FILE" > "$tmp"; then
     mv "$tmp" "$SETTINGS_FILE"
     clear_cleanup_trap
-    info "Auto-approved ${#CSSH_TOOLS[@]} cssh tools in Claude Code settings"
+    ok "${#CSSH_TOOLS[@]} tools auto-approved"
   else
     cleanup_path "$tmp"
-    warn "Failed to update $SETTINGS_FILE — skipping permission injection"
+    warn_step "Failed to update settings — approve tools manually"
   fi
 }
 
 verify() {
   if "$INSTALL_DIR/csshctl" --help &>/dev/null; then
-    info "csshctl is working"
+    ok "csshctl verified"
   else
-    warn "csshctl verification failed — check $INSTALL_DIR/csshctl"
+    warn_step "csshctl verification failed — check $INSTALL_DIR/csshctl"
   fi
 }
 
+# ── Main ─────────────────────────────────────────────
+
 main() {
-  info "Installing cssh..."
+  header
+
   local mode
   mode="$(detect_mode)"
 
+  local plat_os plat_arch
+  plat_os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  plat_arch="$(uname -m)"
+  case "$plat_arch" in
+    x86_64|amd64) plat_arch="amd64" ;;
+    arm64|aarch64) plat_arch="arm64" ;;
+  esac
+
   if [ "$mode" = "dev" ]; then
-    info "Developer mode (building from local source)"
+    meta "Platform" "$plat_os · $plat_arch"
+    meta "Source" "local build"
+    printf '\n'
     build_local
   else
-    info "User mode (installing latest release binary)"
-    install_user_mode
+    meta "Platform" "$plat_os · $plat_arch"
+    meta "Source" "release binary"
+    printf '\n'
+    case "$plat_arch" in
+      amd64|arm64) ;;
+      *) die "Unsupported architecture: $plat_arch" ;;
+    esac
+    case "$plat_os" in
+      darwin|linux) ;;
+      *) die "Unsupported OS: $plat_os" ;;
+    esac
+    OS="$plat_os"
+    ARCH="$plat_arch"
+    install_from_release
   fi
 
   inject_path
   register_mcp
   inject_permissions
   verify
-
-  echo ""
-  info "Installation complete!"
-  info "Binaries: $INSTALL_DIR/cssh-mcp, $INSTALL_DIR/csshctl"
-  info "Open Claude Code and say: \"Help me connect to my SSH server\""
+  footer
 }
 
 main "$@"

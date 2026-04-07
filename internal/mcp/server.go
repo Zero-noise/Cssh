@@ -586,6 +586,14 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 				parsed := app.ParseStringSliceAny(v)
 				editAllowedLocal = &parsed
 			}
+			var editSSHOptions *map[string]string
+			if _, ok := args["ssh_options"]; ok {
+				parsed := app.ParseStringMapAny(args["ssh_options"])
+				if parsed == nil {
+					parsed = map[string]string{}
+				}
+				editSSHOptions = &parsed
+			}
 			in := app.QuickSetupEditInput{
 				ProfileID:         profileID,
 				ProfileName:       stringPtrArg(args, "profile_name"),
@@ -600,6 +608,8 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 				SecurityProfile:   stringPtrArg(args, "security_profile"),
 				AllowRootUser:     boolPtrArg(args, "allow_root_user"),
 				GrantTTLSec:       intPtrArg(args, "grant_ttl_sec"),
+				Shell:             stringPtrArg(args, "shell"),
+				SSHOptions:        editSSHOptions,
 			}
 			return s.svc.QuickSetupEdit(in)
 		case "save":
@@ -641,6 +651,8 @@ func (s *Server) callCanonicalTool(name string, args map[string]any) (map[string
 				SecurityProfile:   stringArg(args, "security_profile"),
 				AllowRootUser:     app.ParseBoolAny(args["allow_root_user"], false),
 				GrantTTLSec:       app.ParseIntAny(args["grant_ttl_sec"], 0),
+				SSHOptions:        app.ParseStringMapAny(args["ssh_options"]),
+				Shell:             stringArg(args, "shell"),
 			}
 			return s.svc.QuickSetupSave(in)
 		default:
@@ -1075,37 +1087,37 @@ func toolDefs(ctlPath string) []map[string]any {
 				"Workflow: ssh_profile_setup(step=save) -> ssh_key_setup (if key auth) -> ssh_credentials_prompt (if needed) -> ssh_connect -> ssh_exec. "+
 				"Optional limit_dir narrows runtime access to a specific subdirectory.",
 			connectSchema(),
-			mutatingAnnotations("Connect to SSH Host", true),
+			mutatingAnnotations("Connect", true),
 		),
 		tool(
 			"ssh_open_session",
 			"Create a reusable shell session bound to an existing connection_id. Optional cwd/shell let later ssh_exec calls reuse context.",
 			reqSchema([]string{"connection_id"}, "connection_id", "cwd", "shell"),
-			mutatingAnnotations("Open Shell Session", false),
+			mutatingAnnotations("Open Session", false),
 		),
 		tool(
 			"ssh_exec",
 			"Run a command on remote host. Requires connection_id and command. Optional session_id/cwd/timeout_sec. Catastrophic commands (rm -rf /, fork bombs) are hard-denied. Dangerous commands (mkfs, shutdown) return approval_required. When approval_required is returned, the user must run `"+ctlPath+" approve <id>` in a separate terminal, then retry with approval_token.",
 			reqSchema([]string{"connection_id", "command"}, "connection_id", "command", "session_id", "cwd", "timeout_sec", "approval_token"),
-			mutatingAnnotations("Execute Remote Command", true),
+			mutatingAnnotations("Exec", true),
 		),
 		tool(
 			"ssh_connection_status",
 			"Inspect SSH connection health. Optional connection_id targets one connection; without it returns all active in-memory connections. Optional timeout_sec controls health-check timeout.",
 			reqSchema(nil, "connection_id", "timeout_sec"),
-			readOnlyAnnotations("Check Connection Health", false),
+			readOnlyAnnotations("Connection Status", false),
 		),
 		tool(
 			"ssh_privilege",
 			"Manage privilege grants. action=status (default) inspects grants, optional connection_id narrows scope, active_only defaults true. action=revoke revokes a grant immediately by grant_id.",
 			privilegeSchema(),
-			mutatingAnnotations("Manage Privilege Grants", false),
+			mutatingAnnotations("Privileges", false),
 		),
 		tool(
 			"ssh_transfer",
 			"Transfer files or directories using scp client with existing connection_id (remote_path is workspace_roots guarded). Modern OpenSSH uses SFTP mode by default; Cssh retries legacy SCP when SFTP subsystem is unavailable. direction=upload(local->remote) or download(remote->local). Requires direction/connection_id/local_path/remote_path. Optional mode(create|overwrite), create_parents, verify_checksum, timeout_sec, allow_local_anywhere, approval_token. Set recursive=true for directory transfers. Set resume=true only for single-file overwrite transfers when both local and remote have rsync; otherwise retry without resume=true. Local path access: paths within cwd and the profile's allowed_local_paths (e.g. /tmp) are auto-allowed; paths outside both require allow_local_anywhere=true which triggers L2 approval showing the exact local and remote paths.",
 			transferSchema(),
-			destructiveAnnotations("Transfer File via SCP", true),
+			destructiveAnnotations("Transfer", true),
 		),
 		tool(
 			"ssh_read_file",
@@ -1113,31 +1125,31 @@ func toolDefs(ctlPath string) []map[string]any {
 				"Use offset/limit for partial reads. Binary files return metadata only — use ssh_transfer to download. "+
 				"Symlinks resolved and checked against workspace_roots.",
 			readFileSchema(),
-			readOnlyAnnotations("Read Remote File", true),
+			readOnlyAnnotations("Read File", true),
 		),
 		tool(
 			"ssh_write_file",
 			"Write remote file content inside workspace_roots (max 5 MB; use ssh_transfer for larger files). mode: create fails if exists, overwrite atomically replaces, append creates or appends. Default: overwrite.",
 			reqSchema([]string{"connection_id", "path", "content"}, "connection_id", "path", "content", "mode", "cwd"),
-			destructiveAnnotations("Write Remote File", true),
+			destructiveAnnotations("Write File", true),
 		),
 		tool(
 			"ssh_apply_patch",
 			"Apply unified patch via patch(1) on remote host (workspace_roots guarded). Requires connection_id + patch_unified; base_dir defaults to '/'. Uses --batch --fuzz=0 for strict, non-interactive patching. Set dry_run=true to validate without modifying files. strip controls leading path component removal (patch -pN): 0 (default) for absolute/relative paths, 1 for standard git diff with a/ b/ prefixes.",
 			reqSchema([]string{"connection_id", "patch_unified"}, "connection_id", "patch_unified", "base_dir", "dry_run", "strip"),
-			destructiveAnnotations("Apply Patch on Remote", true),
+			destructiveAnnotations("Apply Patch", true),
 		),
 		tool(
 			"ssh_disconnect",
 			"Close an SSH connection and attached sessions. Requires connection_id.",
 			reqSchema([]string{"connection_id"}, "connection_id"),
-			annotations("Disconnect SSH", false, true, true, false),
+			annotations("Disconnect", false, true, true, false),
 		),
 		tool(
 			"ssh_profile",
 			"Unified profile operations. action=list returns saved SSH profiles. action=delete deletes one profile by profile_id using confirmation token flow (first call returns confirm_required + confirm_token; second call includes confirm_token). Optional delete_secrets (default true) also removes password/key_passphrase/sudo_password from keychain.",
 			profileSchema(),
-			mutatingAnnotations("Manage SSH Profiles", false),
+			mutatingAnnotations("Profiles", false),
 		),
 		tool(
 			"ssh_cnote",
@@ -1147,7 +1159,7 @@ func toolDefs(ctlPath string) []map[string]any {
 				"The Cnote is automatically returned in ssh_connect responses; you do not need to call get after connecting. "+
 				"Use profile_id when possible; profile_name is supported if unique.",
 			cnoteSchema(),
-			mutatingAnnotations("Manage Connection Notes", false),
+			mutatingAnnotations("Cnote", false),
 		),
 		tool(
 			"ssh_profile_setup",
@@ -1155,13 +1167,13 @@ func toolDefs(ctlPath string) []map[string]any {
 				"step=edit modifies existing profile fields (provide profile_id + fields to change; auth_priority overrides auth_mode if both given). "+
 				"For save step, provide purpose/host/username plus optional profile/workspace/auth/security fields. After save, call ssh_credentials_prompt for credential entry.",
 			profileSetupSchema(),
-			mutatingAnnotations("Setup SSH Profile", false),
+			mutatingAnnotations("Profile Setup", false),
 		),
 		tool(
 			"ssh_credentials_prompt",
 			"Open a secure local web form for the user to enter SSH credentials directly into the OS keychain. Credentials NEVER pass through AI. Default path is web prompt. If web is unavailable, tool returns manual `"+ctlPath+" secret set-*` commands with profile_id. Call this AFTER ssh_profile_setup(step=save) when auth requires password or key passphrase. For sudo, set fields=[\"sudo_password\"].",
 			credentialPromptSchema(),
-			mutatingAnnotations("Enter SSH Credentials", false),
+			mutatingAnnotations("Credentials", false),
 		),
 		tool(
 			"ssh_key_setup",
@@ -1170,7 +1182,7 @@ func toolDefs(ctlPath string) []map[string]any {
 				"AI never sees keys or passphrases. Use after profile creation when auth includes key, "+
 				"or when KEY_PASSPHRASE_REQUIRED / KEY_NOT_FOUND errors occur.",
 			keySetupSchema(),
-			mutatingAnnotations("Setup SSH Key", false),
+			mutatingAnnotations("Key Setup", false),
 		),
 	}
 }
@@ -1292,7 +1304,16 @@ func cnoteSchema() map[string]any {
 }
 
 func profileSetupSchema() map[string]any {
-	return reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "auth_priority", "workspace_roots", "workspace_root", "allowed_local_paths", "key_path", "security_profile", "allow_root_user", "grant_ttl_sec")
+	s := reqSchema(nil, "step", "purpose", "profile_id", "profile_name", "host", "port", "username", "auth_mode", "auth_priority", "workspace_roots", "workspace_root", "allowed_local_paths", "key_path", "security_profile", "allow_root_user", "grant_ttl_sec", "shell", "ssh_options")
+	// Override shell description for profile context (differs from session context).
+	props := s["properties"].(map[string]any)
+	props["shell"] = map[string]any{"type": "string", "description": "Remote shell prefix saved to profile. Auto-detected on first connect. Set \"auto\" to clear and re-detect on next connect. Accepted values: \"bash -lc\", \"sh -c\", \"__raw__\" (no wrapper), \"auto\"."}
+	props["ssh_options"] = map[string]any{
+		"type":                 "object",
+		"description":          "Custom SSH -o flags (whitelist only). Allowed keys: HostKeyAlgorithms, PubkeyAcceptedKeyTypes, PubkeyAcceptedAlgorithms, KexAlgorithms, Ciphers, MACs, HostbasedAcceptedAlgorithms, CASignatureAlgorithms, FingerprintHash, Compression, IPQoS, AddressFamily, RekeyLimit. Example: {\"HostKeyAlgorithms\": \"+ssh-rsa\"}. Pass {} to clear.",
+		"additionalProperties": map[string]any{"type": "string"},
+	}
+	return s
 }
 
 func keySetupSchema() map[string]any {
@@ -1368,7 +1389,7 @@ func paramSchema(key string) map[string]any {
 	case "cwd":
 		return map[string]any{"type": "string", "description": "Working directory for command execution. Validated against workspace_roots for write commands."}
 	case "shell":
-		return map[string]any{"type": "string", "description": "Shell wrapper, e.g. 'bash -lc'."}
+		return map[string]any{"type": "string", "description": "Shell prefix for command wrapping in this session. Defaults to the connection's detected shell. Examples: \"bash -lc\", \"sh -c\". Use \"__raw__\" for no wrapper."}
 	case "timeout_sec":
 		return map[string]any{"type": "integer", "description": "Execution timeout in seconds."}
 	case "approval_token":

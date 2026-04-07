@@ -533,3 +533,178 @@ func TestShutdown_SetsIntentionalFlag(t *testing.T) {
 		t.Fatal("masters should be empty after shutdown")
 	}
 }
+
+func TestValidateSSHOptions_AllowedKeys(t *testing.T) {
+	err := ValidateSSHOptions(map[string]string{
+		"HostKeyAlgorithms": "+ssh-rsa",
+		"Ciphers":           "aes128-ctr,aes256-ctr",
+	})
+	if err != nil {
+		t.Fatalf("expected no error for allowed keys, got: %v", err)
+	}
+}
+
+func TestValidateSSHOptions_ProxyCommandRejected(t *testing.T) {
+	err := ValidateSSHOptions(map[string]string{
+		"ProxyCommand": "nc %h %p",
+	})
+	if err == nil {
+		t.Fatal("expected error for ProxyCommand")
+	}
+	if !strings.Contains(err.Error(), "ProxyCommand") {
+		t.Fatalf("error should mention ProxyCommand: %v", err)
+	}
+}
+
+func TestValidateSSHOptions_DangerousKeysRejected(t *testing.T) {
+	dangerous := []string{
+		"LocalCommand", "PermitLocalCommand", "ProxyJump",
+		"PKCS11Provider", "LocalForward", "RemoteForward",
+		"Include", "SendEnv", "UserKnownHostsFile",
+	}
+	for _, key := range dangerous {
+		err := ValidateSSHOptions(map[string]string{key: "anything"})
+		if err == nil {
+			t.Errorf("expected error for dangerous key %q", key)
+		}
+	}
+}
+
+func TestValidateSSHOptions_SpaceInValueAllowed(t *testing.T) {
+	err := ValidateSSHOptions(map[string]string{
+		"RekeyLimit": "1G 1h",
+	})
+	if err != nil {
+		t.Fatalf("space in RekeyLimit value should be allowed, got: %v", err)
+	}
+
+	err = ValidateSSHOptions(map[string]string{
+		"IPQoS": "af21 cs1",
+	})
+	if err != nil {
+		t.Fatalf("space in IPQoS value should be allowed, got: %v", err)
+	}
+}
+
+func TestValidateSSHOptions_NewlineRejected(t *testing.T) {
+	err := ValidateSSHOptions(map[string]string{
+		"Ciphers": "aes128-ctr\nevil",
+	})
+	if err == nil {
+		t.Fatal("newline in value should be rejected")
+	}
+}
+
+func TestValidateSSHOptions_NilAndEmpty(t *testing.T) {
+	if err := ValidateSSHOptions(nil); err != nil {
+		t.Fatalf("nil should pass: %v", err)
+	}
+	if err := ValidateSSHOptions(map[string]string{}); err != nil {
+		t.Fatalf("empty should pass: %v", err)
+	}
+}
+
+func TestAppendSSHOptions_SortsAllowed(t *testing.T) {
+	opts := map[string]string{
+		"KexAlgorithms":     "+diffie-hellman-group14-sha1",
+		"Ciphers":           "aes128-ctr",
+		"HostKeyAlgorithms": "+ssh-rsa",
+	}
+	args, err := appendSSHOptions([]string{"ssh"}, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expected := []string{
+		"ssh",
+		"-o", "Ciphers=aes128-ctr",
+		"-o", "HostKeyAlgorithms=+ssh-rsa",
+		"-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+	}
+	if len(args) != len(expected) {
+		t.Fatalf("args length mismatch: got %d, want %d\ngot: %v", len(args), len(expected), args)
+	}
+	for i, want := range expected {
+		if args[i] != want {
+			t.Errorf("args[%d] = %q, want %q", i, args[i], want)
+		}
+	}
+}
+
+func TestAppendSSHOptions_RejectsDisallowed(t *testing.T) {
+	opts := map[string]string{
+		"Ciphers":      "aes128-ctr",
+		"ProxyCommand": "evil",
+	}
+	_, err := appendSSHOptions([]string{"ssh"}, opts)
+	if err == nil {
+		t.Fatal("expected error for disallowed key ProxyCommand")
+	}
+	if !strings.Contains(err.Error(), "ProxyCommand") {
+		t.Fatalf("error should mention ProxyCommand: %v", err)
+	}
+}
+
+func TestAppendSSHOptions_StableOrder(t *testing.T) {
+	opts := map[string]string{
+		"MACs":          "hmac-sha2-256",
+		"Ciphers":       "aes256-ctr",
+		"KexAlgorithms": "curve25519-sha256",
+	}
+	first, err := appendSSHOptions(nil, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		again, err := appendSSHOptions(nil, opts)
+		if err != nil {
+			t.Fatalf("unexpected error on iteration %d: %v", i, err)
+		}
+		if len(again) != len(first) {
+			t.Fatalf("unstable length on iteration %d", i)
+		}
+		for j := range first {
+			if again[j] != first[j] {
+				t.Fatalf("unstable order on iteration %d: %v vs %v", i, first, again)
+			}
+		}
+	}
+}
+
+func TestFormatSSHOptionsForRsh_QuotesSpaces(t *testing.T) {
+	opts := map[string]string{
+		"RekeyLimit": "1G 1h",
+		"Ciphers":    "aes128-ctr",
+	}
+	got, err := formatSSHOptionsForRsh(opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Ciphers comes first (sorted), RekeyLimit second.
+	// RekeyLimit value contains a space → must be single-quoted.
+	if !strings.Contains(got, "Ciphers=") {
+		t.Fatalf("missing Ciphers in output: %s", got)
+	}
+	if !strings.Contains(got, "RekeyLimit='1G 1h'") {
+		t.Fatalf("RekeyLimit value should be single-quoted: %s", got)
+	}
+	// Ciphers value has no space but is still quoted (that's fine).
+	if !strings.Contains(got, "Ciphers='aes128-ctr'") {
+		t.Fatalf("Ciphers value should be quoted: %s", got)
+	}
+}
+
+func TestFormatSSHOptionsForRsh_RejectsDisallowed(t *testing.T) {
+	opts := map[string]string{
+		"ProxyCommand":      "evil",
+		"HostKeyAlgorithms": "+ssh-rsa",
+	}
+	_, err := formatSSHOptionsForRsh(opts)
+	if err == nil {
+		t.Fatal("expected error for disallowed key ProxyCommand")
+	}
+	if !strings.Contains(err.Error(), "ProxyCommand") {
+		t.Fatalf("error should mention ProxyCommand: %v", err)
+	}
+}

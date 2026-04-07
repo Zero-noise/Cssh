@@ -519,3 +519,228 @@ func TestQuickSetupEditAllowedLocalPaths(t *testing.T) {
 		t.Fatalf("expected 1 path after edit, got %v", p.AllowedLocalPaths)
 	}
 }
+
+func TestQuickSetupEditShell(t *testing.T) {
+	svc := newTestService(t)
+	_, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "shell test",
+		Host:     "10.0.0.20",
+		Username: "ubuntu",
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	profileID := "shell-test-10-0-0-20"
+
+	// Initially shell is empty (undetected).
+	p, _ := svc.ProfileStore().Get(profileID)
+	if p.Shell != "" {
+		t.Fatalf("expected empty shell after save, got %q", p.Shell)
+	}
+
+	// Set valid shell value.
+	v := "sh -c"
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID: profileID,
+		Shell:     &v,
+	})
+	if err != nil {
+		t.Fatalf("edit sh -c: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.Shell != "sh -c" {
+		t.Fatalf("expected shell = %q, got %q", "sh -c", p.Shell)
+	}
+
+	// Set "auto" → clears to empty for re-detection.
+	v = "auto"
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID: profileID,
+		Shell:     &v,
+	})
+	if err != nil {
+		t.Fatalf("edit auto: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.Shell != "" {
+		t.Fatalf("expected empty shell after auto, got %q", p.Shell)
+	}
+
+	// Set __raw__.
+	v = "__raw__"
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID: profileID,
+		Shell:     &v,
+	})
+	if err != nil {
+		t.Fatalf("edit __raw__: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.Shell != "__raw__" {
+		t.Fatalf("expected shell = %q, got %q", "__raw__", p.Shell)
+	}
+
+	// Invalid value → rejected.
+	v = "zsh -c"
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID: profileID,
+		Shell:     &v,
+	})
+	if err == nil {
+		t.Fatal("expected error for invalid shell value")
+	}
+	if !strings.Contains(err.Error(), "invalid shell") {
+		t.Fatalf("expected 'invalid shell' error, got: %v", err)
+	}
+	// Shell should remain unchanged after failed edit.
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.Shell != "__raw__" {
+		t.Fatalf("shell should be unchanged after failed edit, got %q", p.Shell)
+	}
+
+	// nil Shell → no change.
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID: profileID,
+		Shell:     nil,
+	})
+	if err != nil {
+		t.Fatalf("edit nil: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.Shell != "__raw__" {
+		t.Fatalf("nil edit should preserve shell, got %q", p.Shell)
+	}
+}
+
+func TestQuickSetupSave_SSHOptionsValidation(t *testing.T) {
+	svc := newTestService(t)
+
+	// Allowed options pass.
+	_, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "legacy router",
+		Host:     "10.0.0.1",
+		Username: "admin",
+		SSHOptions: map[string]string{
+			"HostKeyAlgorithms": "+ssh-rsa",
+		},
+	})
+	if err != nil {
+		t.Fatalf("allowed ssh_options should pass: %v", err)
+	}
+
+	// ProxyCommand rejected.
+	_, err = svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "evil",
+		Host:     "10.0.0.2",
+		Username: "admin",
+		SSHOptions: map[string]string{
+			"ProxyCommand": "nc %h %p",
+		},
+	})
+	if err == nil {
+		t.Fatal("ProxyCommand should be rejected")
+	}
+	if !strings.Contains(err.Error(), "ProxyCommand") {
+		t.Fatalf("error should mention ProxyCommand: %v", err)
+	}
+
+	// Space in value allowed (RekeyLimit).
+	_, err = svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "rekey test",
+		Host:     "10.0.0.3",
+		Username: "admin",
+		SSHOptions: map[string]string{
+			"RekeyLimit": "1G 1h",
+		},
+	})
+	if err != nil {
+		t.Fatalf("space in RekeyLimit should be allowed: %v", err)
+	}
+}
+
+func TestQuickSetupEdit_SSHOptionsClearAndPreserve(t *testing.T) {
+	svc := newTestService(t)
+
+	// Create profile with ssh_options.
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "test opts",
+		Host:     "10.0.0.5",
+		Username: "ubuntu",
+		SSHOptions: map[string]string{
+			"Ciphers": "aes128-ctr",
+		},
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	profileID := out["profile_id"].(string)
+	p, _ := svc.ProfileStore().Get(profileID)
+	if len(p.SSHOptions) != 1 || p.SSHOptions["Ciphers"] != "aes128-ctr" {
+		t.Fatalf("initial ssh_options mismatch: %v", p.SSHOptions)
+	}
+
+	// nil SSHOptions → preserve.
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:  profileID,
+		SSHOptions: nil,
+	})
+	if err != nil {
+		t.Fatalf("edit nil: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if len(p.SSHOptions) != 1 {
+		t.Fatalf("nil edit should preserve ssh_options, got: %v", p.SSHOptions)
+	}
+
+	// Empty map → clear.
+	empty := map[string]string{}
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:  profileID,
+		SSHOptions: &empty,
+	})
+	if err != nil {
+		t.Fatalf("edit empty: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if len(p.SSHOptions) != 0 {
+		t.Fatalf("empty edit should clear ssh_options, got: %v", p.SSHOptions)
+	}
+
+	// Non-nil map → replace.
+	newOpts := map[string]string{"MACs": "hmac-sha2-256"}
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:  profileID,
+		SSHOptions: &newOpts,
+	})
+	if err != nil {
+		t.Fatalf("edit replace: %v", err)
+	}
+	p, _ = svc.ProfileStore().Get(profileID)
+	if p.SSHOptions["MACs"] != "hmac-sha2-256" {
+		t.Fatalf("replace should set new value, got: %v", p.SSHOptions)
+	}
+}
+
+func TestQuickSetupEdit_SSHOptionsValidation(t *testing.T) {
+	svc := newTestService(t)
+
+	out, err := svc.QuickSetupSave(QuickSetupInput{
+		Purpose:  "validate edit",
+		Host:     "10.0.0.6",
+		Username: "ubuntu",
+	})
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	profileID := out["profile_id"].(string)
+
+	// Disallowed key in edit → error.
+	bad := map[string]string{"LocalForward": "8080:localhost:80"}
+	_, err = svc.QuickSetupEdit(QuickSetupEditInput{
+		ProfileID:  profileID,
+		SSHOptions: &bad,
+	})
+	if err == nil {
+		t.Fatal("LocalForward should be rejected in edit")
+	}
+}

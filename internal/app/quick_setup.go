@@ -12,6 +12,7 @@ import (
 	"cssh/internal/errorsx"
 	"cssh/internal/model"
 	"cssh/internal/security"
+	"cssh/internal/sshbridge"
 	"cssh/internal/util"
 )
 
@@ -29,6 +30,8 @@ type QuickSetupInput struct {
 	SecurityProfile   string
 	AllowRootUser     bool
 	GrantTTLSec       int
+	SSHOptions        map[string]string // custom SSH -o flags, e.g. {"HostKeyAlgorithms": "+ssh-rsa"}
+	Shell             string            // optional shell override; "" = auto-detect on first connect
 }
 
 func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[string]any, error) {
@@ -70,6 +73,8 @@ func (s *Service) QuickSetupTemplate(purpose, authMode, username string) (map[st
 		{"name": "allow_root_user", "label": "Allow Root User", "type": "boolean", "required": false, "default": false},
 		{"name": "grant_ttl_sec", "label": "Grant TTL (seconds)", "type": "integer", "required": false, "default": 0,
 			"description": "Reusable grant lifetime. 0 = valid for entire connection (default). >0 = expires after N seconds."},
+		{"name": "ssh_options", "label": "Custom SSH Options", "type": "object", "required": false,
+			"description": "Custom SSH -o flags as key-value pairs, e.g. {\"HostKeyAlgorithms\": \"+ssh-rsa\"}. Applied to all SSH commands for this profile."},
 	}
 
 	resp := map[string]any{
@@ -134,6 +139,10 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		allowedLocal = normalized
 	}
 
+	if err := sshbridge.ValidateSSHOptions(in.SSHOptions); err != nil {
+		return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+	}
+
 	if authMode != "password" && strings.TrimSpace(in.KeyPath) == "" {
 		in.KeyPath = "~/.ssh/id_ed25519"
 	}
@@ -156,6 +165,18 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		authPriority = []string{"key", "password"}
 	}
 
+	var shell string
+	if v := strings.TrimSpace(in.Shell); v != "" {
+		if strings.EqualFold(v, "auto") {
+			shell = "" // auto-detect on first connect
+		} else if sshbridge.ValidShellValues[v] {
+			shell = v
+		} else {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				fmt.Sprintf("invalid shell value %q; supported: \"bash -lc\", \"sh -c\", \"__raw__\", \"auto\"", v))
+		}
+	}
+
 	profile := model.Profile{
 		ID:                profileID,
 		Name:              profileName,
@@ -170,6 +191,8 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		SecurityProfile:   effectiveSecurityProfile,
 		AllowRootUser:     in.AllowRootUser,
 		GrantTTLSec:       in.GrantTTLSec,
+		SSHOptions:        in.SSHOptions,
+		Shell:             shell,
 		ToolPolicyVersion: 2,
 	}
 	applyProfileSecurityDefaults(&profile)
@@ -209,6 +232,7 @@ func (s *Service) QuickSetupSave(in QuickSetupInput) (map[string]any, error) {
 		"workspace_roots":     profile.WorkspaceRoots,
 		"allowed_local_paths": profile.AllowedLocalPaths,
 		"security_profile":    profile.SecurityProfile,
+		"ssh_options":         profile.SSHOptions,
 		"secrets_saved":       secretsSaved,
 		"warnings":            warnings,
 		"connect_hint": map[string]any{
@@ -262,6 +286,8 @@ type QuickSetupEditInput struct {
 	SecurityProfile   *string
 	AllowRootUser     *bool
 	GrantTTLSec       *int
+	Shell             *string              // nil = not provided; "auto" clears saved value to trigger re-detection
+	SSHOptions        *map[string]string   // nil = not provided; &map{} = clear; &map{...} = replace
 }
 
 func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error) {
@@ -334,6 +360,24 @@ func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error)
 		}
 	}
 
+	if in.Shell != nil {
+		v := strings.TrimSpace(*in.Shell)
+		if strings.EqualFold(v, "auto") || v == "" {
+			p.Shell = "" // clear → triggers re-detection on next connect
+		} else if sshbridge.ValidShellValues[v] {
+			p.Shell = v
+		} else {
+			return nil, errorsx.New(errorsx.CodeInvalidParams,
+				fmt.Sprintf("invalid shell value %q; supported: \"bash -lc\", \"sh -c\", \"__raw__\", \"auto\"", v))
+		}
+	}
+	if in.SSHOptions != nil {
+		if err := sshbridge.ValidateSSHOptions(*in.SSHOptions); err != nil {
+			return nil, errorsx.New(errorsx.CodeInvalidParams, err.Error())
+		}
+		p.SSHOptions = *in.SSHOptions
+	}
+
 	applyProfileSecurityDefaults(p)
 	if err := s.profiles.Upsert(*p); err != nil {
 		return nil, err
@@ -353,6 +397,8 @@ func (s *Service) QuickSetupEdit(in QuickSetupEditInput) (map[string]any, error)
 		"security_profile":   p.SecurityProfile,
 		"allow_root_user":    p.AllowRootUser,
 		"grant_ttl_sec":      p.GrantTTLSec,
+		"shell":              p.Shell,
+		"ssh_options":        p.SSHOptions,
 	}
 
 	_ = s.audit.Write(model.AuditEvent{
@@ -403,6 +449,8 @@ func (s *Service) ProfilesList() (map[string]any, error) {
 			"allow_reboot":        p.AllowReboot,
 			"allow_disk_ops":      p.AllowDiskOps,
 			"deny_patterns":       p.DenyPatterns,
+			"shell":               p.Shell,
+			"ssh_options":         p.SSHOptions,
 			"has_cnote":           strings.TrimSpace(content) != "",
 			"cnote_preview":       cnotePreview(content),
 		})

@@ -170,9 +170,17 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		return nil, errorsx.New(errorsx.CodeInvalidParams, "public host denied by global policy; set allow_public_host=true in config or use VPN/Tailscale address")
 	}
 
+	profileShellBefore := connModel.Shell
 	conn, err := s.ssh.Connect(connModel)
 	if err != nil {
 		return nil, err
+	}
+	// Persist newly-detected shell back to profile (silent, best-effort).
+	if conn.Shell != "" && conn.Shell != profileShellBefore && strings.TrimSpace(conn.ProfileID) != "" {
+		if p, pErr := s.profiles.Get(conn.ProfileID); pErr == nil && p != nil {
+			p.Shell = conn.Shell
+			_ = s.profiles.Upsert(*p)
+		}
 	}
 	_ = s.audit.Write(model.AuditEvent{
 		Timestamp:       time.Now().UTC(),
@@ -188,6 +196,7 @@ func (s *Service) Connect(input model.ConnectionInput) (map[string]any, error) {
 		"capabilities":     []string{"exec", "file_read", "file_write", "file_transfer", "search", "patch", "tail"},
 		"workspace_roots":  conn.WorkspaceRoots,
 		"security_profile": conn.SecurityProfile,
+		"detected_shell":   conn.Shell,
 	}
 	if strings.TrimSpace(conn.ProfileID) != "" {
 		resp["cnote_path"] = conn.CnotePath
@@ -2447,6 +2456,8 @@ func (s *Service) resolveConnectionInput(input model.ConnectionInput) (model.Con
 		GrantTTLSec:       p.GrantTTLSec,
 		CnotePath:         cnotePath,
 		Cnote:             cnote,
+		Shell:             p.Shell,
+		SSHOptions:        p.SSHOptions,
 	}, nil
 }
 
@@ -2576,6 +2587,29 @@ func ParseStringSliceAny(v any) []string {
 		if ok && s != "" {
 			out = append(out, s)
 		}
+	}
+	return out
+}
+
+// ParseStringMapAny converts a JSON-decoded map to map[string]string.
+// Returns nil if v is nil or not a map.
+func ParseStringMapAny(v any) map[string]string {
+	if v == nil {
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, val := range m {
+		s, ok := val.(string)
+		if ok {
+			out[k] = s
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }

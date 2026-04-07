@@ -28,6 +28,8 @@ type Profile struct {
 	DenyPatterns      []string `json:"deny_patterns,omitempty"`
 	AllowedLocalPaths []string `json:"allowed_local_paths,omitempty"`
 	GrantTTLSec       int      `json:"grant_ttl_sec,omitempty"` // 0 = session-scoped (default), >0 = TTL in seconds
+	Shell             string            `json:"shell,omitempty"`         // detected/manual shell prefix; "" = undetected, "__raw__" = no wrapper, "auto" = re-detect on next connect
+	SSHOptions        map[string]string `json:"ssh_options,omitempty"`   // custom SSH -o flags, e.g. {"HostKeyAlgorithms": "+ssh-rsa"}
 }
 
 type Config struct {
@@ -71,6 +73,8 @@ type Connection struct {
 	GrantTTLSec       int
 	CnotePath         string
 	Cnote           string
+	Shell           string // shell prefix for command wrapping; "" = use default, "__raw__" = no wrapper
+	SSHOptions      map[string]string
 	ControlPath     string
 	AuthMethod      string
 	Generation      uint64

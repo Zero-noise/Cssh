@@ -4,12 +4,24 @@ set -euo pipefail
 INSTALL_DIR="$HOME/.csbridge/bin"
 MARKER="# cssh-path-inject"
 
-info()  { printf '\033[1;34m[cssh]\033[0m %s\n' "$*"; }
-warn()  { printf '\033[1;33m[cssh]\033[0m %s\n' "$*"; }
+# ── Output ────────────────────────────────────────────
 
-clear_cleanup_trap() {
-  trap - EXIT
-}
+if [ -t 1 ] && [ "${NO_COLOR:-}" = "" ]; then
+  CYAN='\033[1;36m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[0;33m'
+  DIM='\033[0;90m'
+  RESET='\033[0m'
+else
+  CYAN='' GREEN='' YELLOW='' DIM='' RESET=''
+fi
+
+header()    { printf '\n  %b◆ cssh · uninstall%b\n\n' "$CYAN" "$RESET"; }
+ok()        { printf '    %b✓%b  %s\n' "$GREEN" "$RESET" "$*"; }
+skip()      { printf '    %b·%b  %s\n' "$DIM" "$RESET" "$*"; }
+warn_step() { printf '    %b⚠%b  %s\n' "$YELLOW" "$RESET" "$*"; }
+
+# ── Helpers ───────────────────────────────────────────
 
 set_cleanup_trap() {
   local target="$1"
@@ -18,18 +30,21 @@ set_cleanup_trap() {
   trap "$cleanup_cmd" EXIT
 }
 
+clear_cleanup_trap() { trap - EXIT; }
+
 cleanup_path() {
-  local target="$1"
-  rm -rf -- "$target"
+  rm -rf -- "$1"
   clear_cleanup_trap
 }
+
+# ── Steps ─────────────────────────────────────────────
 
 remove_binaries() {
   if [ -d "$INSTALL_DIR" ]; then
     rm -rf "$INSTALL_DIR"
-    info "Removed $INSTALL_DIR"
+    ok "Removed ~/.csbridge/bin/"
   else
-    info "No binaries found at $INSTALL_DIR"
+    skip "No binaries at ~/.csbridge/bin/"
   fi
 }
 
@@ -43,26 +58,24 @@ remove_path_injection() {
     "$HOME/.profile" \
     "$HOME/.bashrc"; do
     if [ -f "$rc_file" ] && grep -qF "$MARKER" "$rc_file" 2>/dev/null; then
-      # Remove lines containing the marker
-      local tmp
-      local status
+      local tmp status
       tmp="$(mktemp)"
       set_cleanup_trap "$tmp"
       status=0
       grep -vF "$MARKER" "$rc_file" > "$tmp" || status=$?
       if [ "$status" -gt 1 ]; then
         cleanup_path "$tmp"
-        warn "Failed to update $rc_file while removing PATH entry"
+        warn_step "Failed to update $rc_file"
         continue
       fi
       mv "$tmp" "$rc_file"
       clear_cleanup_trap
-      info "Removed PATH entry from $rc_file"
+      ok "Removed PATH from ${rc_file/#$HOME/~}"
       removed=true
     fi
   done
   if [ "$removed" = false ]; then
-    info "No PATH injection found in shell RC files"
+    skip "No PATH injection found"
   fi
 }
 
@@ -70,21 +83,27 @@ unregister_mcp() {
   if command -v claude &>/dev/null; then
     if claude mcp list 2>/dev/null | grep -q cssh; then
       claude mcp remove cssh || true
-      info "Removed cssh from MCP servers"
+      ok "Unregistered MCP server"
     else
-      info "cssh not registered as MCP server"
+      skip "MCP server not registered"
     fi
   else
-    info "Claude Code CLI not found — skip MCP unregister"
+    skip "Claude CLI not found"
   fi
 }
 
 remove_permissions() {
   local settings_file="$HOME/.claude/settings.json"
-  [ -f "$settings_file" ] || return
-  command -v jq &>/dev/null || { warn "jq not found — cannot clean permissions"; return; }
+  if [ ! -f "$settings_file" ]; then
+    skip "No settings file found"
+    return
+  fi
+  if ! command -v jq &>/dev/null; then
+    warn_step "jq not found — clean permissions manually in ~/.claude/settings.json"
+    return
+  fi
   if ! jq empty "$settings_file" 2>/dev/null; then
-    warn "$settings_file is not valid JSON — skipping permission cleanup"
+    warn_step "settings.json is not valid JSON — skipping"
     return
   fi
   if ! jq -e '
@@ -94,7 +113,7 @@ remove_permissions() {
     else (.permissions.allow | type) == "array"
     end
   ' "$settings_file" >/dev/null; then
-    warn "$settings_file has unexpected permissions.allow format — skipping permission cleanup"
+    warn_step "Unexpected settings format — skipping"
     return
   fi
   local tmp
@@ -109,21 +128,22 @@ remove_permissions() {
   ' "$settings_file" > "$tmp"; then
     mv "$tmp" "$settings_file"
     clear_cleanup_trap
-    info "Removed cssh permissions from Claude Code settings"
+    ok "Removed permissions from settings.json"
   else
     cleanup_path "$tmp"
-    warn "Failed to update $settings_file — skipping permission cleanup"
+    warn_step "Failed to update settings.json"
   fi
 }
 
+# ── Main ─────────────────────────────────────────────
+
 main() {
-  info "Uninstalling cssh..."
+  header
   remove_binaries
   remove_path_injection
   unregister_mcp
   remove_permissions
-  echo ""
-  info "Uninstall complete!"
+  printf '\n  Uninstalled.\n\n'
 }
 
 main "$@"

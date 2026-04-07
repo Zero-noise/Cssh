@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,102 @@ type Manager struct {
 	wg          sync.WaitGroup
 }
 
+// AllowedSSHOptions is the whitelist of SSH -o options that users may set.
+// Only algorithm negotiation and safe connection tuning options are permitted.
+var AllowedSSHOptions = map[string]bool{
+	"hostkeyalgorithms":           true,
+	"pubkeyacceptedkeytypes":      true,
+	"pubkeyacceptedalgorithms":    true,
+	"kexalgorithms":               true,
+	"ciphers":                     true,
+	"macs":                        true,
+	"hostbasedacceptedalgorithms": true,
+	"casignaturealgorithms":       true,
+	"fingerprinthash":             true,
+	"compression":                 true,
+	"ipqos":                       true,
+	"addressfamily":               true,
+	"rekeylimit":                  true,
+}
+
+// ValidateSSHOptions checks every key against the whitelist and rejects
+// values containing newlines or null bytes. It is called at profile
+// save/edit time so errors surface early.
+func ValidateSSHOptions(opts map[string]string) error {
+	if len(opts) == 0 {
+		return nil
+	}
+	var bad []string
+	for k, v := range opts {
+		if !AllowedSSHOptions[strings.ToLower(k)] {
+			bad = append(bad, k)
+		}
+		if strings.ContainsAny(v, "\n\r\x00") {
+			return fmt.Errorf("ssh_options value for %q contains illegal characters", k)
+		}
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		allowed := sortedAllowedKeys()
+		return fmt.Errorf("ssh_options keys not allowed: %s; allowed keys: %s",
+			strings.Join(bad, ", "), strings.Join(allowed, ", "))
+	}
+	return nil
+}
+
+func sortedAllowedKeys() []string {
+	out := make([]string, 0, len(AllowedSSHOptions))
+	for k := range AllowedSSHOptions {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// sortedKeys returns the keys of a map in sorted order for deterministic output.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// appendSSHOptions appends user-defined -o flags to an args slice.
+// Returns an error if any key is not in AllowedSSHOptions (fail-fast for
+// hand-edited profiles or stale data that bypassed save/edit validation).
+// Output order is sorted by key for deterministic args.
+func appendSSHOptions(args []string, opts map[string]string) ([]string, error) {
+	if err := ValidateSSHOptions(opts); err != nil {
+		return nil, err
+	}
+	for _, k := range sortedKeys(opts) {
+		args = append(args, "-o", k+"="+opts[k])
+	}
+	return args, nil
+}
+
+// shellQuote wraps s in single quotes, escaping any embedded single quotes.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+// formatSSHOptionsForRsh formats user-defined options as a string suitable
+// for embedding in rsync -e / --rsh flags. Values are shell-quoted to
+// prevent argument splitting on spaces. Returns an error if any key is not
+// in AllowedSSHOptions. Output order is sorted by key.
+func formatSSHOptionsForRsh(opts map[string]string) (string, error) {
+	if err := ValidateSSHOptions(opts); err != nil {
+		return "", err
+	}
+	var parts []string
+	for _, k := range sortedKeys(opts) {
+		parts = append(parts, fmt.Sprintf("-o %s=%s", k, shellQuote(opts[k])))
+	}
+	return strings.Join(parts, " "), nil
+}
+
 func NewManager(runtimeDir, defaultShell string, defaultTimeout int) *Manager {
 	cleanupLegacyAskPassScripts(runtimeDir)
 	cleanupOrphanedMasters(runtimeDir)
@@ -183,6 +280,18 @@ func (m *Manager) Connect(input model.Connection) (*model.Connection, error) {
 		}
 		conn.AuthMethod = method
 		conn.Generation = 0
+		// Auto-detect remote shell if not already known.
+		if NeedsShellProbe(conn.Shell) {
+			detected, probeErr := m.probeShell(&conn)
+			if probeErr != nil {
+				// Leave conn.Shell empty — exec path falls back to
+				// m.defaultShell at runtime, but nothing is persisted
+				// to the profile, so next connect will retry detection.
+				conn.Shell = ""
+			} else {
+				conn.Shell = detected
+			}
+		}
 		rs := &reconnectState{
 			maxAttempts: 1,
 			cooldown:    30 * time.Second,
@@ -229,6 +338,10 @@ func (m *Manager) startMaster(conn model.Connection, method string) (*masterHand
 		args = append(args, "-o", "PubkeyAuthentication=no")
 		args = append(args, "-o", "PreferredAuthentications=password")
 		args = append(args, "-o", "NumberOfPasswordPrompts=1")
+	}
+	args, err := appendSSHOptions(args, conn.SSHOptions)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ssh_options in profile: %w", err)
 	}
 	args = append(args, target)
 	cmd := exec.Command("ssh", args...)
@@ -514,12 +627,17 @@ func (m *Manager) ListConnections() []model.Connection {
 }
 
 func (m *Manager) OpenSession(connectionID, cwd, shell string) (*model.Session, error) {
-	if shell == "" {
-		shell = m.defaultShell
-	}
 	conn, err := m.GetConnection(connectionID)
 	if err != nil {
 		return nil, err
+	}
+	// Shell fallback: caller-specified > connection-detected > global default.
+	if shell == "" {
+		if conn.Shell != "" {
+			shell = conn.Shell
+		} else {
+			shell = m.defaultShell
+		}
 	}
 	resolvedCWD, err := validateExecCWD(conn, "/", cwd)
 	if err != nil {
@@ -635,7 +753,11 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 	if err != nil {
 		return ExecResult{}, err
 	}
+	// Shell priority: session > connection > defaultShell.
 	shell := m.defaultShell
+	if conn.Shell != "" {
+		shell = conn.Shell
+	}
 	if sessionID != "" {
 		s, err := m.GetSession(sessionID)
 		if err != nil {
@@ -655,6 +777,8 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 			return ExecResult{}, err
 		}
 	}
+	// Resolve sentinel: "__raw__" → "" (no wrapper).
+	shell = ResolveShellForExec(shell)
 	if timeoutSec <= 0 {
 		timeoutSec = m.defaultTimeoutS
 	}
@@ -708,9 +832,12 @@ func (m *Manager) ExecWithProgressCtx(parent context.Context, connectionID, sess
 		"-S", conn.ControlPath,
 		"-o", "ControlMaster=no",
 		"-p", strconv.Itoa(conn.Port),
-		target,
-		remoteCmd,
 	}
+	args, err = appendSSHOptions(args, conn.SSHOptions)
+	if err != nil {
+		return ExecResult{}, fmt.Errorf("invalid ssh_options in profile: %w", err)
+	}
+	args = append(args, target, remoteCmd)
 	cmd := exec.CommandContext(ctx, "ssh", args...)
 	stdoutWriter := &execStreamWriter{stream: "stdout", onProgress: onProgress}
 	stderrWriter := &execStreamWriter{stream: "stderr", onProgress: onProgress}
@@ -961,6 +1088,10 @@ func (m *Manager) runSCPOnce(conn *model.Connection, timeout time.Duration, lega
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=10",
 	}
+	args, aErr := appendSSHOptions(args, conn.SSHOptions)
+	if aErr != nil {
+		return "", fmt.Errorf("invalid ssh_options in profile: %w", aErr)
+	}
 	if legacy {
 		args = append(args, "-O")
 	}
@@ -1019,6 +1150,13 @@ func (m *Manager) RunRsync(connectionID string, timeoutSec int, source, target s
 
 	rshFlag := fmt.Sprintf("ssh -o ControlPath=%s -o ControlMaster=no -o BatchMode=yes -p %d",
 		conn.ControlPath, conn.Port)
+	extra, rshErr := formatSSHOptionsForRsh(conn.SSHOptions)
+	if rshErr != nil {
+		return TransferResult{}, fmt.Errorf("invalid ssh_options in profile: %w", rshErr)
+	}
+	if extra != "" {
+		rshFlag += " " + extra
+	}
 	remote := fmt.Sprintf("%s@%s", conn.Username, normalizeSCPHost(conn.Host))
 
 	var rsyncSource, rsyncTarget string
