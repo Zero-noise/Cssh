@@ -20,6 +20,7 @@ allow_public_host = true
 security_profile_default = "easy_safe"
 sudo_enabled = true
 allow_root_login = false
+auto_update_check = true
 `
 
 // NormalizeSecurityProfile validates and normalizes a security_profile value.
@@ -79,8 +80,9 @@ func Load(configPath string) (model.Config, error) {
 		LogsDir:                filepath.Join(base, "logs"),
 		ProfilesFile:           filepath.Join(base, "profiles.json"),
 		SecurityProfileDefault: "easy_safe",
-		SudoEnabled:           true,
+		SudoEnabled:            true,
 		AllowRootLogin:         false,
+		AutoUpdateCheck:        true,
 	}
 
 	if err := os.MkdirAll(base, 0o700); err != nil {
@@ -132,6 +134,8 @@ func Load(configPath string) (model.Config, error) {
 			cfg.SudoEnabled = strings.EqualFold(val, "true")
 		case "allow_root_login":
 			cfg.AllowRootLogin = strings.EqualFold(val, "true")
+		case "auto_update_check":
+			cfg.AutoUpdateCheck = strings.EqualFold(val, "true")
 		case "profiles_file":
 			if val != "" {
 				cfg.ProfilesFile = ExpandHome(val)

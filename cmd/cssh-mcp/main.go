@@ -39,7 +39,7 @@ func main() {
 		os.Exit(1)
 	}()
 
-	server := mcp.NewServer(svc)
+	server := mcp.NewServer(svc, cfg)
 	if err := server.Run(); err != nil {
 		shutdown()
 		fmt.Fprintf(os.Stderr, "mcp server stopped: %v\n", err)

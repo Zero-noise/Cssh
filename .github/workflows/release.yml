@@ -47,8 +47,9 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
-          go build -o cssh-mcp-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/cssh-mcp
-          go build -o csshctl-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/csshctl
+          LDFLAGS="-X cssh/internal/version.Tag=${GITHUB_REF_NAME} -X cssh/internal/version.Commit=$(git rev-parse --short HEAD) -X cssh/internal/version.Date=$(date -u +%Y-%m-%d)"
+          go build -ldflags "$LDFLAGS" -o cssh-mcp-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/cssh-mcp
+          go build -ldflags "$LDFLAGS" -o csshctl-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/csshctl
 
       - name: Package
         run: |

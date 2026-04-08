@@ -10,24 +10,24 @@ const (
 )
 
 type Profile struct {
-	ID                string   `json:"id"`
-	Name              string   `json:"name,omitempty"`
-	NotePath          string   `json:"note_path,omitempty"`
-	Host              string   `json:"host"`
-	Port              int      `json:"port"`
-	Username          string   `json:"username"`
-	AuthPriority      []string `json:"auth_priority"`
-	KeyPath           string   `json:"key_path,omitempty"`
-	WorkspaceRoots    []string `json:"workspace_roots"`
-	SecurityProfile   string   `json:"security_profile,omitempty"`
-	AllowRootUser     bool     `json:"allow_root_user,omitempty"`
-	ToolPolicyVersion int      `json:"tool_policy_version,omitempty"`
-	MaxAutoRisk       string   `json:"max_auto_risk,omitempty"`
-	AllowReboot       bool     `json:"allow_reboot,omitempty"`
-	AllowDiskOps      bool     `json:"allow_disk_ops,omitempty"`
-	DenyPatterns      []string `json:"deny_patterns,omitempty"`
-	AllowedLocalPaths []string `json:"allowed_local_paths,omitempty"`
-	GrantTTLSec       int      `json:"grant_ttl_sec,omitempty"` // 0 = session-scoped (default), >0 = TTL in seconds
+	ID                string            `json:"id"`
+	Name              string            `json:"name,omitempty"`
+	NotePath          string            `json:"note_path,omitempty"`
+	Host              string            `json:"host"`
+	Port              int               `json:"port"`
+	Username          string            `json:"username"`
+	AuthPriority      []string          `json:"auth_priority"`
+	KeyPath           string            `json:"key_path,omitempty"`
+	WorkspaceRoots    []string          `json:"workspace_roots"`
+	SecurityProfile   string            `json:"security_profile,omitempty"`
+	AllowRootUser     bool              `json:"allow_root_user,omitempty"`
+	ToolPolicyVersion int               `json:"tool_policy_version,omitempty"`
+	MaxAutoRisk       string            `json:"max_auto_risk,omitempty"`
+	AllowReboot       bool              `json:"allow_reboot,omitempty"`
+	AllowDiskOps      bool              `json:"allow_disk_ops,omitempty"`
+	DenyPatterns      []string          `json:"deny_patterns,omitempty"`
+	AllowedLocalPaths []string          `json:"allowed_local_paths,omitempty"`
+	GrantTTLSec       int               `json:"grant_ttl_sec,omitempty"` // 0 = session-scoped (default), >0 = TTL in seconds
 	Shell             string            `json:"shell,omitempty"`         // detected/manual shell prefix; "" = undetected, "__raw__" = no wrapper, "auto" = re-detect on next connect
 	SSHOptions        map[string]string `json:"ssh_options,omitempty"`   // custom SSH -o flags, e.g. {"HostKeyAlgorithms": "+ssh-rsa"}
 }
@@ -42,43 +42,44 @@ type Config struct {
 	SecurityProfileDefault string `json:"security_profile_default"`
 	SudoEnabled            bool   `json:"sudo_enabled"`
 	AllowRootLogin         bool   `json:"allow_root_login"`
+	AutoUpdateCheck        bool   `json:"auto_update_check"`
 }
 
 type ConnectionInput struct {
-	ProfileID       string `json:"profile_id,omitempty"`
-	ProfileName     string `json:"profile_name,omitempty"`
-	LimitDir        string `json:"limit_dir,omitempty"`
+	ProfileID   string `json:"profile_id,omitempty"`
+	ProfileName string `json:"profile_name,omitempty"`
+	LimitDir    string `json:"limit_dir,omitempty"`
 }
 
 type Connection struct {
-	ID              string
-	ProfileID       string
-	Host            string
-	Port            int
-	Username        string
-	AuthPriority    []string
-	KeyPath         string
-	KeyPassphrase   string
-	Password        string
-	SudoPassword    string
-	WorkspaceRoots  []string
-	LimitDir        string
-	SecurityProfile string
-	AllowRootUser   bool
-	MaxAutoRisk     string
-	AllowReboot     bool
-	AllowDiskOps    bool
+	ID                string
+	ProfileID         string
+	Host              string
+	Port              int
+	Username          string
+	AuthPriority      []string
+	KeyPath           string
+	KeyPassphrase     string
+	Password          string
+	SudoPassword      string
+	WorkspaceRoots    []string
+	LimitDir          string
+	SecurityProfile   string
+	AllowRootUser     bool
+	MaxAutoRisk       string
+	AllowReboot       bool
+	AllowDiskOps      bool
 	DenyPatterns      []string
 	AllowedLocalPaths []string
 	GrantTTLSec       int
 	CnotePath         string
-	Cnote           string
-	Shell           string // shell prefix for command wrapping; "" = use default, "__raw__" = no wrapper
-	SSHOptions      map[string]string
-	ControlPath     string
-	AuthMethod      string
-	Generation      uint64
-	CreatedAt       time.Time
+	Cnote             string
+	Shell             string // shell prefix for command wrapping; "" = use default, "__raw__" = no wrapper
+	SSHOptions        map[string]string
+	ControlPath       string
+	AuthMethod        string
+	Generation        uint64
+	CreatedAt         time.Time
 }
 
 type Session struct {

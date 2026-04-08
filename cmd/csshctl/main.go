@@ -9,9 +9,13 @@ import (
 	"strings"
 	"time"
 
+	"context"
+
 	"cssh/internal/app"
 	"cssh/internal/config"
 	"cssh/internal/model"
+	"cssh/internal/update"
+	"cssh/internal/version"
 )
 
 func main() {
@@ -32,6 +36,17 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+
+	// Commands that don't need app.Service (no SSH connection).
+	switch os.Args[1] {
+	case "version":
+		handleVersion(cfg)
+		return
+	case "upgrade":
+		handleUpgrade(cfg)
+		return
+	}
+
 	svc := app.NewService(cfg)
 
 	switch os.Args[1] {
@@ -77,7 +92,52 @@ func usage() {
   reject APPROVAL_ID [--by NAME] [--reason TEXT]
 
   migrate security
+
+  version         show current version and check for updates
+  upgrade         download and install the latest release
 `)
+}
+
+func handleVersion(cfg model.Config) {
+	info := map[string]any{
+		"version": version.Short(),
+		"commit":  version.Commit,
+		"date":    version.Date,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result, err := update.CheckLatestCached(ctx, cfg.RuntimeDir, version.Short(), 24*time.Hour)
+	if err == nil && result != nil {
+		info["latest_version"] = result.LatestVersion
+		info["update_available"] = result.UpdateAvailable
+	}
+	printJSON(info)
+}
+
+func handleUpgrade(cfg model.Config) {
+	current := version.Short()
+	ctx := context.Background()
+
+	result, err := update.CheckLatest(ctx, current)
+	if err != nil {
+		fatal(err)
+	}
+	if !result.UpdateAvailable {
+		printJSON(map[string]any{"ok": true, "message": "already up to date", "version": current})
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Upgrading %s -> %s ...\n", current, result.LatestVersion)
+	upgradeResult, err := update.Upgrade(ctx, cfg.RuntimeDir, result)
+	if err != nil {
+		fatal(err)
+	}
+	printJSON(map[string]any{
+		"ok":               true,
+		"previous_version": upgradeResult.PreviousVersion,
+		"new_version":      upgradeResult.NewVersion,
+		"message":          "restart Claude Code to use the new version",
+	})
 }
 
 func handleProfile(svc *app.Service, cfg model.Config, args []string) {
@@ -510,7 +570,6 @@ func applySecurityProfileDefaults(p *model.Profile) {
 		p.MaxAutoRisk = "L1"
 	}
 }
-
 
 func hasRootPath(roots []string) bool {
 	for _, r := range roots {

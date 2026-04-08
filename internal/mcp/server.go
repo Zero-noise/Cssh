@@ -17,6 +17,8 @@ import (
 	"cssh/internal/model"
 	"cssh/internal/resolve"
 	"cssh/internal/sshbridge"
+	"cssh/internal/update"
+	"cssh/internal/version"
 )
 
 const mcpInstructions = `Cssh provides secure SSH access to remote hosts via saved profiles.
@@ -52,12 +54,14 @@ ssh_read_file returns line-numbered content with metadata. Key response fields:
 
 type Server struct {
 	svc     *app.Service
+	cfg     model.Config
 	ctlPath string
 	out     io.Writer
 
 	seenInitialize    atomic.Bool
 	clientInitialized atomic.Bool
 	minLogLevel       atomic.Int32
+	updateCheckDone   atomic.Bool
 
 	writeMu    sync.Mutex
 	inflightMu sync.Mutex
@@ -65,9 +69,10 @@ type Server struct {
 	wg         sync.WaitGroup
 }
 
-func NewServer(svc *app.Service) *Server {
+func NewServer(svc *app.Service, cfg model.Config) *Server {
 	s := &Server{
 		svc:      svc,
+		cfg:      cfg,
 		ctlPath:  resolve.QuotedPath(),
 		out:      os.Stdout,
 		inflight: map[string]context.CancelFunc{},
@@ -172,6 +177,13 @@ func (s *Server) handleNotification(req request) {
 	case "notifications/initialized":
 		if s.seenInitialize.Load() {
 			s.clientInitialized.Store(true)
+			if s.cfg.AutoUpdateCheck && !version.IsDev() && s.updateCheckDone.CompareAndSwap(false, true) {
+				s.wg.Add(1)
+				go func() {
+					defer s.wg.Done()
+					s.checkForUpdate()
+				}()
+			}
 		}
 	case "notifications/cancelled":
 		var p struct {
@@ -188,6 +200,36 @@ func (s *Server) handleNotification(req request) {
 			cancel()
 		}
 	}
+}
+
+func (s *Server) checkForUpdate() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	result, err := update.CheckLatestCached(ctx, s.cfg.RuntimeDir, version.Short(), 24*time.Hour)
+	if err != nil || result == nil || !result.UpdateAvailable {
+		return
+	}
+	s.emitLogNotification(loggingLevelNotice, "update",
+		fmt.Sprintf("Cssh %s is available (current: %s). Run: csshctl upgrade",
+			result.LatestVersion, result.CurrentVersion))
+}
+
+func (s *Server) emitLogNotification(level loggingLevel, logger, message string) {
+	if !s.shouldEmitLogLevel(level) {
+		return
+	}
+	payload := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/message",
+		"params": map[string]any{
+			"level":  loggingLevelName(level),
+			"logger": logger,
+			"data":   message,
+		},
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_ = writeMessage(s.out, payload)
 }
 
 func (s *Server) dispatchToolCall(req request, id any) {
@@ -268,7 +310,7 @@ func (s *Server) handle(req request, id any) response {
 		return response{JSONRPC: "2.0", ID: id, Result: map[string]any{
 			"protocolVersion": "2025-11-25",
 			"capabilities":    map[string]any{"tools": map[string]any{}, "logging": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "cssh-mcp", "version": "0.1.0"},
+			"serverInfo":      map[string]any{"name": "cssh-mcp", "version": version.Short()},
 			"instructions":    mcpInstructions,
 		}}
 	case "logging/setLevel":

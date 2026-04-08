@@ -310,7 +310,7 @@ func TestConnectSchemaNoTopLevelCombinators(t *testing.T) {
 }
 
 func TestInitializedNotificationGate(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 
 	req := request{Method: "tools/call", Params: []byte(`{"name":"ssh_profile","arguments":{"action":"list"}}`)}
 	res := s.handleToolCall(context.Background(), req, 1)
@@ -420,7 +420,7 @@ func TestProfileSetupSchemaIncludesAllowedLocalPaths(t *testing.T) {
 }
 
 func TestUnknownToolReturnsError(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	_, err := s.callTool("ssh_nonexistent", nil)
 	if err == nil {
 		t.Fatal("expected error for unknown tool")
@@ -449,7 +449,7 @@ func TestCnoteToolCall(t *testing.T) {
 		t.Fatalf("quick save err: %v", err)
 	}
 
-	s := NewServer(svc)
+	s := NewServer(svc, model.Config{})
 	out, err := s.callTool("ssh_cnote", map[string]any{
 		"action":     "set",
 		"profile_id": "debug-worker-100-100-1-9",
@@ -467,7 +467,7 @@ func TestCnoteToolCall(t *testing.T) {
 }
 
 func TestCancelledNotification(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	_ = s.handle(request{Method: "initialize"}, 1)
 	s.handleNotification(request{Method: "notifications/initialized"})
 
@@ -496,7 +496,7 @@ func TestCancelledNotification(t *testing.T) {
 }
 
 func TestCancelledUnknownId(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	// Should not panic on unknown request ID
 	params, _ := json.Marshal(map[string]any{"requestId": 999})
 	s.handleNotification(request{
@@ -514,7 +514,7 @@ func TestConcurrentToolCalls(t *testing.T) {
 		LogsDir:           filepath.Join(tmp, "logs"),
 		ProfilesFile:      filepath.Join(tmp, "profiles.json"),
 	})
-	s := NewServer(svc)
+	s := NewServer(svc, model.Config{})
 	_ = s.handle(request{Method: "initialize"}, 1)
 	s.handleNotification(request{Method: "notifications/initialized"})
 
@@ -577,7 +577,7 @@ func TestProgressTokenFromParamsFallsBackToArgumentsMeta(t *testing.T) {
 
 func TestProgressReporterEmitsOutputAndHeartbeat(t *testing.T) {
 	var out bytes.Buffer
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	s.out = &out
 
 	reporter := newProgressReporter(s, "ssh_exec", "tok-1")
@@ -628,7 +628,7 @@ func TestProgressReporterEmitsOutputAndHeartbeat(t *testing.T) {
 
 func TestProgressReporterFallsBackToMessageWithoutToken(t *testing.T) {
 	var out bytes.Buffer
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	s.out = &out
 
 	reporter := newProgressReporter(s, "ssh_exec", nil)
@@ -672,7 +672,7 @@ func TestProgressReporterFallsBackToMessageWithoutToken(t *testing.T) {
 }
 
 func TestNewProgressReporterRequiresSSHExecOnly(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	if reporter := newProgressReporter(s, "ssh_exec", nil); reporter == nil {
 		t.Fatalf("expected reporter for ssh_exec without token")
 	}
@@ -683,7 +683,7 @@ func TestNewProgressReporterRequiresSSHExecOnly(t *testing.T) {
 
 func TestProgressReporterDiscardDropsPendingOutput(t *testing.T) {
 	var out bytes.Buffer
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	s.out = &out
 
 	reporter := newProgressReporter(s, "ssh_exec", "tok-3")
@@ -698,7 +698,7 @@ func TestProgressReporterDiscardDropsPendingOutput(t *testing.T) {
 
 func TestProgressReporterRespectsLoggingSetLevel(t *testing.T) {
 	var out bytes.Buffer
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	s.out = &out
 
 	params, _ := json.Marshal(map[string]any{"level": "warning"})
@@ -716,7 +716,7 @@ func TestProgressReporterRespectsLoggingSetLevel(t *testing.T) {
 }
 
 func TestLoggingSetLevelRejectsInvalidLevel(t *testing.T) {
-	s := NewServer(nil)
+	s := NewServer(nil, model.Config{})
 	params, _ := json.Marshal(map[string]any{"level": "verbose"})
 	res := s.handle(request{Method: "logging/setLevel", Params: params}, 1)
 	if res.Error == nil || res.Error.Code != -32602 {
@@ -853,4 +853,104 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met before timeout")
+}
+
+// ── Update notification tests ───────────────────────────
+
+func TestEmitLogNotification(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil, model.Config{})
+	s.out = &out
+
+	s.emitLogNotification(loggingLevelNotice, "update", "test message")
+
+	var msg map[string]any
+	if err := json.Unmarshal(out.Bytes(), &msg); err != nil {
+		t.Fatalf("unmarshal notification: %v", err)
+	}
+	if msg["method"] != "notifications/message" {
+		t.Fatalf("method = %v, want notifications/message", msg["method"])
+	}
+	params := msg["params"].(map[string]any)
+	if params["logger"] != "update" {
+		t.Fatalf("logger = %v, want update", params["logger"])
+	}
+	if params["data"] != "test message" {
+		t.Fatalf("data = %v, want test message", params["data"])
+	}
+}
+
+func TestEmitLogNotificationFilteredByLevel(t *testing.T) {
+	var out bytes.Buffer
+	s := NewServer(nil, model.Config{})
+	s.out = &out
+	s.minLogLevel.Store(int32(loggingLevelWarning))
+
+	// Notice < Warning, should be filtered out.
+	s.emitLogNotification(loggingLevelNotice, "update", "should not appear")
+
+	if out.Len() != 0 {
+		t.Fatalf("expected no output when level filtered, got %s", out.String())
+	}
+
+	// Warning >= Warning, should pass.
+	s.emitLogNotification(loggingLevelWarning, "update", "should appear")
+	if out.Len() == 0 {
+		t.Fatal("expected output for warning level")
+	}
+}
+
+func TestUpdateCheckNotTriggeredWhenDisabled(t *testing.T) {
+	s := NewServer(nil, model.Config{AutoUpdateCheck: false})
+	_ = s.handle(request{Method: "initialize"}, 1)
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	// updateCheckDone should remain false since AutoUpdateCheck is disabled.
+	if s.updateCheckDone.Load() {
+		t.Fatal("updateCheckDone should be false when AutoUpdateCheck=false")
+	}
+}
+
+func TestUpdateCheckNotTriggeredForDevBuild(t *testing.T) {
+	// Default build has version.Tag = "dev", so IsDev() == true.
+	s := NewServer(nil, model.Config{AutoUpdateCheck: true})
+	_ = s.handle(request{Method: "initialize"}, 1)
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	// IsDev() returns true for default builds, so check should be skipped.
+	if s.updateCheckDone.Load() {
+		t.Fatal("updateCheckDone should be false for dev builds")
+	}
+}
+
+func TestUpdateCheckOnlyRunsOnce(t *testing.T) {
+	// We can't easily test with a non-dev version in unit tests since
+	// version.Tag is "dev" by default. Instead, test the atomic guard directly.
+	s := NewServer(nil, model.Config{AutoUpdateCheck: true})
+
+	// Simulate the atomic guard being set (as if checkForUpdate already ran).
+	s.updateCheckDone.Store(true)
+
+	_ = s.handle(request{Method: "initialize"}, 1)
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	// The second initialized should not reset or re-trigger.
+	s.handleNotification(request{Method: "notifications/initialized"})
+
+	// If we got here without panic or deadlock, the guard worked.
+}
+
+func TestInitializeResponseContainsVersion(t *testing.T) {
+	s := NewServer(nil, model.Config{})
+	res := s.handle(request{Method: "initialize"}, 1)
+	result := res.Result.(map[string]any)
+	serverInfo := result["serverInfo"].(map[string]any)
+	v, ok := serverInfo["version"].(string)
+	if !ok || v == "" {
+		t.Fatal("serverInfo.version should be a non-empty string")
+	}
+	// In test context, version.Short() returns "dev".
+	if v != "dev" {
+		t.Fatalf("version = %q, want %q", v, "dev")
+	}
 }

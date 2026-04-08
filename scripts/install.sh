@@ -133,11 +133,14 @@ build_local() {
   command -v go &>/dev/null \
     || die "Go toolchain not found" "Install from https://go.dev/dl/"
   mkdir -p "$INSTALL_DIR"
-  local err
-  err="$(go build -o "$INSTALL_DIR/cssh-mcp" ./cmd/cssh-mcp 2>&1)" \
+  local ldflags err
+  ldflags="-X cssh/internal/version.Tag=$(git describe --tags --exact-match 2>/dev/null || echo dev)"
+  ldflags="$ldflags -X cssh/internal/version.Commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ldflags="$ldflags -X cssh/internal/version.Date=$(date -u +%Y-%m-%d)"
+  err="$(go build -ldflags "$ldflags" -o "$INSTALL_DIR/cssh-mcp" ./cmd/cssh-mcp 2>&1)" \
     || die "Build failed: cssh-mcp" "$err"
   ok "Built cssh-mcp"
-  err="$(go build -o "$INSTALL_DIR/csshctl" ./cmd/csshctl 2>&1)" \
+  err="$(go build -ldflags "$ldflags" -o "$INSTALL_DIR/csshctl" ./cmd/csshctl 2>&1)" \
     || die "Build failed: csshctl" "$err"
   ok "Built csshctl"
   ok "Installed to $(tildify "$INSTALL_DIR")/"
