@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="assets/redstone_B_flat_duotone.svg" width="128" alt="Cssh">
 </p>
@@ -298,4 +300,4 @@ High-risk commands (reboot, mkfs, sudo in ops_strict, etc.) require human approv
 - Tell the AI to "record this in the Cnote" to persist profile-level rules.
 - Password auth uses `SSH_ASKPASS` flow.
 - `ssh_apply_patch` requires `patch` and `base64` on the remote host.
-- Default config path: `~/.csbridge/config.toml` (auto-created on first run).
+- Default config path: `~/.csbridge/config.toml` (auto-created on first run). Alternatively, set the `CSSH_CONFIG` environment variable to use a custom config file path.
